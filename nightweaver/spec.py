@@ -80,9 +80,13 @@ def validate(raw, relative_to=None):
     if type(retries) is not int or not 1 <= retries <= 10:
         raise ValueError("Attempts must be between 1 and 10")
     gates = [gate_spec(item) for item in raw.get("gates", [])]
+    final_gates = [gate_spec(item) for item in raw.get("final_gates", [])]
+    milestones = raw.get("milestones", [])
     steps = []
-    for item in raw.get("milestones", []):
+    for index, item in enumerate(milestones):
         current = gates + [gate_spec(g) for g in item.get("gates", [])]
+        if index == len(milestones) - 1:
+            current += final_gates
         names = [g["name"] for g in current]
         if not names or len(names) != len(set(names)):
             raise ValueError("Each milestone needs uniquely named checks")
@@ -95,6 +99,15 @@ def validate(raw, relative_to=None):
     out = {"repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
            "attempts": retries, "agent_timeout": timeout, "milestones": steps,
            "protected_paths": [artifact(path) for path in raw.get("protected_paths", [])]}
+    criteria = raw.get("acceptance", [])
+    if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
+        raise ValueError("acceptance must be a list of nonempty requirements")
+    out["acceptance"] = [item.strip() for item in criteria]
+    if "expected_base" in raw:
+        base = text(raw, "expected_base").lower()
+        if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", base):
+            raise ValueError("expected_base must be a full Git commit hash")
+        out["expected_base"] = base
     if raw.get("reviewer"):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer")
     if raw.get("advisory_ollama"):

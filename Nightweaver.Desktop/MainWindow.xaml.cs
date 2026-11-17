@@ -132,8 +132,8 @@ public partial class MainWindow : Window
         Branch.Text = $"{row.ResultBranch}    {row.Accepted}";
         Branch.Visibility = Visibility.Visible;
         EvidenceButton.IsEnabled = true;
-        PauseButton.IsEnabled = !working && row.Active && !row.Pause && row.Phase is not ("done" or "blocked");
-        ResumeButton.IsEnabled = !working && !row.Active && row.Phase != "done";
+        PauseButton.IsEnabled = !working && (row.Active || row.Queued) && !row.Pause && row.Phase is not ("done" or "blocked");
+        ResumeButton.IsEnabled = !working && !row.Active && row.Phase != "done" && (!row.Waiting || row.Pause);
         ResumeButton.Content = row.Phase == "blocked" ? "Retry" : "Resume";
 
         var events = (await CallAsync("events", row.Id)).EnumerateArray().Select(Activity.Parse).ToArray();
@@ -221,7 +221,8 @@ public partial class MainWindow : Window
         await RefreshAsync(id);
     }
 
-    private sealed record RunRow(string Id, string Title, string Phase, bool Pause, bool Active, string Subtitle, string Current, string Accepted, string ResultBranch)
+    private sealed record RunRow(string Id, string Title, string Phase, bool Pause, bool Active, bool Queued,
+        bool Waiting, string Subtitle, string Current, string Accepted, string ResultBranch)
     {
         public static RunRow Parse(JsonElement data)
         {
@@ -233,20 +234,27 @@ public partial class MainWindow : Window
             string phase = Get(state, "phase");
             bool pause = data.GetProperty("pause").GetBoolean();
             bool active = data.GetProperty("runner_active").GetBoolean();
+            bool queued = state.TryGetProperty("dispatch", out var dispatch) && dispatch.GetBoolean();
+            var prerequisites = data.GetProperty("waiting_for").EnumerateArray().Select(id => id.GetString()).ToArray();
             string label = phase is "done" or "blocked" ? Display(phase) : (active, pause, phase) switch
             {
                 (true, true, _) => "Pausing",
                 (_, true, _) => "Paused",
+                (false, false, _) when prerequisites.Length > 0 => "Waiting for prerequisites",
+                (false, false, _) when queued => "Queued",
                 (false, false, "queued") => "Queued",
                 (false, false, _) => "Interrupted",
                 _ => Display(phase),
             };
             string subtitle = $"{label}  ·  {step}/{count} accepted";
             string current = step < count ? Get(milestones[step], "title") : "All milestones accepted";
+            if (prerequisites.Length > 0)
+                current += $"\nWaiting for {string.Join(", ", prerequisites)}";
             string error = Get(state, "last_error");
             if (phase == "blocked" && error.Length > 0)
                 current += $"\n{Brief(error)}";
-            return new(Get(data, "id"), Get(spec, "title"), phase, pause, active, subtitle, current,
+            return new(Get(data, "id"), Get(spec, "title"), phase, pause, active, queued, prerequisites.Length > 0,
+                subtitle, current,
                 Get(state, "accepted")[..12], Get(data, "result_branch"));
         }
     }

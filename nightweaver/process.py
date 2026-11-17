@@ -30,18 +30,16 @@ def runner_active(path):
 
 
 @contextmanager
-def run_lock(path):
+def run_lock(path, message="A runner already owns this run"):
     import msvcrt
 
     with path.open("a+b") as handle:
-        if path.stat().st_size == 0:
-            handle.write(b"\0")
-            handle.flush()
+        # Windows permits locking a range beyond EOF, so there is no initialization race.
         handle.seek(0)
         try:
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as error:
-            raise BusyRun("A runner already owns this run") from error
+            raise BusyRun(message) from error
         try:
             yield
         finally:

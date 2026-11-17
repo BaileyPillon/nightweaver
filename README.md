@@ -12,6 +12,7 @@ Windows-native orchestration for coding agents. Give Nightweaver a goal with che
 - Independent operator-defined checks, with optional required screenshots or other files and a separate reviewer. Check receipts bind artifacts and decisions to a Git tree. Failed checks feed the next attempt automatically.
 - A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair.
 - A background runner with Windows Job Objects for child process cleanup. Relaunch a failed or interrupted runner against the same durable state, worktree, and recorded provider session where available.
+- A persistent queue with run prerequisites, recovery after interruption, and an optional dispatcher launched by Windows Task Scheduler at sign-in.
 
 ## Try it without model accounts
 
@@ -63,10 +64,45 @@ The compiled desktop app accepts `--home <runtime-directory>` and `--python <pyt
 
 Choose the repository root with the committed base you want. Set `repository`, `title`, `objective`, `worker`, `gates`, and ordered `milestones` in a local JSON plan. A milestone can specify a different `worker`, its own extra `gates`, and its allowed `paths`. `protected_paths` defends tracked checks and project boundaries during promotion. Run with trusted plans and projects. Custom commands run with your Windows permissions, and provider tool calls use the provider's permissions.
 
+Set `expected_base` to a full Git commit hash to reject the wrong starting version. Nightweaver records the resolved checkout and serializes runs that share a Git directory, including linked worktrees. Independent clones have separate Git directories, so use the intended checkout's absolute path if you keep multiple copies.
+
 - **OneShot.** Create a template with the repository, title, worker, and trusted checks. `python -m nightweaver goal template.json "Your goal" --planner claude --start` makes a fresh plan of up to five milestones and starts it. Omit `--start` to print the proposed plan first. Use `--profile-dir` to select an existing planner configuration directory.
-- **Checks.** Each gate has a `name`, an executable `argv` array, an optional `timeout` in seconds, and an optional `artifacts` array of paths relative to the worktree. For browser QA, have your Playwright or browser script start the candidate build, verify its main flow, and generate fresh viewport screenshots. Add the screenshots to `artifacts` and configure a reviewer that can inspect images. Keep generated files ignored by Git. A failed browser check, missing screenshot, or `REVISE` result stops promotion and sends the issue back to the worker.
+- **Checks.** Each gate has a `name`, an executable `argv` array, an optional `timeout` in seconds, and an optional `artifacts` array of paths relative to the worktree. Put whole-project checks under `final_gates`. These run on the final candidate in addition to its regular checks. Use the `acceptance` array for requirements the worker and reviewer should carry across milestones, including visual criteria.
 - **Profiles.** The `codex` and `claude` workers and reviewers accept `model`, `executable`, and `profile_dir`. Log into each chosen profile with its own CLI. The engine passes the matching configuration directory to that process. Use `reviewer` with `{"kind":"claude"}` or `{"kind":"codex"}` to require a fresh review. A custom `command` reviewer receives the brief on stdin and must emit a JSON `verdict` (`PASS` or `REVISE`) and `reason`.
-- **Recovery.** `python -m nightweaver resume <run-id>` starts an interrupted or paused run again. After correcting an external blocker, use `resume <run-id> --retry`. Windows reboot recovery starts when you resume the run. Use the dashboard or `events` to inspect what the runner actually recorded.
+- **Recovery.** `python -m nightweaver resume <run-id>` starts an interrupted or paused run again. After correcting an external blocker, use `resume <run-id> --retry`. Interrupted workers recover without using up a repair attempt, and their original attempt logs remain available. Use the dashboard or `events` to inspect the run.
+
+## Queue and recover runs on Windows
+
+```powershell
+$first = python -m nightweaver add prepare.json --enqueue | ConvertFrom-Json
+python -m nightweaver add verify.json --enqueue --after $first.run_id
+python -m nightweaver dispatch
+```
+
+`dispatch` processes eligible runs once. `dispatch --watch` keeps checking for new or interrupted runs. The dispatcher skips explicitly paused and blocked runs. Use `--after` more than once to wait for multiple prerequisites in the same runtime. A prerequisite controls order. Each run still starts from its own pinned source commit.
+
+To start the watcher automatically when you sign in, register and start the optional task below. It runs as your Windows user and uses the repo and runtime paths captured at registration. Use `-Runtime` for a custom runtime or `-ToolPath` for a semicolon-separated list of provider executable directories. Dispatcher output goes to `dispatcher.log` in the runtime directory.
+
+```powershell
+.\examples\install_dispatcher.ps1
+Start-ScheduledTask -TaskName 'Nightweaver Dispatcher'
+```
+
+To remove the sign-in task, stop it with `Stop-ScheduledTask -TaskName 'Nightweaver Dispatcher'` and unregister it with `Unregister-ScheduledTask -TaskName 'Nightweaver Dispatcher'`. [Windows Task Scheduler settings](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtasksettingsset)
+
+## Add browser acceptance checks
+
+For static HTML, [check_static_page.py](examples/check_static_page.py) checks the expected heading, horizontal overflow, and uncaught page errors in desktop and mobile viewports. Install Playwright with `python -m pip install playwright` and `python -m playwright install chromium`, or use `--channel msedge` with a compatible installed Edge. Add `.nightweaver-browser/` to the target project's Git ignore list. [Playwright browser setup](https://playwright.dev/python/docs/browsers)
+
+```json
+{
+  "name": "Responsive homepage",
+  "argv": ["python", "C:/path/to/Nightweaver/examples/check_static_page.py", "index.html", "Field Notes"],
+  "artifacts": [".nightweaver-browser/desktop.png", ".nightweaver-browser/mobile.png"]
+}
+```
+
+Put this gate in `gates` or `final_gates`. For an app with a build step or interactions, supply a project-specific Playwright check that launches the candidate and exercises the relevant flows. Configure a reviewer that can inspect screenshots and describe the visual requirements in `acceptance`. A failed check, missing screenshot, or review requesting changes sends the issue back for repair.
 
 Run data, model output, and evidence live under `%LOCALAPPDATA%\Nightweaver` or the directory chosen through `--home` or `NIGHTWEAVER_HOME`. Treat them as local project data. The engine creates a result branch locally. Review its commits before merging them into your branch or pushing them to a remote.
 

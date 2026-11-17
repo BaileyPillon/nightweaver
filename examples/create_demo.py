@@ -54,15 +54,16 @@ def main():
         "repository": "project",
         "title": "Field Notes",
         "objective": "Deliver a tiny field journal with a verified title and one-line summary.",
+        "acceptance": ["The title is Field Notes.", "The one-line summary reads Field Notes is ready."],
         "attempts": 3,
         "protected_paths": ["check.py"],
         "gates": [{"name": "Title contract", "argv": [sys.executable, "check.py"]}],
+        "final_gates": [{"name": "Summary contract", "argv": [sys.executable, "check.py", "--final"]}],
         "worker": worker,
         "milestones": [
             {"title": "Name the journal", "task": "Set title.txt to Field Notes followed by a newline.", "paths": ["title.txt"]},
             {"title": "Write the summary", "task": "Add summary.txt containing Field Notes is ready. followed by a newline.",
-             "paths": ["summary.txt"], "worker": followup,
-             "gates": [{"name": "Summary contract", "argv": [sys.executable, "check.py", "--final"]}]},
+             "paths": ["summary.txt"], "worker": followup},
         ],
     }
     if args.ollama:

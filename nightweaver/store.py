@@ -64,11 +64,13 @@ class Store:
             raise ValueError("Invalid run ID")
         return self.root / "runs" / run_id
 
-    def create(self, spec, base):
+    def create(self, spec, base, *, enqueue=False, after=()):
         run_id = uuid4().hex[:12]
         state = {"phase": "queued", "step": 0, "attempt": 0, "base": base, "accepted": base,
                  "candidate": None, "last_error": "", "log": None,
                  "result_ref": f"refs/heads/nightweaver/{run_id}"}
+        if enqueue:
+            state.update(dispatch=True, after=list(after))
         self.directory(run_id).mkdir(parents=True)
         with self.connect() as db:
             db.execute("INSERT INTO runs(id,spec,state,updated) VALUES(?,?,?,?)",
@@ -83,6 +85,14 @@ class Store:
     def runs(self):
         with self.connect() as db:
             return [self.decode(row) for row in db.execute("SELECT * FROM runs ORDER BY updated DESC")]
+
+    def dispatch_runs(self):
+        with self.connect() as db:
+            rows = db.execute("""SELECT * FROM runs WHERE pause=0
+                              AND json_extract(state, '$.dispatch')=1
+                              AND json_extract(state, '$.phase') NOT IN ('done', 'blocked')
+                              ORDER BY rowid""")
+            return [self.decode(row) for row in rows]
 
     def transition(self, run_id, kind, details=None, **changes):
         with self.connect() as db:
@@ -106,6 +116,12 @@ class Store:
                               (run_id, limit)).fetchall()
         return [{"seq": row["seq"], "time": row["time"], "kind": row["kind"],
                  "details": json.loads(row["details"])} for row in reversed(rows)]
+
+    def accepted_milestones(self, run_id):
+        with self.connect() as db:
+            rows = db.execute("SELECT details FROM events WHERE run_id=? AND kind='milestone_accepted' ORDER BY seq",
+                              (run_id,))
+            return [json.loads(row["details"]) for row in rows]
 
     @staticmethod
     def _event(db, run_id, kind, details):

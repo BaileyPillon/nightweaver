@@ -1,5 +1,6 @@
 """Advance approved milestones through independent, content-addressed checks."""
 
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -7,7 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from .process import PausedRun, execute, run_lock
+from .process import BusyRun, PausedRun, execute, run_lock
 from .providers import ProviderUnavailable, advisory, invoke, json_response, metadata
 
 
@@ -19,15 +20,31 @@ def git(repo, *args):
     return result.stdout.decode("utf-8", "replace").rstrip("\r\n")
 
 
-def create_run(store, spec):
+def common_dir(path):
+    return Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve(strict=True)
+
+
+def pending_dependencies(store, state):
+    return [item for item in state.get("after", []) if store.get(item)["state"]["phase"] != "done"]
+
+
+def create_run(store, spec, *, enqueue=False, after=()):
     path = Path(spec["repository"])
     root = Path(git(path, "rev-parse", "--show-toplevel")).resolve()
     if root != path:
         raise ValueError(f"Choose the repository root: {root}")
-    gitdir = Path(git(root, "rev-parse", "--absolute-git-dir")).resolve()
+    gitdir = common_dir(root)
     if store.root.is_relative_to(root) or store.root.is_relative_to(gitdir):
         raise ValueError("The Nightweaver data directory must be outside the source checkout")
-    return store.create(spec, git(root, "rev-parse", "HEAD^{commit}"))
+    base = git(root, "rev-parse", "HEAD^{commit}")
+    if spec.get("expected_base", base) != base:
+        raise ValueError(f"The chosen checkout is at {base}, expected {spec['expected_base']}")
+    if after and not enqueue:
+        raise ValueError("Run dependencies require --enqueue")
+    for dependency in after:
+        store.directory(dependency)
+        store.get(dependency)
+    return store.create({**spec, "git_common_dir": str(gitdir)}, base, enqueue=enqueue, after=dict.fromkeys(after))
 
 
 def tail(path, count=3600):
@@ -87,10 +104,11 @@ class Run:
     def __init__(self, store, run_id):
         self.store = store
         self.id = run_id
-        self.spec = store.get(run_id)["spec"]
+        row = store.get(run_id)
+        self.spec = row["spec"]
         self.root = store.directory(run_id)
         self.repository = Path(self.spec["repository"])
-        self.ref = store.get(run_id)["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
+        self.ref = row["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
 
     def set(self, kind, details=None, **state):
         return self.store.transition(self.id, kind, details, **state)
@@ -106,9 +124,7 @@ class Run:
             self.set("worktree_ready", {"path": str(path), "base": state["accepted"]})
         if not (path / ".git").is_file():
             raise ValueError(f"The run worktree is missing its Git link: {path}")
-        common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        expected = Path(git(self.repository, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        if common != expected:
+        if common_dir(path) != self.gitdir:
             raise ValueError("The worktree belongs to a different repository")
         return path
 
@@ -121,8 +137,13 @@ class Run:
     def worker_prompt(self, state, step):
         paths = ", ".join(step["paths"]) or "the repository files needed for this milestone"
         checks = "\n".join("- " + g["name"] + ": " + json.dumps(g["argv"]) for g in step["gates"])
+        prior = "\n".join(
+            f"- {self.spec['milestones'][item['step'] - 1]['title']} ({item['commit']})"
+            for item in self.store.accepted_milestones(self.id) if item["step"] <= state["step"]
+        )
         return (
-            f"Project goal\n{self.spec['objective']}\n\n"
+            f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
+            f"Accepted milestones in this checkout\n{prior or 'None yet'}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
             f"Work in this supplied Git worktree. Keep edits within {paths}. "
             "Preserve unrelated behavior. Do not commit, push, merge, edit verification rules "
@@ -131,14 +152,19 @@ class Run:
             f"{checks}\n\nLast observed failure (if any)\n{state['last_error'] or 'None'}"
         )
 
+    def acceptance_brief(self):
+        criteria = self.spec.get("acceptance", [])
+        return "Project acceptance requirements\n" + "\n".join(f"- {item}" for item in criteria) + "\n" if criteria else ""
+
     def work(self, state, step, path):
-        if state["attempt"] >= self.spec["attempts"]:
+        used = state.get("attempts_used", state["attempt"])
+        if used >= self.spec["attempts"]:
             self.set("blocked", {"issue": state["last_error"]}, phase="blocked")
             return
         next_state = {**state, "attempt": state["attempt"] + 1}
         log = self.evidence_dir(next_state) / "worker.jsonl"
         self.set("worker_started", {"adapter": step["worker"]["kind"], "attempt": next_state["attempt"]},
-                 phase="working", attempt=next_state["attempt"], log=str(log))
+                 phase="working", attempt=next_state["attempt"], attempts_used=used + 1, log=str(log))
         code, session, answer = invoke(step["worker"], "worker", path, log, self.worker_prompt(state, step),
                                   self.spec["agent_timeout"], self.paused, state.get("worker_session"))
         if code:
@@ -187,7 +213,8 @@ class Run:
         evidence = self.evidence_dir(state)
         checks = (evidence / "checks.json").read_text(encoding="utf-8")
         diff = git(path, "diff", "--cached", "--stat", state["accepted"])
-        decision = f"Goal: {self.spec['objective']}\nTask: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}"
+        decision = (f"Goal: {self.spec['objective']}\n{self.acceptance_brief()}"
+                    f"Task: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}")
         if self.spec.get("reviewer"):
             log = evidence / "review.jsonl"
             self.set("review_started", {"adapter": self.spec["reviewer"]["kind"], "tree": snapshot}, log=str(log))
@@ -246,16 +273,21 @@ class Run:
         finished = number == len(self.spec["milestones"])
         self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref},
                  phase="done" if finished else "ready", step=number, accepted=candidate,
-                 attempt=0, candidate=None, candidate_tree=None, worker_session=None, last_error="", log=None)
+                 attempt=0, attempts_used=0, candidate=None, candidate_tree=None,
+                 worker_session=None, last_error="", log=None)
         if finished:
             self.set("run_completed", {"branch": self.ref, "commit": candidate})
 
     def run(self, *, retry=False):
-        with run_lock(self.root / "runner.lock"):
+        with run_lock(self.root / "runner.lock"), ExitStack() as project_lock:
             state = self.store.get(self.id)["state"]
+            pending = pending_dependencies(self.store, state)
+            if pending:
+                raise BusyRun("Waiting for prerequisite runs: " + ", ".join(pending))
             if state["phase"] == "blocked" and retry:
-                self.set("blocked_run_retried", {}, phase=state.get("blocked_from", "ready"),
-                         attempt=0, blocked_from=None)
+                self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
+                         attempts_used=0, blocked_from=None)
+            self.gitdir = None
             while True:
                 state = self.store.get(self.id)["state"]
                 phase = state["phase"]
@@ -266,6 +298,13 @@ class Run:
                     return "paused"
                 step = self.spec["milestones"][state["step"]]
                 try:
+                    if self.gitdir is None:
+                        gitdir = common_dir(self.repository)
+                        if Path(self.spec.get("git_common_dir", gitdir)) != gitdir:
+                            raise ValueError("The source checkout now points to a different Git repository")
+                        project_lock.enter_context(run_lock(gitdir / "nightweaver.lock",
+                                                            "Another Nightweaver run owns this Git repository"))
+                        self.gitdir = gitdir
                     if phase == "promoting":
                         self.promote(state)
                         continue
@@ -275,6 +314,7 @@ class Run:
                         session, _ = metadata(log, step["worker"]["kind"])
                         self.set("interrupted_worker_recovered", {"log": str(log), "session": session},
                                  phase="ready", worker_session=session or state.get("worker_session"),
+                                 attempts_used=max(0, state.get("attempts_used", state["attempt"]) - 1),
                                  last_error="The prior process stopped before verification. Inspect the existing files and continue.")
                     elif phase in ("queued", "ready"):
                         self.work(state, step, path)
@@ -287,6 +327,8 @@ class Run:
                 except PausedRun:
                     self.set("runner_stopped", {"phase": phase})
                     return "paused"
+                except BusyRun:
+                    raise
                 except ProviderUnavailable as error:
                     actual = self.store.get(self.id)["state"]["phase"]
                     self.set("provider_unavailable", {"issue": str(error)}, phase="blocked",

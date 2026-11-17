@@ -8,8 +8,9 @@ import time
 import unittest
 from unittest.mock import patch
 
+from nightweaver.cli import dispatch
 from nightweaver.engine import Run, create_run, git
-from nightweaver.process import runner_active
+from nightweaver.process import BusyRun, run_lock, runner_active
 from nightweaver.providers import ProviderUnavailable
 from nightweaver.spec import validate
 from nightweaver.store import Store
@@ -41,7 +42,7 @@ class WindowsRunTest(unittest.TestCase):
         (self.repo / "untouched.txt").write_text("in-progress user file", encoding="utf-8")
         self.store = Store(self.root / "private data")
 
-    def configured(self, worker, gate="gate", **extra):
+    def configured(self, worker, gate="gate", *, enqueue=False, after=(), **extra):
         data = {
             "title": "Test milestone", "objective": "Produce a fixture whose independent check passes",
             "repository": str(self.repo), "worker": {"kind": "command", "argv": worker},
@@ -50,10 +51,12 @@ class WindowsRunTest(unittest.TestCase):
             "milestones": [{"title": "Prepare fixture", "task": "Set the value"}],
         }
         data.update(extra)
-        return create_run(self.store, validate(data))
+        return create_run(self.store, validate(data), enqueue=enqueue, after=after)
 
     def test_failed_check_is_sent_back_and_next_milestone_inherits_result(self):
         run = self.configured(fixture("implement"), reviewer={"kind": "command", "argv": fixture("review")},
+                              acceptance=["The second milestone creates delivery.txt."],
+                              final_gates=[{"name": "final delivery", "argv": fixture("final_delivery")}],
                               milestones=[
             {"title": "Prepare fixture", "task": "Set the value", "paths": ["result.txt"]},
             {"title": "Deliver update", "task": "Use the verified value", "paths": ["delivery.txt"],
@@ -65,6 +68,10 @@ class WindowsRunTest(unittest.TestCase):
         self.assertIn("attempt_rejected", kinds)
         self.assertEqual(kinds.count("milestone_accepted"), 2)
         self.assertEqual(kinds.count("review_passed"), 2)
+        final = [event for event in events if event["kind"] == "gate_finished"
+                 and event["details"]["name"] == "final delivery"]
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["details"]["exit"], 0)
         self.assertEqual(git(self.repo, "show", f"nightweaver/{run}:delivery.txt"), "second milestone")
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.head)
         self.assertEqual((self.repo / "result.txt").read_text(encoding="utf-8"), "original")
@@ -95,7 +102,7 @@ class WindowsRunTest(unittest.TestCase):
 
     def test_killed_runner_releases_its_process_tree_and_can_resume(self):
         marker = self.root / "child.pid"
-        run = self.configured(fixture("interrupt", str(marker)))
+        run = self.configured(fixture("interrupt", str(marker)), attempts=1, enqueue=True)
         command = [sys.executable, "-m", "nightweaver", "--home", str(self.store.root), "run", run]
         engine = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -119,12 +126,33 @@ class WindowsRunTest(unittest.TestCase):
                     self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0)
                 finally:
                     kernel.CloseHandle(handle)
-            self.assertEqual(Run(self.store, run).run(), "done")
+            self.assertEqual(dispatch(Store(self.store.root), False), [{"run_id": run, "phase": "done"}])
             self.assertIn("interrupted_worker_recovered", [event["kind"] for event in self.store.events(run)])
+            self.assertTrue((self.store.directory(run) / "evidence/01/01/worker.jsonl").is_file())
         finally:
             if engine.poll() is None:
                 engine.terminate()
                 engine.wait(timeout=8)
+
+    def test_dispatch_obeys_dependencies_and_ignores_unenrolled_or_paused_work(self):
+        first = self.configured(fixture("implement"), enqueue=True)
+        linked = self.root / "linked checkout"
+        git(self.repo, "worktree", "add", "--detach", str(linked), self.head)
+        dependent = self.configured(fixture("implement"), enqueue=True, after=[first], repository=str(linked))
+        paused = self.configured(fixture("implement"), enqueue=True)
+        self.store.pause(paused, True)
+        manual = self.configured(fixture("implement"), repository=str(linked))
+        with self.assertRaisesRegex(BusyRun, "prerequisite"):
+            Run(self.store, dependent).run()
+        with run_lock(self.repo / ".git" / "nightweaver.lock"):
+            with self.assertRaisesRegex(BusyRun, "owns this Git repository"):
+                Run(self.store, manual).run()
+            result = dispatch(self.store, False)
+        self.assertIn("owns this Git repository", result[0]["waiting"])
+        self.assertEqual([row["run_id"] for row in dispatch(self.store, False)], [first, dependent])
+        self.assertEqual(self.store.get(dependent)["state"]["phase"], "done")
+        for run in (paused, manual):
+            self.assertEqual(self.store.get(run)["state"]["phase"], "queued")
 
 
 if __name__ == "__main__":

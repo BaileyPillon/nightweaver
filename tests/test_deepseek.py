@@ -88,15 +88,20 @@ class DeepSeekTest(unittest.TestCase):
     def test_oneshot_routes_to_deepseek_and_preserves_checks(self):
         template = self.root / "plan.json"
         check = {"name": "Existing contract", "argv": [sys.executable, "check.py"]}
+        final = {"name": "Delivery contract", "argv": [sys.executable, "check.py", "--final"]}
         template.write_text(json.dumps({"repository": str(self.root), "title": "A project",
-                                        "worker": {"kind": "deepseek"}, "gates": [check]}), encoding="utf-8")
+                                        "worker": {"kind": "deepseek"}, "gates": [check],
+                                        "final_gates": [final], "acceptance": ["Deliver the final artifact."]}),
+                            encoding="utf-8")
         args = argparse.Namespace(template=str(template), objective="Deliver the project", planner="deepseek",
-                                  model="deepseek-v4-pro", profile_dir=None, start=False)
+                                  model="deepseek-v4-pro", profile_dir=None, start=False, enqueue=False)
         answer = json.dumps({"milestones": [{"title": "Deliver", "task": "Implement the full objective"}]})
         with patch("nightweaver.cli.invoke", return_value=(0, "planner-session", answer)) as planner:
             result = plan_goal(Store(self.root / "runtime"), args)
         self.assertEqual(planner.call_args.args[0], {"kind": "deepseek", "model": "deepseek-v4-pro"})
         self.assertEqual(result["gates"], [check])
+        self.assertEqual(result["final_gates"], [final])
+        self.assertIn("Deliver the final artifact.", planner.call_args.args[4])
         self.assertEqual(result["worker"], {"kind": "deepseek"})
 
 

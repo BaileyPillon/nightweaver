@@ -13,8 +13,13 @@ if mode == "implement":
     value = "ready" if "expected ready" in feedback else "first draft"
     Path("result.txt").write_text(value, encoding="utf-8")
 elif mode == "continue":
+    handoff = sys.stdin.read()
+    assert "Prepare fixture (" in handoff
+    assert "The second milestone creates delivery.txt." in handoff
     assert Path("result.txt").read_text(encoding="utf-8") == "ready"
     Path("delivery.txt").write_text("second milestone", encoding="utf-8")
+elif mode == "final_delivery":
+    assert Path("delivery.txt").read_text(encoding="utf-8") == "second milestone"
 elif mode == "gate":
     if Path("result.txt").read_text(encoding="utf-8") != "ready":
         print("expected ready")
