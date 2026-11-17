@@ -82,6 +82,9 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if re.search(r"authentication_failed|failed to authenticate|not logged in|please log in|refresh token.*expired", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} authentication needs renewal for the selected profile. "
                                       "Sign in with that CLI, then resume this run with --retry.")
+        if re.search(r"oauth_org_not_allowed|oauth_not_allowed_for_organization|can't use your Claude subscription", detail, re.I):
+            raise ProviderUnavailable(f"{config['kind']} reported a subscription or organization access error. "
+                                      "Resolve access for the selected profile, then resume this run with --retry.")
     return code, current or session, answer
 
 

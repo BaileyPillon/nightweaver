@@ -139,10 +139,10 @@ class Run:
         log = self.evidence_dir(next_state) / "worker.jsonl"
         self.set("worker_started", {"adapter": step["worker"]["kind"], "attempt": next_state["attempt"]},
                  phase="working", attempt=next_state["attempt"], log=str(log))
-        code, session, _ = invoke(step["worker"], "worker", path, log, self.worker_prompt(state, step),
+        code, session, answer = invoke(step["worker"], "worker", path, log, self.worker_prompt(state, step),
                                   self.spec["agent_timeout"], self.paused, state.get("worker_session"))
         if code:
-            self.reject(f"Worker exit {code}\n{tail(log)}", "worker", worker_session=None)
+            self.reject(f"Worker exit {code}\n{answer or tail(log)}", "worker", worker_session=None)
             return
         self.set("worker_finished", {"exit": code, "session": session, "log": str(log)},
                  phase="checking", worker_session=session)
@@ -205,7 +205,7 @@ class Run:
                 accepted, review = False, {}
             if not accepted:
                 self.reject("Independent review requested changes or returned no valid PASS.\n"
-                            + str(review.get("reason") or tail(log))[:3600], "review")
+                            + str(review.get("reason") or answer or tail(log))[:3600], "review")
                 return
             self.set("review_passed", {"reason": review["reason"], "tree": snapshot, "log": str(log)})
         if self.spec.get("advisory_ollama"):
