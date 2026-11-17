@@ -1,0 +1,26 @@
+<Window x:Class="Rookline.Desktop.GoalWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New OneShot" Width="590" Height="425" MinWidth="440" MinHeight="325"
+        WindowStartupLocation="CenterOwner" Background="#1D2421" Foreground="#ECF1EB" FontFamily="Segoe UI">
+    <Grid Margin="23">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Text="What should the project achieve?" FontSize="21" FontWeight="SemiBold" Margin="0,0,0,12"/>
+        <TextBox Grid.Row="1" x:Name="GoalText" AcceptsReturn="True" TextWrapping="Wrap" Padding="10"
+                 VerticalScrollBarVisibility="Auto" Background="#161D19" Foreground="#ECF1EB"
+                 CaretBrush="#D4EDAD" BorderBrush="#59685E" FontSize="14" AutomationProperties.Name="Project objective"/>
+        <DockPanel Grid.Row="2" Margin="0,14,0,0" LastChildFill="False">
+            <TextBlock Text="Planner" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="Planner" SelectedIndex="0" Width="115" AutomationProperties.Name="Planner">
+                <ComboBoxItem Content="Claude" Tag="claude"/>
+                <ComboBoxItem Content="Codex" Tag="codex"/>
+            </ComboBox>
+            <Button DockPanel.Dock="Right" Content="Plan and start" IsDefault="True" Click="Start_Click" Padding="12,6" Background="#D4EDAD"/>
+            <Button DockPanel.Dock="Right" Content="Cancel" IsCancel="True" Padding="12,6" Margin="0,0,8,0"/>
+        </DockPanel>
+    </Grid>
+</Window>
