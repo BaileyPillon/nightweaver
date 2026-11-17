@@ -97,8 +97,8 @@ def json_response(answer):
 def advisory(config, information):
     body = {"model": config["model"], "stream": False, "think": False,
             "messages": [{"role": "user", "content": information[:3000]}],
-            "options": {"num_predict": 100, "num_ctx": 2048}}
+            "options": {"num_predict": config.get("max_tokens", 100), "num_ctx": 2048}}
     request = Request(f"http://127.0.0.1:{config['port']}/api/chat", data=json.dumps(body).encode(),
                       headers={"Content-Type": "application/json"})
-    with urlopen(request, timeout=90) as response:
+    with urlopen(request, timeout=config.get("timeout", 90)) as response:
         return json.load(response).get("message", {}).get("content", "")[:1500]

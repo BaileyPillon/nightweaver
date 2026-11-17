@@ -98,7 +98,13 @@ def validate(raw, relative_to=None):
         port = raw["advisory_ollama"].get("port", 11434)
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("Invalid Ollama loopback port")
-        out["advisory_ollama"] = {"model": model, "port": port}
+        local_timeout = raw["advisory_ollama"].get("timeout", 90)
+        max_tokens = raw["advisory_ollama"].get("max_tokens", 100)
+        if type(local_timeout) is not int or not 1 <= local_timeout <= 600:
+            raise ValueError("Ollama timeout must be between 1 and 600 seconds")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 1024:
+            raise ValueError("Ollama max_tokens must be between 1 and 1024")
+        out["advisory_ollama"] = {"model": model, "port": port, "timeout": local_timeout, "max_tokens": max_tokens}
     return out
 
 

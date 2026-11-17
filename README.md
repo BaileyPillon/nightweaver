@@ -46,6 +46,8 @@ Choose the repository root with the committed base you want. Set `repository`, `
 
 Run data, model output, and evidence live under `%LOCALAPPDATA%\Rookline` or the directory chosen through `--home` or `ROOKLINE_HOME`. Treat them as local project data. The engine creates a result branch locally. Review its commits before merging them into your branch or pushing them to a remote.
 
+For a slow local model, set `timeout` and `max_tokens` inside `advisory_ollama`. Defaults are 90 seconds and 100 tokens. Model timeouts are recorded in the activity log and independent verification continues.
+
 [Design rationale and current limits](docs/design-rationale.md)
 
 ## Run the integration tests
