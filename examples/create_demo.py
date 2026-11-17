@@ -1,4 +1,4 @@
-"""Create a disposable Git project and a two-milestone Rookline plan."""
+"""Create a disposable Git project and a two-milestone Nightweaver plan."""
 
 import argparse
 import json
@@ -10,7 +10,9 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, help="A directory that does not exist yet")
-    parser.add_argument("--live", action="store_true", help="Use Codex and Claude Code instead of deterministic workers")
+    live = parser.add_mutually_exclusive_group()
+    live.add_argument("--live", action="store_true", help="Use Codex and Claude Code instead of deterministic workers")
+    live.add_argument("--deepseek", action="store_true", help="Use the configured DeepSeek model for both workers and independent review")
     parser.add_argument("--claude-profile", type=Path, help="An existing authenticated Claude configuration directory")
     parser.add_argument("--ollama", help="Optional already-installed local Ollama model")
     parser.add_argument("--ollama-port", type=int, default=11434)
@@ -27,7 +29,7 @@ def main():
         '    assert Path("summary.txt").read_text(encoding="utf-8").strip() == "Field Notes is ready.", "expected Field Notes is ready. in summary.txt"\n',
         encoding="utf-8",
     )
-    for command in (["init", "-b", "main"], ["config", "user.name", "Rookline Demo"],
+    for command in (["init", "-b", "main"], ["config", "user.name", "Nightweaver Demo"],
                     ["config", "user.email", "demo@example.invalid"], ["add", "title.txt", "check.py"],
                     ["commit", "-m", "Start demo"]):
         subprocess.run(["git", "-C", str(repo), *command], check=True, stdout=subprocess.DEVNULL)
@@ -42,6 +44,12 @@ def main():
         "kind": "command", "argv": [sys.executable, "-c",
             'from pathlib import Path; Path("summary.txt").write_text("Field Notes is ready.\\n", encoding="utf-8")'],
     }
+    if args.deepseek:
+        worker = {"kind": "deepseek"}
+        followup = {"kind": "deepseek"}
+    elif args.live:
+        worker = {"kind": "codex"}
+        followup = {"kind": "claude"}
     plan = {
         "repository": "project",
         "title": "Field Notes",
@@ -49,16 +57,18 @@ def main():
         "attempts": 3,
         "protected_paths": ["check.py"],
         "gates": [{"name": "Title contract", "argv": [sys.executable, "check.py"]}],
-        "worker": {"kind": "codex"} if args.live else worker,
+        "worker": worker,
         "milestones": [
             {"title": "Name the journal", "task": "Set title.txt to Field Notes followed by a newline.", "paths": ["title.txt"]},
             {"title": "Write the summary", "task": "Add summary.txt containing Field Notes is ready. followed by a newline.",
-             "paths": ["summary.txt"], "worker": {"kind": "claude"} if args.live else followup,
+             "paths": ["summary.txt"], "worker": followup,
              "gates": [{"name": "Summary contract", "argv": [sys.executable, "check.py", "--final"]}]},
         ],
     }
     if args.ollama:
         plan["advisory_ollama"] = {"model": args.ollama, "port": args.ollama_port}
+    if args.deepseek:
+        plan["reviewer"] = {"kind": "deepseek"}
     if args.live and args.claude_profile:
         plan["milestones"][1]["worker"]["profile_dir"] = str(args.claude_profile.resolve(strict=True))
     (folder / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")

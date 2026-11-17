@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rookline-windows"
-version = "0.1.0"
+name = "nightweaver-windows"
+version = "0.2.0"
 description = "Windows-native orchestration for checked, resumable coding-agent runs"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,7 +12,8 @@ license = {text = "MIT"}
 dependencies = []
 
 [project.scripts]
-rookline = "rookline.cli:main"
+nightweaver = "nightweaver.cli:main"
+rookline = "nightweaver.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["rookline*"]
+include = ["nightweaver*", "rookline*"]

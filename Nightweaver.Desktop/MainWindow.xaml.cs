@@ -6,15 +6,15 @@ using System.Windows.Controls;
 using System.Windows.Threading;
 using Microsoft.Win32;
 
-namespace Rookline.Desktop;
+namespace Nightweaver.Desktop;
 
 public partial class MainWindow : Window
 {
     private readonly DispatcherTimer refreshTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private readonly string? sourceRoot = FindSourceRoot();
-    private readonly string python = Environment.GetEnvironmentVariable("ROOKLINE_PYTHON") ?? "python.exe";
-    private readonly string dataRoot = Environment.GetEnvironmentVariable("ROOKLINE_HOME")
-        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Rookline");
+    private readonly string python = Argument("--python") ?? Environment.GetEnvironmentVariable("NIGHTWEAVER_PYTHON")
+        ?? Environment.GetEnvironmentVariable("ROOKLINE_PYTHON") ?? "python.exe";
+    private readonly string dataRoot = FindDataRoot();
     private string? visibleRun;
     private long lastEvent;
     private bool refreshing;
@@ -35,13 +35,34 @@ public partial class MainWindow : Window
 
     private static string? FindSourceRoot()
     {
-        string? configured = Environment.GetEnvironmentVariable("ROOKLINE_ROOT");
+        string? configured = Environment.GetEnvironmentVariable("NIGHTWEAVER_ROOT")
+            ?? Environment.GetEnvironmentVariable("ROOKLINE_ROOT");
         if (!string.IsNullOrWhiteSpace(configured))
             return configured;
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
-            if (File.Exists(Path.Combine(dir.FullName, "rookline", "cli.py")))
+            if (File.Exists(Path.Combine(dir.FullName, "nightweaver", "cli.py")))
                 return dir.FullName;
         return null;
+    }
+
+    private static string FindDataRoot()
+    {
+        if (Argument("--home") is string home)
+            return Path.GetFullPath(home);
+        string? configured = Environment.GetEnvironmentVariable("NIGHTWEAVER_HOME")
+            ?? Environment.GetEnvironmentVariable("ROOKLINE_HOME");
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured;
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string legacy = Path.Combine(local, "Rookline");
+        return File.Exists(Path.Combine(legacy, "runs.sqlite3")) ? legacy : Path.Combine(local, "Nightweaver");
+    }
+
+    private static string? Argument(string name)
+    {
+        var args = Environment.GetCommandLineArgs();
+        int index = Array.IndexOf(args, name);
+        return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 
     private async Task<JsonElement> CallAsync(params string[] arguments)
@@ -55,7 +76,7 @@ public partial class MainWindow : Window
         };
         if (sourceRoot is not null)
             start.WorkingDirectory = sourceRoot;
-        foreach (string arg in new[] { "-m", "rookline", "--home", dataRoot }.Concat(arguments))
+        foreach (string arg in new[] { "-m", "nightweaver", "--home", dataRoot }.Concat(arguments))
             start.ArgumentList.Add(arg);
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Python did not start.");
         var output = process.StandardOutput.ReadToEndAsync();
@@ -108,7 +129,7 @@ public partial class MainWindow : Window
             return;
         RunTitle.Text = row.Title;
         RunSummary.Text = $"{row.Subtitle}\n{row.Current}".TrimEnd();
-        Branch.Text = $"rookline/{row.Id}    {row.Accepted}";
+        Branch.Text = $"{row.ResultBranch}    {row.Accepted}";
         Branch.Visibility = Visibility.Visible;
         EvidenceButton.IsEnabled = true;
         PauseButton.IsEnabled = !working && row.Active && !row.Pause && row.Phase is not ("done" or "blocked");
@@ -138,13 +159,13 @@ public partial class MainWindow : Window
 
     private string? PickPlan(string title)
     {
-        var picker = new OpenFileDialog { Title = title, Filter = "Rookline JSON (*.json)|*.json" };
+        var picker = new OpenFileDialog { Title = title, Filter = "Nightweaver JSON (*.json)|*.json" };
         return picker.ShowDialog(this) == true ? picker.FileName : null;
     }
 
     private async void Add_Click(object sender, RoutedEventArgs e)
     {
-        if (working || PickPlan("Select a Rookline plan") is not string path)
+        if (working || PickPlan("Select a Nightweaver plan") is not string path)
             return;
         await PerformAsync("Starting plan…", "add", path, "--start");
     }
@@ -191,7 +212,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            MessageBox.Show(this, error.Message, "Rookline", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(this, error.Message, "Nightweaver", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
@@ -200,7 +221,7 @@ public partial class MainWindow : Window
         await RefreshAsync(id);
     }
 
-    private sealed record RunRow(string Id, string Title, string Phase, bool Pause, bool Active, string Subtitle, string Current, string Accepted)
+    private sealed record RunRow(string Id, string Title, string Phase, bool Pause, bool Active, string Subtitle, string Current, string Accepted, string ResultBranch)
     {
         public static RunRow Parse(JsonElement data)
         {
@@ -226,7 +247,7 @@ public partial class MainWindow : Window
             if (phase == "blocked" && error.Length > 0)
                 current += $"\n{Brief(error)}";
             return new(Get(data, "id"), Get(spec, "title"), phase, pause, active, subtitle, current,
-                Get(state, "accepted")[..12]);
+                Get(state, "accepted")[..12], Get(data, "result_branch"));
         }
     }
 

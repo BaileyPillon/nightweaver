@@ -1,5 +1,5 @@
 using System.Windows;
 
-namespace Rookline.Desktop;
+namespace Nightweaver.Desktop;
 
 public partial class App : Application { }

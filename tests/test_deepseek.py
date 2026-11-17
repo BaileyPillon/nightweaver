@@ -1,0 +1,104 @@
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from nightweaver.cli import plan_goal
+from nightweaver.providers import ProviderUnavailable, adapter, configure_deepseek_key, deepseek_key, invoke
+from nightweaver.spec import IMPLEMENTERS, provider
+from nightweaver.store import Store
+
+
+class DeepSeekTest(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory(prefix="Nightweaver provider ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.key_file = self.root / "model credential.txt"
+        self.key_file.write_text("test-credential-value\n", encoding="utf-8-sig")
+        self.environment = patch.dict(os.environ, {"NIGHTWEAVER_HOME": str(self.root / "runtime")}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_configuration_stores_reference_and_resolves_bom_key(self):
+        result = configure_deepseek_key(self.key_file)
+        settings = self.root / "runtime" / "providers.json"
+        self.assertNotIn("test-credential-value", settings.read_text(encoding="utf-8"))
+        self.assertEqual(result["api_key_file"], str(self.key_file.resolve()))
+        self.assertEqual(deepseek_key({}), "test-credential-value")
+
+    def test_adapter_keeps_routing_credentials_and_profile_process_local(self):
+        os.environ.update({"ANTHROPIC_BASE_URL": "https://existing.invalid", "ANTHROPIC_API_KEY": "existing-key",
+                           "CLAUDE_CONFIG_DIR": "existing-profile", "CLAUDE_CODE_OAUTH_TOKEN": "existing-login",
+                           "CLAUDE_CODE_USE_VERTEX": "1"})
+        before = dict(os.environ)
+        argv, env = adapter({"kind": "deepseek", "api_key_file": str(self.key_file)}, "worker", "prior-session")
+        self.assertEqual(argv[0], "claude")
+        self.assertEqual(argv[argv.index("--model") + 1], "deepseek-flash")
+        self.assertEqual(argv[argv.index("--resume") + 1], "prior-session")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "test-credential-value")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.root / "runtime" / "profiles" / "deepseek"))
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_CODE_USE_VERTEX", env)
+        self.assertEqual(dict(os.environ), before)
+        self.assertNotIn("test-credential-value", json.dumps(argv))
+
+    def test_missing_key_blocks_before_starting_worker(self):
+        with self.assertRaises(ProviderUnavailable):
+            adapter({"kind": "deepseek"}, "worker")
+
+    def test_file_override_and_environment_credentials(self):
+        os.environ["DEEPSEEK_API_KEY"] = "environment-credential"
+        self.assertEqual(deepseek_key({}), "environment-credential")
+        self.assertEqual(deepseek_key({"api_key_file": str(self.key_file)}), "test-credential-value")
+        with self.assertRaisesRegex(ValueError, "api_key_file"):
+            provider({"kind": "deepseek", "api_key": "inline-value"}, IMPLEMENTERS, "worker")
+
+    def test_reviewer_receives_read_tools_and_evidence_directory(self):
+        log = self.root / "review.jsonl"
+        evidence = self.root / "evidence"
+
+        def finished(argv, cwd, output, timeout, **kwargs):
+            self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+            self.assertEqual(argv[argv.index("--add-dir") + 1], str(evidence))
+            output.write_text('{"type":"system","session_id":"review-session"}\n'
+                              '{"type":"result","result":"verified"}\n', encoding="utf-8")
+            return 0
+
+        with patch("nightweaver.providers.execute", side_effect=finished):
+            result = invoke({"kind": "deepseek", "api_key_file": str(self.key_file)}, "reviewer",
+                            self.root, log, "Review the candidate", 30, lambda: False, evidence=evidence)
+        self.assertEqual(result, (0, "review-session", "verified"))
+
+    def test_api_error_blocks_with_recovery_message(self):
+        log = self.root / "worker.jsonl"
+        log.write_text('{"type":"result","result":"Authentication Fails (invalid API key)"}\n', encoding="utf-8")
+        with patch("nightweaver.providers.execute", return_value=1):
+            with self.assertRaisesRegex(ProviderUnavailable, "credential or balance"):
+                invoke({"kind": "deepseek", "api_key_file": str(self.key_file)}, "worker",
+                       self.root, log, "Implement", 30, lambda: False)
+
+    def test_oneshot_routes_to_deepseek_and_preserves_checks(self):
+        template = self.root / "plan.json"
+        check = {"name": "Existing contract", "argv": [sys.executable, "check.py"]}
+        template.write_text(json.dumps({"repository": str(self.root), "title": "A project",
+                                        "worker": {"kind": "deepseek"}, "gates": [check]}), encoding="utf-8")
+        args = argparse.Namespace(template=str(template), objective="Deliver the project", planner="deepseek",
+                                  model="deepseek-v4-pro", profile_dir=None, start=False)
+        answer = json.dumps({"milestones": [{"title": "Deliver", "task": "Implement the full objective"}]})
+        with patch("nightweaver.cli.invoke", return_value=(0, "planner-session", answer)) as planner:
+            result = plan_goal(Store(self.root / "runtime"), args)
+        self.assertEqual(planner.call_args.args[0], {"kind": "deepseek", "model": "deepseek-v4-pro"})
+        self.assertEqual(result["gates"], [check])
+        self.assertEqual(result["worker"], {"kind": "deepseek"})
+
+
+if __name__ == "__main__":
+    unittest.main()

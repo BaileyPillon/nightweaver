@@ -11,7 +11,13 @@ from uuid import uuid4
 
 
 def default_home():
-    return Path(os.getenv("ROOKLINE_HOME") or Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Rookline")
+    configured = os.getenv("NIGHTWEAVER_HOME") or os.getenv("ROOKLINE_HOME")
+    if configured:
+        return Path(configured)
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    legacy = local / "Rookline"
+    # Keep worktree links, provider sessions, and evidence paths valid on upgrade.
+    return legacy if (legacy / "runs.sqlite3").is_file() else local / "Nightweaver"
 
 
 def timestamp():
@@ -61,7 +67,8 @@ class Store:
     def create(self, spec, base):
         run_id = uuid4().hex[:12]
         state = {"phase": "queued", "step": 0, "attempt": 0, "base": base, "accepted": base,
-                 "candidate": None, "last_error": "", "log": None}
+                 "candidate": None, "last_error": "", "log": None,
+                 "result_ref": f"refs/heads/nightweaver/{run_id}"}
         self.directory(run_id).mkdir(parents=True)
         with self.connect() as db:
             db.execute("INSERT INTO runs(id,spec,state,updated) VALUES(?,?,?,?)",

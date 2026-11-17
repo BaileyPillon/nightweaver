@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .engine import Run, create_run
 from .process import runner_active
-from .providers import invoke, json_response
+from .providers import configure_deepseek_key, invoke, json_response
 from .spec import read_plan, validate
 from .store import Store
 
@@ -22,12 +22,13 @@ def output(data):
 
 def with_live_status(store, row):
     lock = store.directory(row["id"]) / "runner.lock"
-    return {**row, "runner_active": runner_active(lock)}
+    ref = row["state"].get("result_ref", f"refs/heads/rookline/{row['id']}")
+    return {**row, "runner_active": runner_active(lock), "result_branch": ref.removeprefix("refs/heads/")}
 
 
 def background(store, run_id, retry):
     root = store.directory(run_id)
-    command = [sys.executable, "-m", "rookline", "--home", str(store.root), "run", run_id]
+    command = [sys.executable, "-m", "nightweaver", "--home", str(store.root), "run", run_id]
     if retry:
         command.append("--retry")
     with (root / "runner.log").open("ab") as out:
@@ -51,14 +52,20 @@ def plan_goal(store, args):
     prompt = (
         "Break the following software goal into one to five ordered milestones. "
         "The runner executes them in isolated Git worktrees. Give each a short title and a detailed, "
-        "self-contained task with a testable accepted result. Preserve user choices and state assumptions. "
+        "self-contained task with a testable accepted result. This runs natively on Windows. "
+        "Preserve user choices and do not invent repository facts or require files to be new unless explicitly requested. "
+        "Every milestone must make a useful tracked change and pass ALL the template checks. "
+        "If those checks require the entire objective, return one milestone. "
         'Return only JSON {"milestones":[{"title":"...","task":"..."}]}. '
         "These checks were chosen by the operator, keep them as provided: "
-        + ", ".join(gates) + "\n\nGoal:\n" + args.objective
+        + json.dumps(raw["gates"]) + "\nProtected paths: " + json.dumps(raw.get("protected_paths", []))
+        + "\n\nGoal:\n" + args.objective
     )
     config = {"kind": args.planner}
     if args.profile_dir:
         config["profile_dir"] = str(Path(args.profile_dir).resolve(strict=True))
+    if args.model:
+        config["model"] = args.model
     log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
     code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
     if code:
@@ -76,7 +83,7 @@ def plan_goal(store, args):
 
 
 def main(argv=None):
-    app = argparse.ArgumentParser(prog="rookline")
+    app = argparse.ArgumentParser(prog="nightweaver")
     app.add_argument("--home", type=Path, help="Override private runtime data directory")
     commands = app.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="Register an explicit plan")
@@ -85,9 +92,13 @@ def main(argv=None):
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
     goal.add_argument("objective")
-    goal.add_argument("--planner", choices=("claude", "codex"), default="claude")
+    goal.add_argument("--planner", choices=("claude", "codex", "deepseek"), default="claude")
     goal.add_argument("--profile-dir")
+    goal.add_argument("--model", help="Model used by the planner")
     goal.add_argument("--start", action="store_true")
+    configure = commands.add_parser("configure", help="Configure a provider using an existing local key file")
+    configure.add_argument("provider", choices=("deepseek",))
+    configure.add_argument("--key-file", type=Path, required=True)
     for name in ("run", "start", "pause", "resume", "status", "events"):
         parser = commands.add_parser(name)
         parser.add_argument("id")
@@ -97,16 +108,19 @@ def main(argv=None):
     commands.add_parser("doctor")
     args = app.parse_args(argv)
     if os.name != "nt":
-        print("Rookline's native process runner requires Windows.", file=sys.stderr)
+        print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
     try:
         store = Store(args.home)
+        os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
         if name == "doctor":
             output({"data_directory": str(store.root),
                     "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "ollama")}})
         elif name == "list":
             output([with_live_status(store, row) for row in store.runs()])
+        elif name == "configure":
+            output(configure_deepseek_key(args.key_file))
         elif name == "add":
             run_id = create_run(store, read_plan(args.plan))
             result = {"run_id": run_id}
@@ -133,5 +147,5 @@ def main(argv=None):
             output({"run_id": args.id, "runner_pid": background(store, args.id, args.retry)})
         return 0
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as error:
-        print(f"Rookline: {error}", file=sys.stderr)
+        print(f"Nightweaver: {error}", file=sys.stderr)
         return 1

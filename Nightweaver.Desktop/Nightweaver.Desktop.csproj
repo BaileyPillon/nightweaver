@@ -5,6 +5,6 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>Rookline</AssemblyName>
+    <AssemblyName>Nightweaver</AssemblyName>
   </PropertyGroup>
 </Project>

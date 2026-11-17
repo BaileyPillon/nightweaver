@@ -1,3 +1,3 @@
-"""Rookline Windows coding-agent orchestration."""
+"""Compatibility entry point for the original Rookline CLI."""
 
-__version__ = "0.1.0"
+from nightweaver import __version__

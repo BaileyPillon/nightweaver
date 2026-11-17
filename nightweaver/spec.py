@@ -5,8 +5,8 @@ from pathlib import Path, PurePosixPath
 import re
 
 
-IMPLEMENTERS = {"codex", "claude", "command"}
-REVIEWERS = {"codex", "claude", "command"}
+IMPLEMENTERS = {"codex", "claude", "deepseek", "command"}
+REVIEWERS = {"codex", "claude", "deepseek", "command"}
 
 
 def command(value, label):
@@ -33,6 +33,12 @@ def provider(value, choices, label):
         out["executable"] = text(value, "executable")
     if value.get("model"):
         out["model"] = text(value, "model")
+    if "api_key" in value:
+        raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
+    if value.get("api_key_file"):
+        if value["kind"] != "deepseek":
+            raise ValueError("api_key_file is supported by the DeepSeek adapter")
+        out["api_key_file"] = str(Path(text(value, "api_key_file")).expanduser().resolve())
     if value.get("profile_dir"):
         profile = Path(text(value, "profile_dir")).expanduser().resolve(strict=True)
         if not profile.is_dir() or value["kind"] == "command":

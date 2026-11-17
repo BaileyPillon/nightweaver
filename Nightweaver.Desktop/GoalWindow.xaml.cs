@@ -1,7 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 
-namespace Rookline.Desktop;
+namespace Nightweaver.Desktop;
 
 public partial class GoalWindow : Window
 {

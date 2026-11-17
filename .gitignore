@@ -11,4 +11,5 @@ obj/
 *.log
 .env
 .env.*
+.nightweaver/
 .rookline/

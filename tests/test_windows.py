@@ -8,11 +8,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from rookline.engine import Run, create_run, git
-from rookline.process import runner_active
-from rookline.providers import ProviderUnavailable
-from rookline.spec import validate
-from rookline.store import Store
+from nightweaver.engine import Run, create_run, git
+from nightweaver.process import runner_active
+from nightweaver.providers import ProviderUnavailable
+from nightweaver.spec import validate
+from nightweaver.store import Store
 
 
 FIXTURE = str(Path(__file__).with_name("fixture.py").resolve())
@@ -25,13 +25,13 @@ def fixture(mode, *args):
 @unittest.skipUnless(os.name == "nt", "Windows owns the controller and test processes")
 class WindowsRunTest(unittest.TestCase):
     def setUp(self):
-        sandbox = TemporaryDirectory(prefix="Rookline test ")
+        sandbox = TemporaryDirectory(prefix="Nightweaver test ")
         self.addCleanup(sandbox.cleanup)
         self.root = Path(sandbox.name)
         self.repo = self.root / "source checkout"
         self.repo.mkdir()
         git(self.repo, "init", "-b", "main")
-        git(self.repo, "config", "user.name", "Rookline Fixture")
+        git(self.repo, "config", "user.name", "Nightweaver Fixture")
         git(self.repo, "config", "user.email", "fixture@example.invalid")
         (self.repo / "result.txt").write_text("original", encoding="utf-8")
         (self.repo / ".gitignore").write_text("receipt.txt\n", encoding="utf-8")
@@ -65,7 +65,7 @@ class WindowsRunTest(unittest.TestCase):
         self.assertIn("attempt_rejected", kinds)
         self.assertEqual(kinds.count("milestone_accepted"), 2)
         self.assertEqual(kinds.count("review_passed"), 2)
-        self.assertEqual(git(self.repo, "show", f"rookline/{run}:delivery.txt"), "second milestone")
+        self.assertEqual(git(self.repo, "show", f"nightweaver/{run}:delivery.txt"), "second milestone")
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.head)
         self.assertEqual((self.repo / "result.txt").read_text(encoding="utf-8"), "original")
         self.assertTrue((self.repo / "untouched.txt").exists())
@@ -74,11 +74,11 @@ class WindowsRunTest(unittest.TestCase):
         run = self.configured(fixture("implement"), gate="drift", attempts=1)
         self.assertEqual(Run(self.store, run).run(), "blocked")
         self.assertIn("changed tracked", self.store.get(run)["state"]["last_error"])
-        self.assertEqual(git(self.repo, "branch", "--list", "rookline/*"), "")
+        self.assertEqual(git(self.repo, "branch", "--list", "nightweaver/*"), "")
 
     def test_expired_profile_blocks_without_repeated_attempts(self):
         run = self.configured(fixture("implement"))
-        with patch("rookline.engine.invoke", side_effect=ProviderUnavailable("Selected profile needs login")) as worker:
+        with patch("nightweaver.engine.invoke", side_effect=ProviderUnavailable("Selected profile needs login")) as worker:
             self.assertEqual(Run(self.store, run).run(), "blocked")
         self.assertEqual(worker.call_count, 1)
         state = self.store.get(run)["state"]
@@ -96,7 +96,7 @@ class WindowsRunTest(unittest.TestCase):
     def test_killed_runner_releases_its_process_tree_and_can_resume(self):
         marker = self.root / "child.pid"
         run = self.configured(fixture("interrupt", str(marker)))
-        command = [sys.executable, "-m", "rookline", "--home", str(self.store.root), "run", run]
+        command = [sys.executable, "-m", "nightweaver", "--home", str(self.store.root), "run", run]
         engine = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 20

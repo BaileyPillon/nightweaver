@@ -26,7 +26,7 @@ def create_run(store, spec):
         raise ValueError(f"Choose the repository root: {root}")
     gitdir = Path(git(root, "rev-parse", "--absolute-git-dir")).resolve()
     if store.root.is_relative_to(root) or store.root.is_relative_to(gitdir):
-        raise ValueError("The Rookline data directory must be outside the source checkout")
+        raise ValueError("The Nightweaver data directory must be outside the source checkout")
     return store.create(spec, git(root, "rev-parse", "HEAD^{commit}"))
 
 
@@ -90,7 +90,7 @@ class Run:
         self.spec = store.get(run_id)["spec"]
         self.root = store.directory(run_id)
         self.repository = Path(self.spec["repository"])
-        self.ref = f"refs/heads/rookline/{run_id}"
+        self.ref = store.get(run_id)["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
 
     def set(self, kind, details=None, **state):
         return self.store.transition(self.id, kind, details, **state)
@@ -159,7 +159,8 @@ class Run:
             log = evidence / f"gate-{index:02d}.log"
             before = {name: artifact_stamp(path, name) for name in check["artifacts"]}
             self.set("gate_started", {"name": check["name"], "tree": snapshot}, log=str(log))
-            env = {**os.environ, "ROOKLINE_EVIDENCE": str(evidence), "ROOKLINE_TREE": snapshot}
+            env = {**os.environ, "NIGHTWEAVER_EVIDENCE": str(evidence), "NIGHTWEAVER_TREE": snapshot,
+                   "ROOKLINE_EVIDENCE": str(evidence), "ROOKLINE_TREE": snapshot}
             code = execute(check["argv"], path, log, check["timeout"], env=env, paused=self.paused)
             receipt = {"name": check["name"], "exit": code, "log": str(log), "tree": snapshot}
             self.set("gate_finished", receipt)
