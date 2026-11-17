@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 from urllib.request import Request, urlopen
 
@@ -13,6 +14,60 @@ from .store import default_home
 
 class ProviderUnavailable(ValueError):
     """An account or service problem that another coding attempt cannot fix."""
+
+    def __init__(self, message, kind="unavailable"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def provider_executable(config):
+    kind = config["kind"]
+    if kind == "command":
+        return config["argv"][0]
+    return config.get("executable", "claude" if kind == "deepseek" else kind)
+
+
+def find_executable(config, cwd):
+    name = provider_executable(config)
+    path = Path(name)
+    if not path.is_absolute() and (path.parent != Path(".") or name.startswith((".", "/", "\\"))):
+        name = str(cwd / path)
+    return shutil.which(name)
+
+
+def profile_override(config):
+    kind = config["kind"]
+    variable = "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"
+    inherited = None if kind == "deepseek" else os.environ.get(variable)
+    return config.get("profile_dir") or inherited
+
+
+def describe_provider(config):
+    kind = config["kind"]
+    if kind == "command":
+        return {"provider": kind, "executable": provider_executable(config)}
+    profile = profile_override(config)
+    if not profile:
+        profile = default_home() / "profiles" / "deepseek" if kind == "deepseek" else Path.home() / f".{kind}"
+    return {"provider": kind, "executable": provider_executable(config),
+            "profile_dir": str(Path(profile).expanduser().resolve()),
+            "model": config.get("model") or ("deepseek-flash" if kind == "deepseek" else "CLI default")}
+
+
+def check_provider(config, cwd):
+    executable = find_executable(config, cwd)
+    if not executable:
+        raise ProviderUnavailable(f"Cannot find {provider_executable(config)}. Install it or set the provider executable.",
+                                  "missing_executable")
+    if config["kind"] == "command":
+        return executable
+    profile = profile_override(config)
+    if profile and not Path(profile).expanduser().is_dir():
+        raise ProviderUnavailable("The selected provider profile directory is missing. Check profile_dir and the CLI environment.",
+                                  "missing_profile")
+    if config["kind"] == "deepseek":
+        deepseek_key(config)
+    return executable
 
 
 def deepseek_key(config):
@@ -27,9 +82,11 @@ def deepseek_key(config):
         try:
             key = Path(source).expanduser().read_text(encoding="utf-8-sig").strip()
         except (OSError, UnicodeError) as error:
-            raise ProviderUnavailable("DeepSeek's configured key file could not be read. Configure an accessible key file.") from error
+            raise ProviderUnavailable("DeepSeek's configured key file could not be read. Configure an accessible key file.",
+                                      "missing_credentials") from error
     if not key or not key.isascii() or any(char.isspace() for char in key):
-        raise ProviderUnavailable("DeepSeek needs a valid key through configure deepseek --key-file, api_key_file, or DEEPSEEK_API_KEY.")
+        raise ProviderUnavailable("DeepSeek needs a valid key through configure deepseek --key-file, api_key_file, or DEEPSEEK_API_KEY.",
+                                  "missing_credentials")
     return key
 
 
@@ -55,7 +112,7 @@ def adapter(config, mode, session=None):
     env = os.environ.copy()
     if kind == "command":
         return config["argv"], env
-    exe = config.get("executable", "claude" if kind == "deepseek" else kind)
+    exe = provider_executable(config)
     model = config.get("model")
     if kind == "deepseek":
         key = deepseek_key(config)
@@ -80,12 +137,17 @@ def adapter(config, mode, session=None):
         argv += ["--json"]
         if config.get("model"):
             argv += ["--model", config["model"]]
+        if mode == "probe":
+            argv += ["--skip-git-repo-check", "--ephemeral"]
         return argv + ["-"], env
     argv = [exe, "--print", "--output-format", "stream-json", "--verbose",
             "--permission-mode", "acceptEdits" if mode == "worker" else "dontAsk"]
     if mode != "worker":
         argv += ["--tools", "Read,Grep,Glob" if mode == "reviewer" else ""]
-    if mode == "planner":
+    if mode == "probe":
+        argv += ["--no-session-persistence", "--strict-mcp-config",
+                 "--system-prompt", "This is a connection test. Reply READY and use no tools."]
+    elif mode == "planner":
         argv += ["--system-prompt", "You are a software milestone planner. Use only the supplied goal and constraints. "
                  "You have no tools and must not request tools or inspect files. Return only the JSON requested by the user, "
                  "without commentary or tool-call markup. Each milestone must be self-contained and testable."]
@@ -121,7 +183,9 @@ def metadata(path, kind):
 
 
 def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None):
+    executable = check_provider(config, cwd)
     argv, env = adapter(config, mode, session)
+    argv = [executable, *argv[1:]]
     if evidence is not None:
         env["NIGHTWEAVER_EVIDENCE"] = str(evidence)
         env["ROOKLINE_EVIDENCE"] = str(evidence)
@@ -138,13 +202,22 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if config["kind"] == "deepseek" and re.search(
                 r"invalid.*api.?key|authentication_error|authentication.fail|insufficient.balance|invalid.authentication", detail, re.I):
             raise ProviderUnavailable("DeepSeek reported an API credential or balance error. "
-                                      "Check the configured key and API account, then resume with --retry.")
-        if re.search(r"authentication_failed|failed to authenticate|not logged in|please log in|refresh token.*expired", detail, re.I):
+                                      "Check the configured key and API account, then resume with --retry.", "credentials_or_balance")
+        if re.search(r"authentication_failed|failed to authenticate|not logged in|please (?:log|sign) in|refresh token.*expired|token.*(expired|revoked)", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} authentication needs renewal for the selected profile. "
-                                      "Sign in with that CLI, then resume this run with --retry.")
+                                      "Sign in with that CLI, then resume this run with --retry.", "authentication")
         if re.search(r"oauth_org_not_allowed|oauth_not_allowed_for_organization|can't use your Claude subscription", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a subscription or organization access error. "
-                                      "Resolve access for the selected profile, then resume this run with --retry.")
+                                      "Resolve access for the selected profile, then resume this run with --retry.", "subscription")
+        if re.search(r"credit balance.*(?:low|insufficient)|billing.hard.limit|insufficient credits", detail, re.I):
+            raise ProviderUnavailable(f"{config['kind']} reported a billing or credit balance problem. Check the selected account.",
+                                      "billing")
+        if re.search(r"usage limit|rate.limit|quota exceeded|too many requests|(?:HTTP|status|API error)[: ]+429\b", detail, re.I):
+            raise ProviderUnavailable(f"{config['kind']} reached a rate or usage limit. Retry after the limit resets.",
+                                      "usage_limit")
+        if re.search(r"model_not_found|unsupported model|model .*?(?:not found|does not exist|not supported|not available)", detail, re.I):
+            raise ProviderUnavailable(f"{config['kind']} could not use the selected model. Check model access for this profile.",
+                                      "model_access")
     return code, current or session, answer
 
 

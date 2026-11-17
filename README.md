@@ -64,12 +64,33 @@ The compiled desktop app accepts `--home <runtime-directory>` and `--python <pyt
 
 Choose the repository root with the committed base you want. Set `repository`, `title`, `objective`, `worker`, `gates`, and ordered `milestones` in a local JSON plan. A milestone can specify a different `worker`, its own extra `gates`, and its allowed `paths`. `protected_paths` defends tracked checks and project boundaries during promotion. Run with trusted plans and projects. Custom commands run with your Windows permissions, and provider tool calls use the provider's permissions.
 
-Set `expected_base` to a full Git commit hash to reject the wrong starting version. Nightweaver records the resolved checkout and serializes runs that share a Git directory, including linked worktrees. Independent clones have separate Git directories, so use the intended checkout's absolute path if you keep multiple copies.
+Set `expected_base` to a full Git commit hash to reject the wrong starting version. Nightweaver records the resolved checkout and serializes runs that share a Git directory, including linked worktrees.
+
+### Register the canonical checkout
+
+```powershell
+python -m nightweaver project bind journal 'C:\Projects\field-journal'
+python -m nightweaver project list
+```
+
+Set `"project": "journal"` in a plan or OneShot template to use that checkout. Omit `repository`, or supply it as an explicit assertion that must match the binding. A second clone is rejected even at the same commit. Bindings live in the selected Nightweaver runtime. Use `project bind journal <new-root> --replace` to redirect future runs. Already registered runs keep their original checkout and base.
 
 - **OneShot.** Create a template with the repository, title, worker, and trusted checks. `python -m nightweaver goal template.json "Your goal" --planner claude --start` makes a fresh plan of up to five milestones and starts it. Omit `--start` to print the proposed plan first. Use `--profile-dir` to select an existing planner configuration directory.
 - **Checks.** Each gate has a `name`, an executable `argv` array, an optional `timeout` in seconds, and an optional `artifacts` array of paths relative to the worktree. Put whole-project checks under `final_gates`. These run on the final candidate in addition to its regular checks. Use the `acceptance` array for requirements the worker and reviewer should carry across milestones, including visual criteria.
 - **Profiles.** The `codex` and `claude` workers and reviewers accept `model`, `executable`, and `profile_dir`. Log into each chosen profile with its own CLI. The engine passes the matching configuration directory to that process. Use `reviewer` with `{"kind":"claude"}` or `{"kind":"codex"}` to require a fresh review. A custom `command` reviewer receives the brief on stdin and must emit a JSON `verdict` (`PASS` or `REVISE`) and `reason`.
 - **Recovery.** `python -m nightweaver resume <run-id>` starts an interrupted or paused run again. After correcting an external blocker, use `resume <run-id> --retry`. Interrupted workers recover without using up a repair attempt, and their original attempt logs remain available. Use the dashboard or `events` to inspect the run.
+
+### Check provider readiness
+
+```powershell
+python -m nightweaver doctor --plan plan.json
+python -m nightweaver doctor --plan plan.json --planner deepseek --live
+python -m nightweaver doctor --planner claude --profile-dir 'C:\Profiles\claude-work' --live
+```
+
+The report resolves the plan's checkout and identifies which executable, profile and model each role will use. A non-live report checks local configuration. With `--live`, Nightweaver sends a small test prompt per distinct model route from an empty directory. A successful model reply confirms access at the time of the check. Live requests use your normal subscription limits or API balance. Ollama is checked by listing local models. Custom commands are checked for executable availability and run only as part of the plan.
+
+The command exits with status 3 if a required model route is blocked or a live request could not be verified. On a run, a missing CLI, missing selected profile, or recognized account, model, or usage-limit error blocks with the affected role and profile. Correct that route and retry the existing run. [Claude profile settings](https://code.claude.com/docs/en/settings) · [Ollama model listing](https://docs.ollama.com/api/tags)
 
 ## Queue and recover runs on Windows
 

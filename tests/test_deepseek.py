@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from nightweaver.cli import plan_goal
 from nightweaver.providers import ProviderUnavailable, adapter, configure_deepseek_key, deepseek_key, invoke
+from nightweaver.readiness import check_route
 from nightweaver.spec import IMPLEMENTERS, provider
 from nightweaver.store import Store
 
@@ -73,7 +74,7 @@ class DeepSeekTest(unittest.TestCase):
             return 0
 
         with patch("nightweaver.providers.execute", side_effect=finished):
-            result = invoke({"kind": "deepseek", "api_key_file": str(self.key_file)}, "reviewer",
+            result = invoke({"kind": "deepseek", "api_key_file": str(self.key_file), "executable": sys.executable}, "reviewer",
                             self.root, log, "Review the candidate", 30, lambda: False, evidence=evidence)
         self.assertEqual(result, (0, "review-session", "verified"))
 
@@ -82,7 +83,7 @@ class DeepSeekTest(unittest.TestCase):
         log.write_text('{"type":"result","result":"Authentication Fails (invalid API key)"}\n', encoding="utf-8")
         with patch("nightweaver.providers.execute", return_value=1):
             with self.assertRaisesRegex(ProviderUnavailable, "credential or balance"):
-                invoke({"kind": "deepseek", "api_key_file": str(self.key_file)}, "worker",
+                invoke({"kind": "deepseek", "api_key_file": str(self.key_file), "executable": sys.executable}, "worker",
                        self.root, log, "Implement", 30, lambda: False)
 
     def test_oneshot_routes_to_deepseek_and_preserves_checks(self):
@@ -103,6 +104,16 @@ class DeepSeekTest(unittest.TestCase):
         self.assertEqual(result["final_gates"], [final])
         self.assertIn("Deliver the final artifact.", planner.call_args.args[4])
         self.assertEqual(result["worker"], {"kind": "deepseek"})
+
+    def test_readiness_checks_the_selected_profile_before_probing(self):
+        store = Store(self.root / "runtime")
+        config = {"kind": "claude", "executable": sys.executable,
+                  "profile_dir": str(self.root / "deleted profile")}
+        with patch("nightweaver.readiness.invoke") as probe:
+            result = check_route(store, config, self.root, live=True)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "missing_profile")
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

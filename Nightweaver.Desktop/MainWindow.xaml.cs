@@ -253,7 +253,17 @@ public partial class MainWindow : Window
             string error = Get(state, "last_error");
             if (phase == "blocked" && error.Length > 0)
                 current += $"\n{Brief(error)}";
-            return new(Get(data, "id"), Get(spec, "title"), phase, pause, active, queued, prerequisites.Length > 0,
+            if (phase == "blocked" && state.TryGetProperty("provider_issue", out var issue) &&
+                issue.ValueKind == JsonValueKind.Object)
+            {
+                current += $"\n{Display(Get(issue, "role"))} · {Display(Get(issue, "provider"))}";
+                if (issue.TryGetProperty("profile_dir", out var profile))
+                    current += $"\n{profile.GetString()}";
+            }
+            string title = Get(spec, "title");
+            if (spec.TryGetProperty("project", out var project))
+                title = $"{project.GetString()} · {title}";
+            return new(Get(data, "id"), title, phase, pause, active, queued, prerequisites.Length > 0,
                 subtitle, current,
                 Get(state, "accepted")[..12], Get(data, "result_branch"));
         }

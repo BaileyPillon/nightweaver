@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from nightweaver.cli import dispatch
-from nightweaver.engine import Run, create_run, git
+from nightweaver.engine import Run, checkout, create_run, git
 from nightweaver.process import BusyRun, run_lock, runner_active
 from nightweaver.providers import ProviderUnavailable
 from nightweaver.spec import validate
@@ -153,6 +153,26 @@ class WindowsRunTest(unittest.TestCase):
         self.assertEqual(self.store.get(dependent)["state"]["phase"], "done")
         for run in (paused, manual):
             self.assertEqual(self.store.get(run)["state"]["phase"], "queued")
+
+    def test_project_binding_rejects_an_identical_clone_and_preserves_pinned_run(self):
+        clone = self.root / "independent clone"
+        git(self.root, "clone", str(self.repo), str(clone))
+        self.assertEqual(git(clone, "rev-parse", "HEAD"), self.head)
+        self.store.bind_project("journal", *checkout(self.repo.resolve()))
+        raw = {"project": "JOURNAL", "title": "Bound project", "objective": "Use the canonical copy",
+               "worker": {"kind": "command", "argv": fixture("implement")},
+               "gates": [{"name": "fixture check", "argv": fixture("gate")}],
+               "milestones": [{"title": "Prepare fixture", "task": "Set the value"}]}
+        spec = validate(raw, self.root, self.store)
+        run_id = create_run(self.store, spec)
+        with self.assertRaisesRegex(ValueError, "bound to"):
+            validate({**raw, "repository": str(clone)}, self.root, self.store)
+        with self.assertRaisesRegex(ValueError, "Use --replace"):
+            self.store.bind_project("journal", *checkout(clone.resolve()))
+        self.store.bind_project("journal", *checkout(clone.resolve()), replace=True)
+        with self.assertRaisesRegex(ValueError, "no longer matches"):
+            create_run(self.store, spec)
+        self.assertEqual(Path(self.store.get(run_id)["spec"]["repository"]), self.repo.resolve())
 
 
 if __name__ == "__main__":

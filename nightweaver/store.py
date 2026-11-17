@@ -40,6 +40,10 @@ class Store:
                     time TEXT NOT NULL, kind TEXT NOT NULL, details TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS events_for_run ON events(run_id, seq);
+                CREATE TABLE IF NOT EXISTS projects (
+                    name TEXT PRIMARY KEY COLLATE NOCASE, repository TEXT NOT NULL,
+                    git_common_dir TEXT NOT NULL
+                );
             """)
 
     @contextmanager
@@ -63,6 +67,30 @@ class Store:
         if not re.fullmatch(r"[0-9a-f]{12}", run_id):
             raise ValueError("Invalid run ID")
         return self.root / "runs" / run_id
+
+    def projects(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM projects ORDER BY name")]
+
+    def project(self, name):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
+            if row is None:
+                raise ValueError(f"Project {name!r} is not registered in this Nightweaver runtime")
+            return dict(row)
+
+    def bind_project(self, name, repository, gitdir, replace=False):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+            raise ValueError("Project names must be 1 to 64 letters, numbers, dots, underscores or hyphens")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
+            if old and not replace and (Path(old["repository"]) != repository or Path(old["git_common_dir"]) != gitdir):
+                raise ValueError(f"Project {name!r} is bound to {old['repository']}. Use --replace to change it.")
+            db.execute("""INSERT INTO projects VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE
+                          SET repository=excluded.repository, git_common_dir=excluded.git_common_dir""",
+                       (name, str(repository), str(gitdir)))
+        return self.project(name)
 
     def create(self, spec, base, *, enqueue=False, after=()):
         run_id = uuid4().hex[:12]

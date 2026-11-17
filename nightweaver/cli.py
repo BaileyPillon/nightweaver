@@ -4,16 +4,16 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
 from uuid import uuid4
 
-from .engine import Run, create_run, pending_dependencies
+from .engine import Run, checkout, create_run, pending_dependencies, source_info
 from .process import BusyRun, run_lock, runner_active
 from .providers import configure_deepseek_key, invoke, json_response
-from .spec import read_plan, validate
+from .readiness import diagnose
+from .spec import read_plan, resolve_repository, validate
 from .store import Store, timestamp
 
 
@@ -69,10 +69,10 @@ def background(store, run_id, retry):
 def plan_goal(store, args):
     path = Path(args.template).resolve(strict=True)
     raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    repository = Path(raw["repository"]).expanduser()
-    if not repository.is_absolute():
-        repository = (path.parent / repository).resolve()
+    repository, project = resolve_repository(raw, path.parent, store)
     raw["repository"] = str(repository)
+    if project:
+        raw["project"] = project["name"]
     raw["objective"] = args.objective
     gates = raw.get("gates", [])
     final_gates = raw.get("final_gates", [])
@@ -93,11 +93,9 @@ def plan_goal(store, args):
         + "\nProtected paths: " + json.dumps(raw.get("protected_paths", []))
         + "\n\nGoal:\n" + args.objective
     )
-    config = {"kind": args.planner}
-    if args.profile_dir:
-        config["profile_dir"] = str(Path(args.profile_dir).resolve(strict=True))
-    if args.model:
-        config["model"] = args.model
+    if project or "expected_base" in raw:
+        source_info(store, raw)
+    config = planner_route(args)
     log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
     code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
     if code:
@@ -107,11 +105,20 @@ def plan_goal(store, args):
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 5:
         raise ValueError(f"Planner did not return one to five milestones. See {log}")
     raw["milestones"] = [{"title": item["title"], "task": item["task"]} for item in milestones]
-    spec = validate(raw)
+    spec = validate(raw, store=store)
     if args.start or args.enqueue:
         result = register(store, spec, args)
         return {**result, "milestones": raw["milestones"]}
     return raw
+
+
+def planner_route(args):
+    config = {"kind": args.planner}
+    if args.profile_dir:
+        config["profile_dir"] = str(Path(args.profile_dir).expanduser().resolve())
+    if args.model:
+        config["model"] = args.model
+    return config
 
 
 def register(store, spec, args):
@@ -131,9 +138,20 @@ def main(argv=None):
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
     goal.add_argument("objective")
-    goal.add_argument("--planner", choices=("claude", "codex", "deepseek"), default="claude")
-    goal.add_argument("--profile-dir")
-    goal.add_argument("--model", help="Model used by the planner")
+    doctor = commands.add_parser("doctor", help="Check repository and provider readiness")
+    doctor.add_argument("--plan", help="Check the exact provider routes in a plan")
+    doctor.add_argument("--live", action="store_true", help="Make a small model request per distinct provider route")
+    for parser in (goal, doctor):
+        parser.add_argument("--planner", choices=("claude", "codex", "deepseek"), default="claude" if parser is goal else None)
+        parser.add_argument("--profile-dir")
+        parser.add_argument("--model", help="Model used by the planner")
+    project = commands.add_parser("project", help="Manage canonical project checkouts")
+    project_commands = project.add_subparsers(dest="project_action", required=True)
+    project_commands.add_parser("list")
+    bind = project_commands.add_parser("bind")
+    bind.add_argument("project_name")
+    bind.add_argument("repository", type=Path)
+    bind.add_argument("--replace", action="store_true", help="Change an existing project's binding for future runs")
     for parser in (add, goal):
         launch = parser.add_mutually_exclusive_group()
         launch.add_argument("--start", action="store_true", help="Start a dedicated runner now")
@@ -152,10 +170,14 @@ def main(argv=None):
         if name in ("run", "start", "resume"):
             parser.add_argument("--retry", action="store_true", help="Try a blocked run again")
     commands.add_parser("list")
-    commands.add_parser("doctor")
     args = app.parse_args(argv)
     if getattr(args, "after", None) and not args.enqueue:
         app.error("--after requires --enqueue")
+    if args.command == "doctor":
+        if args.live and not (args.plan or args.planner):
+            app.error("--live requires --plan or --planner")
+        if (args.profile_dir or args.model) and not args.planner:
+            app.error("--profile-dir and --model require --planner")
     if os.name != "nt":
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
@@ -164,14 +186,22 @@ def main(argv=None):
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
         if name == "doctor":
-            output({"data_directory": str(store.root),
-                    "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "ollama")}})
+            report = diagnose(store, read_plan(args.plan, store) if args.plan else None,
+                              planner_route(args) if args.planner else None, args.live)
+            output(report)
+            return 3 if any(route["status"] in {"blocked", "unverified"} for route in report.get("providers", [])) else 0
+        elif name == "project":
+            if args.project_action == "list":
+                output(store.projects())
+            else:
+                repository, gitdir = checkout(args.repository.expanduser().resolve(strict=True))
+                output(store.bind_project(args.project_name, repository, gitdir, args.replace))
         elif name == "list":
             output([with_live_status(store, row) for row in store.runs()])
         elif name == "configure":
             output(configure_deepseek_key(args.key_file))
         elif name == "add":
-            output(register(store, read_plan(args.plan), args))
+            output(register(store, read_plan(args.plan, store), args))
         elif name == "goal":
             output(plan_goal(store, args))
         elif name == "status":

@@ -4,14 +4,14 @@ Nightweaver addresses recurring failure modes in long-running coding work. Verif
 
 | Failure mode | What Nightweaver does |
 | --- | --- |
-| Several sessions or replicas are working on different versions of a project | Pin the source repository and base commit when registering a run. Optionally require an exact expected starting commit. Serialize linked checkouts via their shared Git directory, isolate each milestone, and advance result branches atomically. |
+| Several sessions or replicas are working on different versions of a project | Bind a project name to a canonical checkout and reject a mismatched clone. Pin the exact source and base when registering each run. Serialize linked checkouts via their shared Git directory and advance result branches atomically. |
 | A worker says it finished, but no result can be reproduced | Run operator-authored checks against the staged implementation and detect tracked changes during checking or review. Record the exact tree, exit code, log and artifact hashes. |
 | An agent fixes an assertion instead of fixing the product | Support tracked protected paths and optional tracked edit allowlists. Store the check commands in the run plan, outside the worker's checkout. |
 | A browser flow works while the interface still looks wrong | Let the project require fresh screenshots and an independent review decision. Feed an actionable `REVISE` result into the next worker attempt. |
 | A long tool call times out or the control surface closes | Keep the run independent of the dashboard. A dispatcher can recover enrolled runs at Windows sign-in and preserve the worktree, logs and repair budget after interruption. |
 | One agent or session loses the original goal | Give each worker the objective, acceptance requirements, previous accepted commits, current check commands, and latest failure. Final checks verify the completed result against whole-project requirements. |
 | A local model approves a broken result | Gate promotion on command checks and any required reviewer verdict. Store local Ollama output as advice. |
-| Multiple CLI accounts or model subscriptions are in use | Allow per-role provider and profile selection. Subscription authentication remains with the installed CLI. DeepSeek uses a separate API key file and configuration directory, with endpoint and credentials set only for its child process. |
+| Multiple CLI accounts or model subscriptions are in use | Report the selected provider, profile and model for each role. Offer a live model request before execution and classify recognized authentication, subscription, model access and usage errors during a run. |
 
 ## Current limits
 
@@ -24,4 +24,4 @@ Nightweaver addresses recurring failure modes in long-running coding work. Verif
 
 ## Next priorities
 
-Add a project registry for tracking canonical checkouts across independent clones. Improve provider readiness and show why an account, model or prerequisite is blocking a run. Add screenshot comparisons and project-specific browser flows that can be reused across runs.
+Add screenshot comparisons and reusable browser flows. Show blocked prerequisites and their underlying failures directly in the dependent run. Track provider availability over time so one successful probe can be distinguished from reliable access.

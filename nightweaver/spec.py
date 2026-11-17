@@ -40,9 +40,9 @@ def provider(value, choices, label):
             raise ValueError("api_key_file is supported by the DeepSeek adapter")
         out["api_key_file"] = str(Path(text(value, "api_key_file")).expanduser().resolve())
     if value.get("profile_dir"):
-        profile = Path(text(value, "profile_dir")).expanduser().resolve(strict=True)
-        if not profile.is_dir() or value["kind"] == "command":
-            raise ValueError("profile_dir must be an existing Claude or Codex configuration directory")
+        profile = Path(text(value, "profile_dir")).expanduser().resolve()
+        if value["kind"] == "command":
+            raise ValueError("profile_dir is supported by model providers")
         out["profile_dir"] = str(profile)
     return out
 
@@ -64,15 +64,28 @@ def gate_spec(item):
             "timeout": timeout, "artifacts": [artifact(path) for path in item.get("artifacts", [])]}
 
 
-def validate(raw, relative_to=None):
+def resolve_repository(raw, relative_to=None, store=None):
     if not isinstance(raw, dict):
         raise ValueError("A plan must be a JSON object")
-    root = Path(text(raw, "repository")).expanduser()
+    project = None
+    if "project" in raw:
+        if store is None:
+            raise ValueError("A registered project requires a Nightweaver runtime")
+        project = store.project(text(raw, "project"))
+    value = project["repository"] if project and "repository" not in raw else text(raw, "repository")
+    root = Path(value).expanduser()
     if not root.is_absolute():
         root = (relative_to or Path.cwd()) / root
     repository = root.resolve(strict=True)
     if not repository.is_dir():
         raise ValueError("Repository must be a folder")
+    if project and repository != Path(project["repository"]):
+        raise ValueError(f"Project {project['name']!r} is bound to {project['repository']}, but the plan selects {repository}")
+    return repository, project
+
+
+def validate(raw, relative_to=None, store=None):
+    repository, project = resolve_repository(raw, relative_to, store)
     timeout = raw.get("agent_timeout", 1800)
     if type(timeout) is not int or not 1 <= timeout <= 14400:
         raise ValueError("Agent timeout must be between 1 and 14400 seconds")
@@ -99,6 +112,9 @@ def validate(raw, relative_to=None):
     out = {"repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
            "attempts": retries, "agent_timeout": timeout, "milestones": steps,
            "protected_paths": [artifact(path) for path in raw.get("protected_paths", [])]}
+    if project:
+        out["project"] = project["name"]
+        out["git_common_dir"] = project["git_common_dir"]
     criteria = raw.get("acceptance", [])
     if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
         raise ValueError("acceptance must be a list of nonempty requirements")
@@ -127,6 +143,6 @@ def validate(raw, relative_to=None):
     return out
 
 
-def read_plan(path):
+def read_plan(path, store=None):
     path = Path(path).resolve(strict=True)
-    return validate(json.loads(path.read_text(encoding="utf-8-sig")), path.parent)
+    return validate(json.loads(path.read_text(encoding="utf-8-sig")), path.parent, store)

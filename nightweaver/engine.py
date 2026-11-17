@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 from .process import BusyRun, PausedRun, execute, run_lock
-from .providers import ProviderUnavailable, advisory, invoke, json_response, metadata
+from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata
 
 
 def git(repo, *args):
@@ -28,23 +28,36 @@ def pending_dependencies(store, state):
     return [item for item in state.get("after", []) if store.get(item)["state"]["phase"] != "done"]
 
 
-def create_run(store, spec, *, enqueue=False, after=()):
-    path = Path(spec["repository"])
+def checkout(path):
     root = Path(git(path, "rev-parse", "--show-toplevel")).resolve()
     if root != path:
         raise ValueError(f"Choose the repository root: {root}")
-    gitdir = common_dir(root)
+    return root, common_dir(root)
+
+
+def source_info(store, spec):
+    root, gitdir = checkout(Path(spec["repository"]))
     if store.root.is_relative_to(root) or store.root.is_relative_to(gitdir):
         raise ValueError("The Nightweaver data directory must be outside the source checkout")
+    if "project" in spec:
+        project = store.project(spec["project"])
+        if Path(project["repository"]) != root or Path(project["git_common_dir"]) != gitdir:
+            raise ValueError(f"The checkout no longer matches the binding for project {project['name']!r}")
     base = git(root, "rev-parse", "HEAD^{commit}")
-    if spec.get("expected_base", base) != base:
+    if str(spec.get("expected_base", base)).lower() != base:
         raise ValueError(f"The chosen checkout is at {base}, expected {spec['expected_base']}")
+    return {"repository": str(root), "git_common_dir": str(gitdir), "base": base}
+
+
+def create_run(store, spec, *, enqueue=False, after=()):
+    source = source_info(store, spec)
     if after and not enqueue:
         raise ValueError("Run dependencies require --enqueue")
     for dependency in after:
         store.directory(dependency)
         store.get(dependency)
-    return store.create({**spec, "git_common_dir": str(gitdir)}, base, enqueue=enqueue, after=dict.fromkeys(after))
+    return store.create({**spec, "git_common_dir": source["git_common_dir"]}, source["base"],
+                        enqueue=enqueue, after=dict.fromkeys(after))
 
 
 def tail(path, count=3600):
@@ -286,7 +299,7 @@ class Run:
                 raise BusyRun("Waiting for prerequisite runs: " + ", ".join(pending))
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
-                         attempts_used=0, blocked_from=None)
+                         attempts_used=0, blocked_from=None, provider_issue=None)
             self.gitdir = None
             while True:
                 state = self.store.get(self.id)["state"]
@@ -331,8 +344,12 @@ class Run:
                     raise
                 except ProviderUnavailable as error:
                     actual = self.store.get(self.id)["state"]["phase"]
-                    self.set("provider_unavailable", {"issue": str(error)}, phase="blocked",
-                             blocked_from="ready" if actual == "working" else actual, last_error=str(error))
+                    role = "reviewer" if actual == "reviewing" else "worker"
+                    config = self.spec["reviewer"] if role == "reviewer" else step["worker"]
+                    provider = {**describe_provider(config), "role": role, "reason": error.kind}
+                    self.set("provider_unavailable", {"issue": str(error), **provider}, phase="blocked",
+                             blocked_from="ready" if actual == "working" else actual, last_error=str(error),
+                             provider_issue=provider)
                     return "blocked"
                 except (OSError, ValueError, subprocess.TimeoutExpired) as error:
                     actual = self.store.get(self.id)["state"]["phase"]
