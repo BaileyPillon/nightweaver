@@ -8,6 +8,7 @@ Windows-native orchestration for coding agents. Give Rookline a goal with checke
 - Native Codex and Claude Code CLI adapters. Use your existing CLI logins or select a specific installed profile for a role. An optional local Ollama model supplies advisory feedback. You can also plug in a custom executable.
 - A pinned Git baseline and a separate worktree per milestone. Accepted commits land on `rookline/<run-id>` for inspection or integration.
 - Independent operator-defined checks, with optional required screenshots or other files and a separate reviewer. Check receipts bind artifacts and decisions to a Git tree. Failed checks feed the next attempt automatically.
+- A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair.
 - A background runner with Windows Job Objects for child process cleanup. Relaunch a failed or interrupted runner against the same durable state, worktree, and recorded provider session where available.
 
 ## Try it without model accounts

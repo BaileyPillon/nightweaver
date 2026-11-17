@@ -196,6 +196,9 @@ class Run:
                 "If required evidence cannot be read or has not been inspected, return REVISE and explain. Remain read-only. "
                 'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision
             )
+            if state["step"] + 1 == len(self.spec["milestones"]):
+                prompt += ("\nThis is the final milestone. Also check the complete project objective against the current "
+                           "worktree and supplied evidence. Return REVISE for any unfulfilled part of that objective.")
             code, _, answer = invoke(self.spec["reviewer"], "reviewer", path, log, prompt,
                                      self.spec["agent_timeout"], self.paused, evidence=evidence)
             try:
