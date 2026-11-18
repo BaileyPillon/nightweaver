@@ -56,7 +56,7 @@ def ollama_readiness(config):
 
 def diagnose(store, spec=None, planner=None, live=False):
     report = {"data_directory": str(store.root),
-              "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "ollama")}}
+              "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "gemini", "ollama")}}
     if not spec and not planner:
         return report
     roles = []
@@ -68,6 +68,9 @@ def diagnose(store, spec=None, planner=None, live=False):
                  for index, step in enumerate(spec["milestones"], 1)]
         if "reviewer" in spec:
             roles.append(("reviewer", spec["reviewer"]))
+        for index, step in enumerate(spec["milestones"], 1):
+            roles.extend((f"worker {index} fallback {number}", route) for number, route in enumerate(step.get("worker_fallbacks", []), 1))
+        roles.extend((f"reviewer fallback {number}", route) for number, route in enumerate(spec.get("reviewer_fallbacks", []), 1))
     if planner:
         roles.insert(0, ("planner", planner))
     routes = {}

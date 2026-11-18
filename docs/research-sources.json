@@ -1,0 +1,102 @@
+{
+  "checked_on": "2026-11-18",
+  "scope": "Focused relevance survey; not exhaustive GitHub coverage",
+  "repositories": [
+    {
+      "repository": "fynnfluegge/agtx",
+      "url": "https://github.com/fynnfluegge/agtx",
+      "archived": false,
+      "license": "Apache-2.0",
+      "default_branch": "main",
+      "pushed_at": "2026-11-03T10:12:19Z"
+    },
+    {
+      "repository": "OpenHands/software-agent-sdk",
+      "url": "https://github.com/OpenHands/software-agent-sdk",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T17:14:49Z"
+    },
+    {
+      "repository": "langchain-ai/langgraph",
+      "url": "https://github.com/langchain-ai/langgraph",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T16:50:58Z"
+    },
+    {
+      "repository": "temporalio/sdk-python",
+      "url": "https://github.com/temporalio/sdk-python",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T15:14:25Z"
+    },
+    {
+      "repository": "SWE-agent/mini-swe-agent",
+      "url": "https://github.com/SWE-agent/mini-swe-agent",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-11-16T22:30:40Z"
+    },
+    {
+      "repository": "SWE-bench/SWE-bench",
+      "url": "https://github.com/SWE-bench/SWE-bench",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-09-18T05:08:56Z"
+    },
+    {
+      "repository": "promptfoo/promptfoo",
+      "url": "https://github.com/promptfoo/promptfoo",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T16:49:00Z"
+    },
+    {
+      "repository": "BerriAI/litellm",
+      "url": "https://github.com/BerriAI/litellm",
+      "archived": false,
+      "license": "NOASSERTION",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T17:26:03Z"
+    },
+    {
+      "repository": "Aider-AI/aider",
+      "url": "https://github.com/Aider-AI/aider",
+      "archived": false,
+      "license": "Apache-2.0",
+      "default_branch": "main",
+      "pushed_at": "2026-05-22T14:02:20Z"
+    },
+    {
+      "repository": "microsoft/playwright",
+      "url": "https://github.com/microsoft/playwright",
+      "archived": false,
+      "license": "Apache-2.0",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T17:18:22Z"
+    },
+    {
+      "repository": "google-gemini/gemini-cli",
+      "url": "https://github.com/google-gemini/gemini-cli",
+      "archived": false,
+      "license": "Apache-2.0",
+      "default_branch": "main",
+      "pushed_at": "2026-11-18T01:06:44Z"
+    },
+    {
+      "repository": "cli/cli",
+      "url": "https://github.com/cli/cli",
+      "archived": false,
+      "license": "MIT",
+      "default_branch": "trunk",
+      "pushed_at": "2026-11-18T17:25:32Z"
+    }
+  ]
+}

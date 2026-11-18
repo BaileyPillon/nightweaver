@@ -5,8 +5,28 @@ from pathlib import Path, PurePosixPath
 import re
 
 
-IMPLEMENTERS = {"codex", "claude", "deepseek", "command"}
-REVIEWERS = {"codex", "claude", "deepseek", "command"}
+IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
+REVIEWERS = IMPLEMENTERS
+
+
+def fields(value, allowed, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    unknown = set(value) - set(allowed.split())
+    if unknown:
+        raise ValueError(f"Unknown {label} fields: {', '.join(sorted(unknown))}")
+
+
+def array(value, label, maximum=100):
+    if not isinstance(value, list) or len(value) > maximum:
+        raise ValueError(f"{label} must be a list of at most {maximum} items")
+    return value
+
+
+def integer(value, label, low, high):
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f"{label} must be an integer between {low} and {high}")
+    return value
 
 
 def command(value, label):
@@ -24,11 +44,16 @@ def text(obj, key):
 
 
 def provider(value, choices, label):
+    fields(value, "kind argv executable model api_key api_key_file profile_dir", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
     if value["kind"] == "command":
+        if set(value) - {"kind", "argv"}:
+            raise ValueError("Command providers accept only kind and argv")
         out["argv"] = command(value.get("argv"), label)
+    elif "argv" in value:
+        raise ValueError("Only command providers accept argv")
     elif value.get("executable"):
         out["executable"] = text(value, "executable")
     if value.get("model"):
@@ -48,20 +73,38 @@ def provider(value, choices, label):
 
 
 def artifact(value):
-    if not isinstance(value, str) or "\\" in value:
+    if not isinstance(value, str) or "\\" in value or any(ord(c) < 32 for c in value):
         raise ValueError("Artifact paths use forward slashes")
     path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts or ":" in value:
+    if path.is_absolute() or not path.parts or ".." in path.parts or any(c in value for c in ':*?"<>|'):
         raise ValueError(f"Artifact must be relative to the worktree: {value}")
+    for part in path.parts:
+        if part.endswith((" ", ".")) or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part):
+            raise ValueError(f"Invalid Windows path component: {part}")
     return path.as_posix()
 
 
 def gate_spec(item):
+    fields(item, "name argv timeout artifacts kind browser max_artifact_bytes", "gate")
     timeout = item.get("timeout", 120)
     if type(timeout) is not int or not 1 <= timeout <= 7200:
         raise ValueError("Gate timeout must be between 1 and 7200 seconds")
-    return {"name": text(item, "name"), "argv": command(item.get("argv"), "Gate"),
-            "timeout": timeout, "artifacts": [artifact(path) for path in item.get("artifacts", [])]}
+    artifacts = [artifact(path) for path in array(item.get("artifacts", []), "artifacts", 32)]
+    if len({p.casefold() for p in artifacts}) != len(artifacts):
+        raise ValueError("Duplicate artifact paths")
+    result = {"name": text(item, "name"), "timeout": timeout, "artifacts": artifacts,
+              "max_artifact_bytes": integer(item.get("max_artifact_bytes", 32 * 1024 * 1024), "max_artifact_bytes", 1, 256 * 1024 * 1024)}
+    kind = item.get("kind", "command")
+    if kind == "browser":
+        from .browser import validate_browser
+        if "argv" in item or artifacts:
+            raise ValueError("Browser gates manage their own command and evidence")
+        result.update(kind="browser", browser=validate_browser(item.get("browser")))
+    elif kind == "command" and "browser" not in item:
+        result["argv"] = command(item.get("argv"), "Gate")
+    else:
+        raise ValueError("Gate kind must be command or browser")
+    return result
 
 
 def resolve_repository(raw, relative_to=None, store=None):
@@ -85,6 +128,11 @@ def resolve_repository(raw, relative_to=None, store=None):
 
 
 def validate(raw, relative_to=None, store=None):
+    fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
+           "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
+           "reviewer_fallbacks context_files repository_map source_issue", "plan")
+    if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
+        raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
     timeout = raw.get("agent_timeout", 1800)
     if type(timeout) is not int or not 1 <= timeout <= 14400:
@@ -92,26 +140,54 @@ def validate(raw, relative_to=None, store=None):
     retries = raw.get("attempts", 3)
     if type(retries) is not int or not 1 <= retries <= 10:
         raise ValueError("Attempts must be between 1 and 10")
-    gates = [gate_spec(item) for item in raw.get("gates", [])]
-    final_gates = [gate_spec(item) for item in raw.get("final_gates", [])]
-    milestones = raw.get("milestones", [])
+    gates = [gate_spec(item) for item in array(raw.get("gates", []), "gates")]
+    final_gates = [gate_spec(item) for item in array(raw.get("final_gates", []), "final_gates")]
+    milestones = array(raw.get("milestones", []), "milestones", 50)
     steps = []
     for index, item in enumerate(milestones):
-        current = gates + [gate_spec(g) for g in item.get("gates", [])]
+        fields(item, "title task gates paths worker worker_fallbacks", "milestone")
+        current = gates + [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
         if index == len(milestones) - 1:
             current += final_gates
         names = [g["name"] for g in current]
         if not names or len(names) != len(set(names)):
             raise ValueError("Each milestone needs uniquely named checks")
-        paths = item.get("paths", [])
+        paths = array(item.get("paths", []), "paths")
         steps.append({"title": text(item, "title"), "task": text(item, "task"), "gates": current,
                       "paths": [artifact(path) for path in paths],
-                      "worker": provider(item.get("worker") or raw.get("worker"), IMPLEMENTERS, "worker")})
+                      "worker": provider(item.get("worker") or raw.get("worker"), IMPLEMENTERS, "worker"),
+                      "worker_fallbacks": [provider(p, IMPLEMENTERS, "worker fallback") for p in
+                                           array(item.get("worker_fallbacks", raw.get("worker_fallbacks", [])), "worker_fallbacks", 5)]})
     if not steps:
         raise ValueError("At least one milestone is required")
-    out = {"repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
+    out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
            "attempts": retries, "agent_timeout": timeout, "milestones": steps,
-           "protected_paths": [artifact(path) for path in raw.get("protected_paths", [])]}
+           "protected_paths": [artifact(path) for path in array(raw.get("protected_paths", []), "protected_paths")]}
+    out["reviewer_fallbacks"] = [provider(p, REVIEWERS, "reviewer fallback") for p in
+                                 array(raw.get("reviewer_fallbacks", []), "reviewer_fallbacks", 5)]
+    if out["reviewer_fallbacks"] and not raw.get("reviewer"):
+        raise ValueError("reviewer_fallbacks require a reviewer")
+    out["context_files"] = [artifact(p) for p in array(raw.get("context_files", []), "context_files", 20)]
+    if type(raw.get("repository_map", False)) is not bool:
+        raise ValueError("repository_map must be true or false")
+    out["repository_map"] = raw.get("repository_map", False)
+    budgets = raw.get("budgets", {})
+    fields(budgets, "max_calls max_seconds max_observed_tokens idle_timeout max_log_bytes", "budgets")
+    bounds = {"max_calls": (1, 10000), "max_seconds": (1, 604800), "max_observed_tokens": (1, 1000000000),
+              "idle_timeout": (1, 14400), "max_log_bytes": (1024, 256 * 1024 * 1024)}
+    out["budgets"] = {key: integer(value, key, *bounds[key]) for key, value in budgets.items()}
+    retry = raw.get("retry", {})
+    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit", "retry")
+    defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3}
+    out["retry"] = {key: integer(retry.get(key, value), key, 1 if key in ("initial_seconds", "max_seconds") else 0,
+                                  3600 if key in ("initial_seconds", "max_seconds") else 20)
+                    for key, value in defaults.items()}
+    if out["retry"]["max_seconds"] < out["retry"]["initial_seconds"]:
+        raise ValueError("retry max_seconds must be at least initial_seconds")
+    if "source_issue" in raw:
+        fields(raw["source_issue"], "url number repository", "source_issue")
+        out["source_issue"] = {"url": text(raw["source_issue"], "url"), "repository": text(raw["source_issue"], "repository"),
+                               "number": integer(raw["source_issue"].get("number"), "issue number", 1, 2147483647)}
     if project:
         out["project"] = project["name"]
         out["git_common_dir"] = project["git_common_dir"]
@@ -127,6 +203,7 @@ def validate(raw, relative_to=None, store=None):
     if raw.get("reviewer"):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer")
     if raw.get("advisory_ollama"):
+        fields(raw["advisory_ollama"], "model port timeout max_tokens", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
             raise ValueError("Invalid Ollama model name")

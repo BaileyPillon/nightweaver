@@ -40,3 +40,22 @@ elif mode == "emit":
     Path("receipt.txt").write_text("evidence", encoding="utf-8")
 elif mode == "no_evidence":
     assert Path("receipt.txt").exists()
+elif mode == "good":
+    sys.stdin.read()
+    Path("result.txt").write_text("ready", encoding="utf-8")
+elif mode == "bad":
+    sys.stdin.read()
+    Path("result.txt").write_text("permanent defect", encoding="utf-8")
+elif mode == "sleep":
+    time.sleep(20)
+elif mode == "flood":
+    print("x" * 10000)
+elif mode == "large_artifact":
+    Path("receipt.txt").write_text("x" * 10000, encoding="utf-8")
+elif mode == "browser_build":
+    feedback = sys.stdin.read()
+    width = "100%" if "Horizontal overflow" in feedback else "1400px"
+    Path("index.html").write_text(f'''<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,">
+    <style>body{{margin:0;width:{width};background:#161a19;color:#ecf1eb;font:20px Segoe UI}}main{{padding:24px;box-sizing:border-box}}</style>
+    <main><h1>Atlas fixture</h1><label>Search <input id="search"></label><button id="apply">Apply</button><p id="result">Waiting</p></main>
+    <script>document.querySelector('#apply').onclick=()=>document.querySelector('#result').textContent=document.querySelector('#search').value;</script></html>''', encoding="utf-8")

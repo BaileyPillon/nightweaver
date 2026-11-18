@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.3 adds persistent run budgets, explicit provider fallback, reproducible benchmark suites, browser journeys, Gemini CLI routing, checkpoint forks, pinned context, saved guidance, GitHub issue intake and portable HTML reports. It also hardens retries, evidence, validation and process ownership. See the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md) and the [upgrade guide](docs/v0.3-guide.md).
+
 An autonomous workshop for your code, built for Windows.
 
 Windows-native orchestration for coding agents. Give Nightweaver a goal with checked milestones. It hands off work between agents, sends failed checks back for repair, and advances after the result passes verification. Close the desktop dashboard whenever you need to. The runner keeps its place in SQLite.

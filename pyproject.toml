@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightweaver-windows"
-version = "0.2.0"
+version = "0.3.0"
 description = "Windows-native orchestration for checked, resumable coding-agent runs"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = []
+
+[project.optional-dependencies]
+browser = ["playwright>=1.48,<2"]
 
 [project.scripts]
 nightweaver = "nightweaver.cli:main"

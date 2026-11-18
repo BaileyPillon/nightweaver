@@ -16,12 +16,12 @@ Nightweaver addresses recurring failure modes in long-running coding work. Verif
 ## Current limits
 
 - The dispatcher runs one queued job at a time. Prerequisites wait for existing runs to finish, and projects keep their own result branches and pinned baselines. Automatic restart at sign-in requires installing the scheduled task.
-- Each attempt has a timeout and each milestone has an attempt limit. A blocked run stays inspectable and can be explicitly retried. Provider authentication, rate limits, and machine availability still affect progress.
-- Recognized authentication failures block the run immediately with a login recovery message. A renewed profile can resume through the existing worktree.
+- Each attempt has a timeout and each milestone has an attempt limit. Optional run budgets persist across restarts. Token accounting depends on reported telemetry and is not a billing cap. A blocked run stays inspectable and can be explicitly retried without refilling its run budget.
+- Recognized provider failures can use an explicitly configured fallback route. Temporary service/usage failures have bounded durable retries. Without an available fallback, authentication failures block with a login recovery message.
 - Git links, allowed tracked paths and Job Objects provide ownership and recovery boundaries. They do not sandbox arbitrary user-supplied executables. Use trusted checks, working directories, adapters, and project content.
-- Browser verification is project-specific. Nightweaver stores the resulting artifacts and review evidence. The project supplies the checks and the visual brief.
+- Declarative browser gates cover local static pages or existing loopback apps, responsive viewports and interaction assertions. Screenshots and traces preserve failed attempts as well as successes. The project still supplies selectors, application startup, trusted checks and the visual brief; screenshot presence alone is not visual acceptance.
 - Git tracks accepted source code. Untracked local state, web deployments, and physical-device or production behavior require explicit project checks and separate operational steps.
 
-## Next priorities
+## Research upgrade
 
-Add screenshot comparisons and reusable browser flows. Show blocked prerequisites and their underlying failures directly in the dependent run. Track provider availability over time so one successful probe can be distinguished from reliable access.
+The [ranked upgrade record](upgrade-plan.md) maps ten features and ten improvements to primary upstream repositories. The [0.3 guide](v0.3-guide.md) documents budgets, browser journeys, fallback, Gemini, feedback, forks, reports and evaluation boundaries. Remaining opportunities include calibrated visual preference scoring, application-server lifecycle recipes, and recorded CLI/model versions for stronger reproducibility.

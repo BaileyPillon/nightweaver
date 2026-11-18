@@ -9,12 +9,13 @@ import sys
 import time
 from uuid import uuid4
 
-from .engine import Run, checkout, create_run, pending_dependencies, source_info
+from .engine import Run, checkout, create_run, fork_run, pending_dependencies, source_info
 from .process import BusyRun, run_lock, runner_active
 from .providers import configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
 from .spec import read_plan, resolve_repository, validate
 from .store import Store, timestamp
+from .safety import redact
 
 
 def output(data):
@@ -24,8 +25,10 @@ def output(data):
 def with_live_status(store, row):
     lock = store.directory(row["id"]) / "runner.lock"
     ref = row["state"].get("result_ref", f"refs/heads/rookline/{row['id']}")
+    waiting = pending_dependencies(store, row["state"])
     return {**row, "runner_active": runner_active(lock), "result_branch": ref.removeprefix("refs/heads/"),
-            "waiting_for": pending_dependencies(store, row["state"])}
+            "waiting_for": waiting,
+            "blocked_prerequisites": [item for item in waiting if store.get(item)["state"]["phase"] == "blocked"]}
 
 
 def dispatch(store, watch):
@@ -36,11 +39,15 @@ def dispatch(store, watch):
             results = []
             for row in store.dispatch_runs():
                 try:
-                    phase = Run(store, row["id"]).run()
+                    phase = Run(store, row["id"]).run(defer_retries=watch)
                 except BusyRun as error:
                     if not watch:
                         results.append({"run_id": row["id"], "waiting": str(error)})
                     continue
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    store.transition(row["id"], "dispatcher_run_failed", {"issue": str(error)},
+                                     phase="blocked", last_error=redact(str(error)))
+                    phase = "blocked"
                 results.append({"run_id": row["id"], "phase": phase})
             if not watch:
                 return results
@@ -62,7 +69,7 @@ def background(store, run_id, retry):
     with (root / "runner.log").open("ab") as out:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  close_fds=True, creationflags=subprocess.DETACHED_PROCESS,
-                                 cwd=Path.cwd())
+                                 cwd=Path(__file__).resolve().parent.parent)
     return child.pid
 
 
@@ -142,7 +149,7 @@ def main(argv=None):
     doctor.add_argument("--plan", help="Check the exact provider routes in a plan")
     doctor.add_argument("--live", action="store_true", help="Make a small model request per distinct provider route")
     for parser in (goal, doctor):
-        parser.add_argument("--planner", choices=("claude", "codex", "deepseek"), default="claude" if parser is goal else None)
+        parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini"), default="claude" if parser is goal else None)
         parser.add_argument("--profile-dir")
         parser.add_argument("--model", help="Model used by the planner")
     project = commands.add_parser("project", help="Manage canonical project checkouts")
@@ -169,9 +176,40 @@ def main(argv=None):
         parser.add_argument("id")
         if name in ("run", "start", "resume"):
             parser.add_argument("--retry", action="store_true", help="Try a blocked run again")
+        if name == "events":
+            parser.add_argument("--after", type=int)
+            parser.add_argument("--limit", type=int, default=80)
+            parser.add_argument("--all", action="store_true")
+    metrics_parser = commands.add_parser("metrics", help="Measure a run using its complete history")
+    metrics_parser.add_argument("id")
+    report_parser = commands.add_parser("report", help="Export a standalone HTML evidence report")
+    report_parser.add_argument("id")
+    report_parser.add_argument("--output", type=Path)
+    report_parser.add_argument("--include-images", action="store_true", help="Embed verified screenshots (may contain private project data)")
+    feedback = commands.add_parser("feedback", help="Add durable instructions for subsequent worker/reviewer calls")
+    feedback.add_argument("id")
+    feedback.add_argument("message")
+    fork = commands.add_parser("fork", help="Start a new run from an accepted checkpoint")
+    fork.add_argument("id")
+    fork.add_argument("--milestone", type=int, required=True)
+    fork.add_argument("--worker", choices=("codex", "claude", "deepseek", "gemini"))
+    issue = commands.add_parser("issue", help="Import one GitHub issue into a local plan")
+    issue.add_argument("template")
+    issue.add_argument("--repo", required=True)
+    issue.add_argument("--number", type=int, required=True)
+    issue.add_argument("--output", required=True, type=Path)
+    benchmark = commands.add_parser("benchmark", help="Create, run or report reproducible comparisons")
+    bench_sub = benchmark.add_subparsers(dest="benchmark_action", required=True)
+    bench_create = bench_sub.add_parser("create")
+    bench_create.add_argument("suite")
+    for action in ("run", "report"):
+        bench_parser = bench_sub.add_parser(action)
+        bench_parser.add_argument("id")
+        if action == "report":
+            bench_parser.add_argument("--output", type=Path)
     commands.add_parser("list")
     args = app.parse_args(argv)
-    if getattr(args, "after", None) and not args.enqueue:
+    if args.command in ("add", "goal") and args.after and not args.enqueue:
         app.error("--after requires --enqueue")
     if args.command == "doctor":
         if args.live and not (args.plan or args.planner):
@@ -207,7 +245,37 @@ def main(argv=None):
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":
-            output(store.events(args.id))
+            output(store.events(args.id, limit=None if args.all else args.limit, after=args.after))
+        elif name == "metrics":
+            from .reports import metrics
+            output(metrics(store, args.id))
+        elif name == "report":
+            from .reports import run_report
+            output(run_report(store, args.id, args.output or store.directory(args.id) / "report.html", args.include_images))
+        elif name == "feedback":
+            store.feedback(args.id, args.message)
+            output({"run_id": args.id, "feedback_saved": True})
+        elif name == "fork":
+            output({"run_id": fork_run(store, args.id, args.milestone, {"kind": args.worker} if args.worker else None)})
+        elif name == "issue":
+            from .intake import issue_plan
+            output(issue_plan(store, args.template, args.repo, args.number, args.output))
+        elif name == "benchmark":
+            from .benchmark import create_suite, read_suite, suite_report
+            if args.benchmark_action == "create":
+                output(create_suite(store, args.suite))
+            elif args.benchmark_action == "report":
+                output(suite_report(store, args.id, args.output))
+            else:
+                results = []
+                for row in read_suite(store, args.id)["runs"]:
+                    try:
+                        phase = Run(store, row["run_id"]).run()
+                        results.append({"run_id": row["run_id"], "phase": phase})
+                    except BusyRun as error:
+                        results.append({"run_id": row["run_id"], "waiting": str(error)})
+                output(results)
+                return 0 if all(row.get("phase") == "done" for row in results) else 3
         elif name == "dispatch":
             if args.tool_path:
                 os.environ["PATH"] = args.tool_path + os.pathsep + os.environ.get("PATH", "")
@@ -218,7 +286,7 @@ def main(argv=None):
         elif name == "run":
             phase = Run(store, args.id).run(retry=args.retry)
             output({"run_id": args.id, "phase": phase})
-            return {"done": 0, "paused": 2, "blocked": 3}[phase]
+            return {"done": 0, "paused": 2, "blocked": 3, "waiting": 4}[phase]
         else:
             row = store.get(args.id)
             waiting = pending_dependencies(store, row["state"])
@@ -234,5 +302,5 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as error:
         if args.command == "dispatch" and args.watch and "store" in locals():
             record_dispatch(store, str(error))
-        print(f"Nightweaver: {error}", file=sys.stderr)
+        print(f"Nightweaver: {redact(str(error))}", file=sys.stderr)
         return 1

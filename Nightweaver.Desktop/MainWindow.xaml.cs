@@ -17,9 +17,11 @@ public partial class MainWindow : Window
     private readonly string dataRoot = FindDataRoot();
     private string? visibleRun;
     private long lastEvent;
+    private readonly List<Activity> history = [];
     private bool refreshing;
     private bool updatingList;
     private bool working;
+    private bool rendering;
 
     public MainWindow()
     {
@@ -125,6 +127,11 @@ public partial class MainWindow : Window
 
     private async Task RenderSelectionAsync()
     {
+        if (rendering)
+            return;
+        rendering = true;
+        try
+        {
         if (RunList.SelectedItem is not RunRow row)
             return;
         RunTitle.Text = row.Title;
@@ -132,21 +139,40 @@ public partial class MainWindow : Window
         Branch.Text = $"{row.ResultBranch}    {row.Accepted}";
         Branch.Visibility = Visibility.Visible;
         EvidenceButton.IsEnabled = true;
+        ReportButton.IsEnabled = !working;
+        FeedbackText.IsEnabled = FeedbackButton.IsEnabled = !working && row.Phase != "done";
         PauseButton.IsEnabled = !working && (row.Active || row.Queued) && !row.Pause && row.Phase is not ("done" or "blocked");
         ResumeButton.IsEnabled = !working && !row.Active && row.Phase != "done" && (!row.Waiting || row.Pause);
         ResumeButton.Content = row.Phase == "blocked" ? "Retry" : "Resume";
 
-        var events = (await CallAsync("events", row.Id)).EnumerateArray().Select(Activity.Parse).ToArray();
-        if ((RunList.SelectedItem as RunRow)?.Id != row.Id)
-            return;
-        long seq = events.LastOrDefault()?.Seq ?? 0;
-        if (visibleRun == row.Id && lastEvent == seq)
-            return;
-        visibleRun = row.Id;
-        lastEvent = seq;
-        Timeline.ItemsSource = events;
-        if (events.Length != 0)
-            Timeline.ScrollIntoView(events[^1]);
+        if (visibleRun != row.Id)
+        {
+            visibleRun = row.Id;
+            lastEvent = 0;
+            history.Clear();
+        }
+        bool changed = false;
+        while (true)
+        {
+            var page = (await CallAsync("events", row.Id, "--after", lastEvent.ToString(), "--limit", "500"))
+                .EnumerateArray().Select(Activity.Parse).ToArray();
+            if ((RunList.SelectedItem as RunRow)?.Id != row.Id)
+                return;
+            history.AddRange(page);
+            changed |= page.Length > 0;
+            if (page.Length > 0)
+                lastEvent = page[^1].Seq;
+            if (page.Length < 500)
+                break;
+        }
+        if (changed || history.Count == 0)
+        {
+            Timeline.ItemsSource = history.ToArray();
+            if (history.Count > 0)
+                Timeline.ScrollIntoView(history[^1]);
+        }
+        }
+        finally { rendering = false; }
     }
 
     private async void Run_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -200,6 +226,35 @@ public partial class MainWindow : Window
         catch (Exception error) { Status.Text = error.Message; }
     }
 
+    private async void Report_Click(object sender, RoutedEventArgs e)
+    {
+        if (working || RunList.SelectedItem is not RunRow row)
+            return;
+        working = true;
+        try
+        {
+            var result = await CallAsync("report", row.Id, "--include-images");
+            Process.Start(new ProcessStartInfo(result.GetProperty("report").GetString()!) { UseShellExecute = true });
+        }
+        catch (Exception error) { Status.Text = error.Message; }
+        finally { working = false; }
+    }
+
+    private async void Feedback_Click(object sender, RoutedEventArgs e)
+    {
+        if (working || RunList.SelectedItem is not RunRow row || string.IsNullOrWhiteSpace(FeedbackText.Text))
+            return;
+        working = true;
+        try
+        {
+            await CallAsync("feedback", row.Id, FeedbackText.Text);
+            FeedbackText.Clear();
+            Status.Text = "Guidance saved for the next attempt. Paused runs remain paused.";
+        }
+        catch (Exception error) { Status.Text = error.Message; }
+        finally { working = false; }
+    }
+
     private async Task PerformAsync(string message, params string[] arguments)
     {
         working = true;
@@ -247,12 +302,19 @@ public partial class MainWindow : Window
                 _ => Display(phase),
             };
             string subtitle = $"{label}  ·  {step}/{count} accepted";
+            if (state.TryGetProperty("retry_at", out var retryAt) && retryAt.ValueKind == JsonValueKind.String &&
+                DateTimeOffset.TryParse(retryAt.GetString(), out var retryTime) && retryTime > DateTimeOffset.Now && !pause)
+                subtitle = $"Retry at {retryTime.ToLocalTime():HH:mm:ss} · {step}/{count} accepted";
             string current = step < count ? Get(milestones[step], "title") : "All milestones accepted";
             if (prerequisites.Length > 0)
                 current += $"\nWaiting for {string.Join(", ", prerequisites)}";
             string error = Get(state, "last_error");
             if (phase == "blocked" && error.Length > 0)
                 current += $"\n{Brief(error)}";
+            if (data.TryGetProperty("blocked_prerequisites", out var blocked) && blocked.GetArrayLength() > 0)
+                current += "\nA prerequisite needs attention before this run can start.";
+            if (state.TryGetProperty("provider_calls", out var calls))
+                current += $"\n{calls} provider calls";
             if (phase == "blocked" && state.TryGetProperty("provider_issue", out var issue) &&
                 issue.ValueKind == JsonValueKind.Object)
             {
@@ -292,7 +354,11 @@ public partial class MainWindow : Window
                 "promotion_prepared" => $"Verified commit {Read("commit")[..12]}",
                 "milestone_accepted" => $"Milestone {Read("step")} accepted · {Read("commit")[..12]}",
                 "run_completed" => Read("branch").Replace("refs/heads/", ""),
-                "attempt_rejected" or "blocked" or "provider_unavailable" => Brief(Read("issue")),
+                "attempt_rejected" or "blocked" or "provider_unavailable" or "budget_exhausted" or "repeated_failure_stopped" => Brief(Read("issue")),
+                "operator_feedback" => Brief(Read("message")),
+                "provider_retry_scheduled" => $"Retry in {Read("seconds")} seconds · {Read("issue")}",
+                "provider_fallback" => $"Switching provider route: {Read("to")}",
+                "provider_call_finished" => $"{Read("role")} · {Read("seconds")}s · observed tokens: {Read("observed_tokens")}",
                 _ => string.Join("\n", details.EnumerateObject()
                     .Where(property => property.Name is "reason" or "phase")
                     .Select(property => $"{Display(property.Name)}  {property.Value}")),

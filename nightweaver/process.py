@@ -78,6 +78,7 @@ class WindowsJob:
         k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         k.OpenProcess.restype = wintypes.HANDLE
         k.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
         k.CloseHandle.argtypes = (wintypes.HANDLE,)
         self.handle = k.CreateJobObjectW(None, None)
         if not self.handle:
@@ -103,8 +104,13 @@ class WindowsJob:
     def __exit__(self, *_error):
         self.kernel.CloseHandle(self.handle)
 
+    def terminate(self):
+        if not self.kernel.TerminateJobObject(self.handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
 
-def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: False):
+
+def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: False,
+            idle_timeout=None, max_log_bytes=16 * 1024 * 1024, heartbeat=None):
     """Run an operator-approved program using files for I/O and a native Job for ownership."""
     log.parent.mkdir(parents=True, exist_ok=True)
     prompt_path = log.with_suffix(".input.txt")
@@ -112,21 +118,42 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
         prompt_path.write_text(prompt, encoding="utf-8")
     source = prompt_path if prompt is not None else os.devnull
     deadline = time.monotonic() + timeout
+    changed_at = beat_at = time.monotonic()
+    last_size = 0
     shim = [sys.executable, str(Path(__file__).with_name("_child.py")), json.dumps(argv), str(source)]
     with log.open("wb") as out, WindowsJob() as job:
         child = subprocess.Popen(shim, cwd=cwd, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
                                  env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+        attached = False
         try:
             with child.stdin as control:
                 job.attach(child.pid)
+                attached = True
                 control.write(b"\x01")
-        except OSError:
-            child.wait(timeout=5)
-            raise
-        while child.poll() is None:
-            if paused():
-                raise PausedRun
-            if time.monotonic() >= deadline:
-                return 124
-            time.sleep(.2)
-        return child.returncode
+            while child.poll() is None:
+                if paused():
+                    raise PausedRun
+                if time.monotonic() >= deadline:
+                    return 124
+                now = time.monotonic()
+                size = log.stat().st_size
+                if size != last_size:
+                    changed_at, last_size = now, size
+                if size > max_log_bytes:
+                    return 126
+                if idle_timeout is not None and now - changed_at >= idle_timeout:
+                    return 125
+                if heartbeat and now - beat_at >= 10:
+                    heartbeat({"pid": child.pid, "log_bytes": size})
+                    beat_at = now
+                time.sleep(.2)
+            if log.stat().st_size > max_log_bytes:
+                return 126
+            return child.returncode
+        finally:
+            if child.poll() is None:
+                if attached:
+                    job.terminate()
+                else:
+                    child.kill()  # the blocked shim has not been allowed to launch its child
+                child.wait(timeout=10)

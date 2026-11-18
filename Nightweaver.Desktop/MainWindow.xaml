@@ -138,13 +138,16 @@
                 </StackPanel>
                 <DockPanel Grid.Row="1" Margin="0,21,0,19">
                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                        <Button x:Name="ReportButton" Content="Open report" Click="Report_Click" IsEnabled="False"/>
                         <Button x:Name="EvidenceButton" Content="Evidence folder" Click="Evidence_Click" IsEnabled="False"/>
                         <Button x:Name="PauseButton" Content="Pause" Click="Pause_Click" IsEnabled="False"/>
                         <Button x:Name="ResumeButton" Content="Resume" Click="Resume_Click" IsEnabled="False" Margin="0"/>
                     </StackPanel>
                     <TextBlock Text="Activity" FontSize="19" FontWeight="SemiBold" VerticalAlignment="Center"/>
                 </DockPanel>
-                <ListBox Grid.Row="2" x:Name="Timeline" Background="{StaticResource Panel}" Foreground="#ECF1EB"
+                <Grid Grid.Row="2">
+                    <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <ListBox x:Name="Timeline" Background="{StaticResource Panel}" Foreground="#ECF1EB"
                          BorderBrush="{StaticResource Line}" HorizontalContentAlignment="Stretch" Padding="7"
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled" AutomationProperties.Name="Run activity">
                     <ListBox.ItemTemplate>
@@ -163,6 +166,16 @@
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
+                    <Grid Grid.Row="1" Margin="0,14,0,0">
+                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                        <TextBlock Text="Guidance for the next attempt" Foreground="{StaticResource Muted}" Margin="0,0,0,7"/>
+                        <DockPanel Grid.Row="1">
+                            <Button x:Name="FeedbackButton" Content="Save guidance" DockPanel.Dock="Right" Click="Feedback_Click" Margin="10,0,0,0"/>
+                            <TextBox x:Name="FeedbackText" MaxLength="12000" MinHeight="38" MaxHeight="100" TextWrapping="Wrap"
+                                     AcceptsReturn="True" VerticalScrollBarVisibility="Auto" AutomationProperties.Name="Guidance for the next attempt"/>
+                        </DockPanel>
+                    </Grid>
+                </Grid>
             </Grid>
         </Grid>
         <Border Grid.Row="2" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,9">
