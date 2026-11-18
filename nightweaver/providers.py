@@ -268,7 +268,12 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if re.search(r"authentication_failed|failed to authenticate|not logged in|please (?:log|sign) in|refresh token.*expired|token.*(expired|revoked)", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} authentication needs renewal for the selected profile. "
                                       "Sign in with that CLI, then resume this run with --retry.", "authentication")
-        if re.search(r"oauth_org_not_allowed|oauth_not_allowed_for_organization|can't use your Claude subscription", detail, re.I):
+        if config["kind"] == "claude" and re.search(r"can.t use your Claude subscription", detail, re.I):
+            raise ProviderUnavailable("Claude rejected the selected profile's subscription. Compare its "
+                                      "claude auth status with the intended browser account at "
+                                      "https://claude.ai/settings/billing. Verify access with doctor --live "
+                                      "before retrying.", "subscription")
+        if re.search(r"oauth_org_not_allowed|oauth_not_allowed_for_organization", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a subscription or organization access error. "
                                       "Resolve access for the selected profile, then resume this run with --retry.", "subscription")
         if re.search(r"credit balance.*(?:low|insufficient)|billing.hard.limit|insufficient credits", detail, re.I):

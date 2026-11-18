@@ -19,10 +19,12 @@ from nightweaver.safety import write_json
 
 def validate_browser(raw):
     from nightweaver.spec import array, artifact, fields, integer, text
-    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until", "browser")
+    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline", "browser")
     if sum(key in raw for key in ("page", "url", "server")) != 1:
         raise ValueError("Browser needs exactly one of page, loopback url or owned server")
     out = dict(raw)
+    if type(raw.get("offline", False)) is not bool or (raw.get("offline") and "page" not in raw):
+        raise ValueError("Offline browser checks require a local page and a boolean offline option")
     if "page" in raw:
         out["page"] = artifact(raw["page"])
     elif "url" in raw:
@@ -41,10 +43,19 @@ def validate_browser(raw):
         raise ValueError("Unsupported browser channel")
     out["timeout_ms"] = integer(raw.get("timeout_ms", 10000), "browser timeout_ms", 100, 120000)
     out["steps"] = array(raw.get("steps", []), "browser steps", 100)
+    checkpoints = set()
     for step in out["steps"]:
         fields(step, "action selector value", "browser step")
         action = text(step, "action")
-        if action not in ("click", "fill", "press", "check", "visible", "text", "count"):
+        if action == "checkpoint":
+            label = text(step, "value")
+            if (set(step) != {"action", "value"} or label != step["value"] or
+                    not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", label) or label in checkpoints):
+                raise ValueError("Use a unique lowercase checkpoint name and omit selector")
+            checkpoints.add(label)
+            continue
+        if action not in ("click", "fill", "press", "check", "visible", "hidden", "enabled", "disabled",
+                          "focused", "text", "count"):
             raise ValueError(f"Unsupported browser action: {action}")
         text(step, "selector")
         if action in ("fill", "press", "text") and not isinstance(step.get("value"), str):
@@ -86,6 +97,9 @@ def local_page(config, root, output):
     page = (root / config["page"]).resolve(strict=True)
     if not page.is_relative_to(root) or not page.is_file():
         raise ValueError("Browser page must be a file inside the candidate checkout")
+    if config.get("offline"):
+        yield page.as_uri(), lambda: None
+        return
     with ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(root))) as server:
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -94,6 +108,25 @@ def local_page(config, root, output):
         finally:
             server.shutdown()
             thread.join(timeout=5)
+
+
+def run_step(page, step, index, result, output, timeout):
+    from playwright.sync_api import expect
+    action = step["action"]
+    if action == "checkpoint":
+        file = f"checkpoint.{result['viewport']}.{step['value']}.png"
+        page.screenshot(path=str(output / file), animations="disabled")
+        result["checkpoints"].append({"step": index, "name": step["value"], "file": file})
+        return
+    locator = page.locator(step["selector"])
+    if action in ("visible", "hidden", "enabled", "disabled", "focused"):
+        getattr(expect(locator), "to_be_" + action)(timeout=timeout)
+    elif action in ("text", "count"):
+        getattr(expect(locator), "to_have_" + action)(step["value"], timeout=timeout)
+    elif action in ("fill", "press"):
+        getattr(locator, action)(step["value"])
+    else:
+        getattr(locator, action)()
 
 
 def run_browser(config, root, output):
@@ -108,41 +141,44 @@ def run_browser(config, root, output):
             for viewport in config["viewports"]:
                 name = viewport["name"]
                 errors = []
-                context = browser.new_context(viewport={key: viewport[key] for key in ("width", "height")}, reduced_motion="reduce")
+                offline = config.get("offline", False)
+                context = browser.new_context(viewport={key: viewport[key] for key in ("width", "height")},
+                                              reduced_motion="reduce", offline=offline,
+                                              service_workers="block" if offline else "allow")
                 context.tracing.start(screenshots=True, snapshots=True, sources=False)
                 page = context.new_page()
                 page.set_default_timeout(config["timeout_ms"])
-                page.on("pageerror", lambda error: errors.append(str(error)))
-                page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
-                result = {"viewport": name, "passed": False, "errors": errors, "completed_steps": 0}
+                def record_error(message):
+                    if len(errors) < 20:
+                        errors.append(str(message)[:2000])
+                page.on("pageerror", record_error)
+                page.on("console", lambda message: record_error(message.text) if message.type == "error" else None)
+                if offline:
+                    context.on("request", lambda req: record_error("External request during offline playback")
+                               if req.url.startswith(("http:", "https:")) else None)
+                result = {"viewport": name, "passed": False, "errors": errors, "completed_steps": 0, "checkpoints": []}
+                stage = {"action": "navigate"}
                 try:
                     server_check()
                     response = page.goto(url, wait_until=config["wait_until"], timeout=config["timeout_ms"])
-                    if response is None or response.status >= 400:
+                    if (response is None and not offline) or (response is not None and response.status >= 400):
                         raise ValueError(f"Page response: {response.status if response else 'missing'}")
                     if config.get("heading"):
-                        expect(page.get_by_role("heading", name=config["heading"], exact=True)).to_be_visible()
-                    for step in config["steps"]:
+                        stage = {"action": "heading", "name": config["heading"]}
+                        expect(page.get_by_role("heading", name=config["heading"], exact=True)).to_be_visible(timeout=config["timeout_ms"])
+                    for index, step in enumerate(config["steps"], 1):
+                        stage = {"index": index, "action": step["action"], "selector": step.get("selector")}
                         server_check()
-                        locator = page.locator(step["selector"])
-                        action = step["action"]
-                        if action == "visible":
-                            expect(locator).to_be_visible()
-                        elif action == "text":
-                            expect(locator).to_have_text(step["value"])
-                        elif action == "count":
-                            expect(locator).to_have_count(step["value"])
-                        elif action in ("fill", "press"):
-                            getattr(locator, action)(step["value"])
-                        else:
-                            getattr(locator, action)()
+                        run_step(page, step, index, result, output, config["timeout_ms"])
                         result["completed_steps"] += 1
+                    stage = {"action": "layout"}
                     result["overflow_px"] = page.evaluate("Math.max(0,document.documentElement.scrollWidth-innerWidth)")
                     if result["overflow_px"] > 1:
                         raise ValueError(f"Horizontal overflow: {result['overflow_px']}px")
                     server_check()
                     result["passed"] = not errors
                 except Exception as error:
+                    result["failed_at"] = stage
                     errors.append(str(error)[:4000])
                 finally:
                     try:
@@ -154,8 +190,12 @@ def run_browser(config, root, output):
                     try:
                         context.tracing.stop(path=str(output / f"{name}.trace.zip"))
                         result["trace"] = f"{name}.trace.zip"
+                    except Exception as error:
+                        result["passed"] = False
+                        record_error(f"Trace unavailable: {error}")
                     finally:
                         context.close()
+                    result["passed"] = result["passed"] and not errors
                     results.append(result)
         finally:
             browser.close()
@@ -166,11 +206,14 @@ def run_browser(config, root, output):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config")
+    source.add_argument("--config-file", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        result = run_browser(json.loads(args.config), Path.cwd(), args.output)
+        raw = args.config_file.read_text(encoding="utf-8") if args.config_file else args.config
+        result = run_browser(json.loads(raw), Path.cwd(), args.output)
     except Exception as error:
         result = {"passed": False, "error": str(error)}
         write_json(args.output / "browser.json", result)

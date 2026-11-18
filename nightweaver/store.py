@@ -125,7 +125,7 @@ class Store:
                               ORDER BY rowid""", (timestamp(),))
             return [self.decode(row) for row in rows]
 
-    def transition(self, run_id, kind, details=None, **changes):
+    def transition(self, run_id, kind, details=None, *, following_event=None, **changes):
         if "last_error" in changes:
             changes["last_error"] = redact(changes["last_error"])
         with self.connect() as db:
@@ -135,6 +135,8 @@ class Store:
             db.execute("UPDATE runs SET state=?,updated=? WHERE id=?",
                        (json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, kind, details or {})
+            if following_event is not None:
+                self._event(db, run_id, *following_event)
         return row["state"]
 
     def pause(self, run_id, value):

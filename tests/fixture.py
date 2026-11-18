@@ -72,6 +72,12 @@ elif mode in ("serve", "serve_fail", "serve_redirect"):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         Path(sys.argv[2]).write_text(json.dumps({"pid": os.getpid(), "child": child.pid, "port": server.server_port}))
         server.serve_forever()
+elif mode == "focus_repair":
+    feedback = sys.stdin.read()
+    target = "next" if '"stage": {"index": 2, "action": "focused", "selector": "#next"}' in feedback else "wrong"
+    Path("index.html").write_text(
+        f"""<button id="open" onclick="document.getElementById('{target}').focus()">Open</button>
+        <button id="next">Next</button><button id="wrong">Other</button>""", encoding="utf-8")
 elif mode == "browser_build":
     feedback = sys.stdin.read()
     width = "100%" if "Horizontal overflow" in feedback else "1400px"

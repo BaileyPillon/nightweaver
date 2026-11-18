@@ -7,7 +7,7 @@ from .safety import redact, write_json
 
 
 def capture(spec, base):
-    from .engine import git
+    from .engine import git, git_bytes
     repository = spec["repository"]
     files, remaining = [], 48000
     for name in spec.get("context_files", []):
@@ -18,10 +18,11 @@ def capture(spec, base):
         mode = git(repository, "ls-tree", base, "--", name).split(" ", 1)[0]
         if mode not in ("100644", "100755"):
             raise ValueError(f"Context must be a regular committed file: {name}")
-        content = git(repository, "show", reference)
-        if "\x00" in content:
+        raw = git_bytes(repository, "cat-file", "blob", reference)
+        if b"\x00" in raw:
             raise ValueError(f"Context must be text: {name}")
-        digest = hashlib.sha256(content.encode()).hexdigest()
+        content = raw.decode("utf-8", "replace")
+        digest = hashlib.sha256(raw).hexdigest()
         files.append({"path": name, "sha256": digest, "content": redact(content)})
         remaining -= size
     names = git(repository, "ls-tree", "-r", "--name-only", base).splitlines() if spec.get("repository_map") else []

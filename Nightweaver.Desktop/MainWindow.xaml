@@ -132,9 +132,13 @@
                     <TextBlock x:Name="RunSummary" Text="Start a plan to see its milestones and verification evidence."
                                Margin="0,8,0,0" Foreground="{StaticResource Muted}" TextWrapping="Wrap"
                                TextTrimming="CharacterEllipsis" MaxHeight="112" FontSize="14"/>
-                    <TextBox x:Name="Branch" IsReadOnly="True" Visibility="Collapsed" BorderThickness="0"
-                             Padding="0" Margin="0,8,0,0" Background="Transparent" Foreground="{StaticResource Accent}"
-                             FontFamily="Consolas" AutomationProperties.Name="Result branch"/>
+                    <DockPanel>
+                        <Button x:Name="HandoffButton" DockPanel.Dock="Right" Content="Copy handoff" Click="Handoff_Click"
+                                Visibility="Collapsed" Margin="12,4,0,0"/>
+                        <TextBox x:Name="Branch" IsReadOnly="True" Visibility="Collapsed" BorderThickness="0"
+                                 Padding="0" Margin="0,8,0,0" Background="Transparent" Foreground="{StaticResource Accent}"
+                                 FontFamily="Consolas" AutomationProperties.Name="Result branch"/>
+                    </DockPanel>
                 </StackPanel>
                 <DockPanel Grid.Row="1" Margin="0,21,0,19">
                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">

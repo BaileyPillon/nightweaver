@@ -18,8 +18,15 @@ def metrics(store, run_id):
     started = next((event for event in events if event["kind"] == "run_started"), None)
     start = started["time"] if started else None
     stop = next((event["time"] for event in reversed(events) if event["kind"] == "run_completed"), None)
-    if not stop and row["state"]["phase"] == "blocked" and events:
-        stop = events[-1]["time"]
+    if not stop and row["state"]["phase"] == "done":
+        stop = next((event["time"] for event in reversed(events) if event["kind"] == "milestone_accepted"), None)
+    terminal = None
+    if row["state"]["phase"] == "blocked":
+        terminal = next((event for event in reversed(events) if event["kind"] in (
+            "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed",
+            "repeated_failure_stopped")), None)
+        if terminal:
+            stop = terminal["time"]
     seconds = None
     if start:
         seconds = max(0, ((datetime.fromisoformat(stop) if stop else datetime.now(timezone.utc)) - datetime.fromisoformat(start)).total_seconds())
@@ -30,8 +37,6 @@ def metrics(store, run_id):
     phase = row["state"]["phase"]
     outcome = "accepted" if phase == "done" else "unfinished"
     if phase == "blocked":
-        terminal = next((event for event in reversed(events) if event["kind"] in (
-            "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed")), None)
         if terminal and terminal["kind"] == "provider_unavailable":
             outcome = "provider_blocked"
         elif terminal and terminal["kind"] == "budget_exhausted":
@@ -40,7 +45,8 @@ def metrics(store, run_id):
             last_call = next((event["seq"] for event in reversed(events) if event["kind"] == "provider_call_started"), 0)
             if row["spec"].get("budgets", {}).get("max_calls") == 1 and recovered > last_call:
                 outcome = "interrupted"
-        elif terminal and terminal["kind"] == "blocked" and "during" not in terminal["details"]:
+        elif terminal and (terminal["kind"] == "repeated_failure_stopped" or
+                           (terminal["kind"] == "blocked" and "during" not in terminal["details"])):
             outcome = "rejected"
         else:
             outcome = "execution_blocked"

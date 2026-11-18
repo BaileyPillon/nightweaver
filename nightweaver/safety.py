@@ -9,12 +9,14 @@ import tempfile
 
 def redact(value):
     if isinstance(value, dict):
-        return {key: ("[REDACTED]" if re.search(r"(?:api[_-]?key|auth[_-]?token|password|secret|authorization)$", key, re.I)
+        return {key: ("[REDACTED]" if re.search(r"(?:api[_-]?key|(?:auth|access|refresh|id)[_-]?token|password|secret|authorization)$", key, re.I)
                       else redact(item)) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [redact(item) for item in value]
     if not isinstance(value, str):
         return value
+    value = re.sub(r"(?i)([?&](?:access_token|refresh_token|id_token|code|code_verifier)=)[^&#\s]+",
+                   r"\1[REDACTED]", value)
     value = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})\b", "[REDACTED]", value)
     value = re.sub(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[REDACTED]", value)
     return re.sub(r"(?i)((?:api[_-]?key|auth[_-]?token|password|secret)\s*[=:]\s*)[^\s,;\"'}]+", r"\1[REDACTED]", value)

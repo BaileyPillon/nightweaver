@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import mkdtemp
 import time
 
 from .process import BusyRun, PausedRun, execute, run_lock
@@ -21,12 +22,16 @@ class BudgetExceeded(ValueError):
     pass
 
 
-def git(repo, *args):
+def git_bytes(repo, *args):
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=90,
                             creationflags=subprocess.CREATE_NO_WINDOW, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     if result.returncode:
         raise ValueError(result.stderr.decode("utf-8", "replace").strip() or f"Git {args[0]} failed")
-    return result.stdout.decode("utf-8", "replace").rstrip("\r\n")
+    return result.stdout
+
+
+def git(repo, *args):
+    return git_bytes(repo, *args).decode("utf-8", "replace").rstrip("\r\n")
 
 
 def common_dir(path):
@@ -103,7 +108,7 @@ def tree(path, base, allowed, protected):
     if git(path, "rev-parse", "HEAD") != base:
         raise ValueError("Worktree HEAD changed. Keep agent edits uncommitted.")
     git(path, "add", "-A", "--", ".")
-    names = git(path, "diff", "--cached", "--name-only", "-z", base).split("\0")
+    names = git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", base).split("\0")
     names = [name for name in names if name]
     if not names:
         raise ValueError("The milestone produced no tracked changes")
@@ -239,21 +244,24 @@ class Run:
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
         self.set("attempt_rejected", {"phase": phase, "issue": reason, "same_failure_count": count},
+                 following_event=("repeated_failure_stopped", {"issue": reason, "count": count}) if blocked else None,
                  phase="blocked" if blocked else "ready", last_error=reason, failure_fingerprint=fingerprint,
                  failure_count=count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
-        if blocked:
-            self.set("repeated_failure_stopped", {"issue": reason, "count": count})
 
     def worker_prompt(self, state, step):
         paths = ", ".join(step["paths"]) or "the repository files needed for this milestone"
         checks = "\n".join("- " + g["name"] + ": " + json.dumps(g.get("argv", g.get("browser"))) for g in step["gates"])
-        prior = "\n".join(
-            f"- {self.spec['milestones'][item['step'] - 1]['title']} ({item['commit']})"
-            for item in self.store.accepted_milestones(self.id) if item["step"] <= state["step"]
-        )
+        prior = []
+        for item in self.store.accepted_milestones(self.id):
+            if item["step"] <= state["step"]:
+                line = f"- {self.spec['milestones'][item['step'] - 1]['title']} ({item['commit']})"
+                if item.get("verified_checks"):
+                    line += " · Passed: " + ", ".join(item["verified_checks"])
+                prior.append(line)
+        prior_summary = "\n".join(prior) or "None yet"
         return (
             f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
-            f"Accepted milestones in this checkout\n{prior or 'None yet'}\n\n"
+            f"Accepted milestones in this checkout\n{prior_summary}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
             f"Work in this supplied Git worktree. Keep edits within {paths}. "
             "Preserve unrelated behavior. Do not commit, push, merge, edit verification rules "
@@ -305,8 +313,13 @@ class Run:
             browser_output = evidence / f"gate-{index:02d}" / "browser"
             argv = check.get("argv")
             if check.get("kind") == "browser":
-                argv = [sys.executable, str(Path(__file__).with_name("browser.py")), "--config",
-                        json.dumps(check["browser"]), "--output", str(browser_output)]
+                # A crash can restart this gate in the same attempt. Keep each capture distinct.
+                if browser_output.exists():
+                    browser_output = Path(mkdtemp(prefix="browser-replay-", dir=browser_output.parent))
+                config_path = evidence / f"gate-{index:02d}.browser.json"
+                write_json(config_path, check["browser"])
+                argv = [sys.executable, str(Path(__file__).with_name("browser.py")), "--config-file",
+                        str(config_path), "--output", str(browser_output)]
             code = execute(argv, path, log, check["timeout"], env=env, paused=self.paused,
                            max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
                            heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
@@ -322,6 +335,11 @@ class Run:
                             digest = hashlib.file_digest(stream, "sha256").hexdigest()
                         receipt["artifacts"].append({"name": file.name, "path": str(file), "sha256": digest})
                     report = json.loads((browser_output / "browser.json").read_text(encoding="utf-8"))
+                    failures = [{"viewport": view.get("viewport"), "stage": view.get("failed_at"),
+                                 "error": next(iter(view.get("errors") or []), "")[:600]}
+                                for view in report.get("viewports", []) if not view.get("passed")]
+                    if failures:
+                        receipt["browser_failures"] = failures
                     if code == 0 and report.get("passed") is not True:
                         raise ValueError("Browser returned no passing receipt")
             except (OSError, ValueError) as error:
@@ -331,7 +349,9 @@ class Run:
                 return
             self.set("gate_finished", receipt)
             if code:
-                self.reject(f"{check['name']} exited {code}\n{tail(log)}", "check")
+                diagnostic = (json.dumps(receipt["browser_failures"], ensure_ascii=False)
+                              if receipt.get("browser_failures") else tail(log))
+                self.reject(f"{check['name']} exited {code}\n{diagnostic}", "check")
                 return
             outputs.append(receipt)
         if self.snapshot(path, state, step) != snapshot:
@@ -430,13 +450,15 @@ class Run:
             git(self.repository, "update-ref", self.ref, candidate, current or "0" * len(candidate))
         number = state["step"] + 1
         finished = number == len(self.spec["milestones"])
-        self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref},
+        passed = [gate["name"] for gate in self.spec["milestones"][number - 1]["gates"]]
+        completion = ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None
+        self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref,
+                 "tree": state.get("candidate_tree"), "verified_checks": passed},
+                 following_event=completion,
                  phase="done" if finished else "ready", step=number, accepted=candidate,
                  attempt=0, attempts_used=0, candidate=None, candidate_tree=None,
                  worker_session=None, last_error="", log=None, retry_at=None, failure_count=0,
                  failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0)
-        if finished:
-            self.set("run_completed", {"branch": self.ref, "commit": candidate})
 
     def run(self, *, retry=False, defer_retries=False):
         with run_lock(self.root / "runner.lock"), ExitStack() as project_lock:

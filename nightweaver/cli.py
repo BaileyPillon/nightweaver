@@ -180,6 +180,16 @@ def main(argv=None):
             parser.add_argument("--after", type=int)
             parser.add_argument("--limit", type=int, default=80)
             parser.add_argument("--all", action="store_true")
+            parser.add_argument("--follow", action="store_true", help="Stream new events as JSON lines until the run stops")
+    commands.add_parser("attention", help="List runs requiring an operator decision")
+    for command, help_text in (("handoff", "Summarize durable context for a fresh session"),
+                               ("changes", "Review accepted changes from immutable Git commits"),
+                               ("audit-evidence", "Recheck the hashes of recorded gate artifacts")):
+        parser = commands.add_parser(command, help=help_text)
+        parser.add_argument("id")
+        if command == "changes":
+            parser.add_argument("--milestone", type=int)
+            parser.add_argument("--patch", action="store_true", help="Include a redacted patch for inspection")
     metrics_parser = commands.add_parser("metrics", help="Measure a run using its complete history")
     metrics_parser.add_argument("id")
     report_parser = commands.add_parser("report", help="Export a standalone HTML evidence report")
@@ -207,6 +217,12 @@ def main(argv=None):
         bench_parser.add_argument("id")
         if action == "report":
             bench_parser.add_argument("--output", type=Path)
+    compare = bench_sub.add_parser("compare", help="Compare matching trials from two saved suites")
+    compare.add_argument("before")
+    compare.add_argument("after")
+    junit = bench_sub.add_parser("junit", help="Export suite results for CI test dashboards")
+    junit.add_argument("id")
+    junit.add_argument("--output", type=Path, required=True)
     commands.add_parser("list")
     args = app.parse_args(argv)
     if args.command in ("add", "goal") and args.after and not args.enqueue:
@@ -245,7 +261,26 @@ def main(argv=None):
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":
-            output(store.events(args.id, limit=None if args.all else args.limit, after=args.after))
+            if args.follow:
+                from .operations import follow_events
+                for event in follow_events(store, args.id, args.after or 0, args.limit):
+                    print(json.dumps(event, ensure_ascii=True), flush=True)
+            else:
+                output(store.events(args.id, limit=None if args.all else args.limit, after=args.after))
+        elif name == "attention":
+            from .operations import attention
+            output(attention(store))
+        elif name == "handoff":
+            from .operations import handoff
+            output(handoff(store, args.id))
+        elif name == "changes":
+            from .operations import changes
+            output(changes(store, args.id, args.milestone, args.patch))
+        elif name == "audit-evidence":
+            from .operations import audit_evidence
+            audit = audit_evidence(store, args.id)
+            output(audit)
+            return 0 if audit["status"] == "verified" else 3
         elif name == "metrics":
             from .reports import metrics
             output(metrics(store, args.id))
@@ -266,6 +301,12 @@ def main(argv=None):
                 output(create_suite(store, args.suite))
             elif args.benchmark_action == "report":
                 output(suite_report(store, args.id, args.output))
+            elif args.benchmark_action == "compare":
+                from .benchmark_exports import compare_suites
+                output(compare_suites(store, args.before, args.after))
+            elif args.benchmark_action == "junit":
+                from .benchmark_exports import export_junit
+                output(export_junit(store, args.id, args.output))
             else:
                 results = []
                 for row in read_suite(store, args.id)["runs"]:

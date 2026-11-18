@@ -138,6 +138,7 @@ public partial class MainWindow : Window
         RunSummary.Text = $"{row.Subtitle}\n{row.Current}".TrimEnd();
         Branch.Text = $"{row.ResultBranch}    {row.Accepted}";
         Branch.Visibility = Visibility.Visible;
+        HandoffButton.Visibility = Visibility.Visible;
         EvidenceButton.IsEnabled = true;
         ReportButton.IsEnabled = !working;
         FeedbackText.IsEnabled = FeedbackButton.IsEnabled = !working && row.Phase != "done";
@@ -216,6 +217,19 @@ public partial class MainWindow : Window
         if (!working && RunList.SelectedItem is RunRow row)
             await PerformAsync("Starting runner…", row.Phase == "blocked"
                 ? ["resume", row.Id, "--retry"] : ["resume", row.Id]);
+    }
+
+    private async void Handoff_Click(object sender, RoutedEventArgs e)
+    {
+        if (RunList.SelectedItem is not RunRow row)
+            return;
+        try
+        {
+            var result = await CallAsync("handoff", row.Id);
+            Clipboard.SetText(result.GetRawText());
+            Status.Text = $"Copied handoff for {row.Title}.";
+        }
+        catch (Exception error) { Status.Text = error.Message; }
     }
 
     private void Evidence_Click(object sender, RoutedEventArgs e)

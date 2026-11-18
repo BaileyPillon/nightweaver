@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.5 adds session handoffs, an operator attention queue, accepted Git diffs, offline browser journeys with named screenshots, and matched benchmark history. The [ranked features, reliability improvements and research sources](docs/v0.5-field-guide.md) include commands and an example journey.
+
 Run a [head-to-head benchmark of AGTX OneShot, Codex and Claude Code](docs/head-to-head.md) using a frozen task, shared time limits and independent checks.
 
 Version 0.4 adds owned application servers for browser checks, direct standalone CLI comparisons, complete standalone task handoffs, per-task matched outcomes, and explicit account/environment blockers. See the [0.4 guide and comparison starter](docs/v0.4-guide.md). Version 0.3 introduced the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md); its [guide](docs/v0.3-guide.md) remains applicable except where superseded.

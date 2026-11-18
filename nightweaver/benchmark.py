@@ -1,6 +1,7 @@
 """Repeatable coding-workflow experiments with frozen baselines and all outcomes retained."""
 
 from copy import deepcopy
+from hashlib import sha256
 from collections import Counter
 from html import escape
 import json
@@ -17,6 +18,14 @@ from .engine import create_run, git, source_info
 from .reports import document, metrics
 from .safety import atomic_write, redact, write_json
 from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan
+
+
+INCONCLUSIVE = {"provider_blocked", "execution_blocked", "interrupted"}
+
+
+def config_digest(config):
+    serialized = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(serialized).hexdigest()
 
 
 def create_suite(store, source):
@@ -65,9 +74,17 @@ def create_suite(store, source):
             raise ValueError("Benchmark checkout needs a Git author and committer identity to record accepted trials. "
                              "Set user.name and user.email locally in the benchmark repository.") from error
         spec["expected_base"] = source_data["base"]
+        # Match the operator's full brief and checks before adapting it to each contender.
+        contract = {k: v for k, v in spec.items() if k not in
+                    {"repository", "project", "expected_base", "reviewer", "reviewer_fallbacks", "milestones"}}
+        contract["milestones"] = [{k: v for k, v in step.items() if k not in {"worker", "worker_fallbacks"}}
+                                  for step in spec["milestones"]]
+        digest = config_digest(contract)
         if not spec.get("budgets", {}).get("max_seconds"):
             raise ValueError("Benchmark task plans require a max_seconds budget")
         for contender in contenders:
+            route = {k: v for k, v in contender.items() if k not in ("name", "mode")}
+            route_hash = config_digest(route)
             for repeat in range(repetitions):
                 plan = deepcopy(spec)
                 plan.pop("reviewer", None)
@@ -97,7 +114,8 @@ def create_suite(store, source):
                     plan["retry"] = {**plan.get("retry", {}), "transient_attempts": 0}
                     plan["budgets"] = {**plan["budgets"], "max_calls": 1}
                     plan.pop("advisory_ollama", None)
-                prepared.append({"task": task["name"], "contender": contender["name"], "repeat": repeat + 1,
+                prepared.append({"task": task["name"], "contract_sha256": digest, "route_sha256": route_hash,
+                                 "contender": contender["name"], "repeat": repeat + 1,
                                  "mode": contender.get("mode", "nightweaver"), "plan": plan})
     random.Random(seed).shuffle(prepared)
     suite_id = uuid4().hex[:12]
@@ -155,7 +173,7 @@ def paired_outcomes(runs):
             a, b = sides[0].get(key), sides[1].get(key)
             if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
                 counts["unfinished_pairs"] += 1
-            elif any(row.get("outcome") in ("provider_blocked", "execution_blocked", "interrupted") for row in (a, b)):
+            elif any(row.get("outcome") in INCONCLUSIVE for row in (a, b)):
                 counts["inconclusive_pairs"] += 1
             else:
                 label = ("both_accepted" if b["accepted"] else "left_only_accepted") if a["accepted"] else (
