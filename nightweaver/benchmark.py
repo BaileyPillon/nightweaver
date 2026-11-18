@@ -6,13 +6,14 @@ from html import escape
 import json
 from pathlib import Path
 import random
+from statistics import median
 from itertools import combinations
 from uuid import uuid4
 import platform
 
 from . import __version__
 
-from .engine import create_run, source_info
+from .engine import create_run, git, source_info
 from .reports import document, metrics
 from .safety import atomic_write, redact, write_json
 from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan
@@ -57,6 +58,12 @@ def create_suite(store, source):
         task_names.add(task["name"])
         spec = read_plan(source.parent / task["plan"], store)
         source_data = source_info(store, spec)
+        try:
+            for identity in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+                git(Path(spec["repository"]), "var", identity)
+        except ValueError as error:
+            raise ValueError("Benchmark checkout needs a Git author and committer identity to record accepted trials. "
+                             "Set user.name and user.email locally in the benchmark repository.") from error
         spec["expected_base"] = source_data["base"]
         if not spec.get("budgets", {}).get("max_seconds"):
             raise ValueError("Benchmark task plans require a max_seconds budget")
@@ -143,6 +150,7 @@ def paired_outcomes(runs):
                  for name in (left, right)]
         counts = dict(both_accepted=0, left_only_accepted=0, right_only_accepted=0, neither_accepted=0,
                       unfinished_pairs=0, inconclusive_pairs=0)
+        time_ratios = []
         for key in sides[0].keys() | sides[1].keys():
             a, b = sides[0].get(key), sides[1].get(key)
             if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
@@ -153,7 +161,14 @@ def paired_outcomes(runs):
                 label = ("both_accepted" if b["accepted"] else "left_only_accepted") if a["accepted"] else (
                     "right_only_accepted" if b["accepted"] else "neither_accepted")
                 counts[label] += 1
-        pairs.append({"left": left, "right": right, **counts})
+                if a["accepted"] and b["accepted"] and a.get("elapsed_seconds") and b.get("elapsed_seconds"):
+                    time_ratios.append(b["elapsed_seconds"] / a["elapsed_seconds"])
+        scored = sum(counts[k] for k in ("both_accepted", "left_only_accepted", "right_only_accepted", "neither_accepted"))
+        difference = counts["left_only_accepted"] - counts["right_only_accepted"]
+        pairs.append({"left": left, "right": right, **counts, "scored_pairs": scored,
+                      "acceptance_gap_left_minus_right_pp": round(100 * difference / scored, 2) if scored else None,
+                      "timed_success_pairs": len(time_ratios),
+                      "median_right_seconds_over_left": round(median(time_ratios), 3) if time_ratios else None})
     return pairs
 
 
@@ -174,7 +189,16 @@ def suite_report(store, suite_id, output=None):
         body = f'<header><h1>{escape(result["name"])}</h1><p>{escape(result["interpretation"])}</p></header><h2>Contenders</h2><div class="table"><table><thead><tr><th>Setup</th><th>Finished / planned</th><th>Accepted / finished</th><th>Outcomes</th><th>No intervention</th><th>Total calls</th><th>Seconds / acceptance</th></tr></thead><tbody>'
         for row in result["summaries"]:
             body += '<tr>' + ''.join(f'<td>{escape(str(value))}</td>' for value in [row["contender"], f'{row["finished"]}/{row["planned"]}', f'{row["accepted"]}/{row["finished"]}', ", ".join(f"{key.replace('_', ' ')}: {count}" for key, count in row["outcomes"].items()), row["unassisted"], row["calls_all_attempts"], row["seconds_per_acceptance"] if row["seconds_per_acceptance"] is not None else "Unavailable"]) + '</tr>'
-        body += '</tbody></table></div><h2>Matched outcomes</h2><pre>' + escape(json.dumps(result["paired_outcomes"], indent=2)) + '</pre>'
+        body += ('</tbody></table></div><h2>Matched outcomes</h2><p>Acceptance gap is left minus right in percentage points. '
+                 'Time ratio divides right elapsed time by left elapsed time on pairs where both passed. '
+                 'A ratio above 1 means the left workflow was faster.</p><div class="table"><table><thead><tr>'
+                 '<th>Left</th><th>Right</th><th>Scored pairs</th><th>Acceptance gap</th><th>Median time ratio</th>'
+                 '<th>Timed pairs</th><th>Inconclusive</th><th>Unfinished</th></tr></thead><tbody>')
+        for pair in result["paired_outcomes"]:
+            cells = [pair[key] for key in ("left", "right", "scored_pairs", "acceptance_gap_left_minus_right_pp",
+                                           "median_right_seconds_over_left", "timed_success_pairs", "inconclusive_pairs", "unfinished_pairs")]
+            body += '<tr>' + ''.join(f'<td>{escape(str(value)) if value is not None else "—"}</td>' for value in cells) + '</tr>'
+        body += '</tbody></table></div>'
         body += '<h2>Results by task</h2>'
         for item in result["per_task"]:
             body += f'<details><summary>{escape(item["task"])}</summary><pre>{escape(json.dumps(item["summaries"], indent=2))}</pre></details>'

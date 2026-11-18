@@ -44,14 +44,18 @@ def text(obj, key):
 
 
 def provider(value, choices, label):
-    fields(value, "kind argv executable model api_key api_key_file profile_dir", label)
+    fields(value, "kind argv executable model api_key api_key_file profile_dir unavailable_exit_code", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
     if value["kind"] == "command":
-        if set(value) - {"kind", "argv"}:
-            raise ValueError("Command providers accept only kind and argv")
+        if set(value) - {"kind", "argv", "unavailable_exit_code"}:
+            raise ValueError("Unsupported command provider field")
         out["argv"] = command(value.get("argv"), label)
+        if "unavailable_exit_code" in value:
+            out["unavailable_exit_code"] = integer(value["unavailable_exit_code"], "unavailable_exit_code", 1, 123)
+    elif "unavailable_exit_code" in value:
+        raise ValueError("Only command providers support unavailable_exit_code")
     elif "argv" in value:
         raise ValueError("Only command providers accept argv")
     elif value.get("executable"):

@@ -58,7 +58,15 @@ def main():
     parser.add_argument("--codex-model")
     parser.add_argument("--claude-model")
     parser.add_argument("--claude-profile", type=Path)
+    parser.add_argument("--agtx-skill", type=Path, help="Installed upstream skills/oneshot/SKILL.md; compare AGTX, Codex and Claude")
+    parser.add_argument("--agtx-distro", default="AGTX-Pilot")
+    parser.add_argument("--also-codex-coordinator", action="store_true", help="Include a separately labeled Codex-hosted OneShot")
+    parser.add_argument("--seconds", type=int, default=600, help="Shared per-workflow timeout in AGTX comparisons")
     args = parser.parse_args()
+    if args.also_codex_coordinator and not args.agtx_skill:
+        parser.error("--also-codex-coordinator requires --agtx-skill")
+    if not 30 <= args.seconds <= 14400:
+        parser.error("--seconds must be between 30 and 14400")
     folder = args.directory.resolve()
     folder.mkdir(parents=True)
     repo = folder / "project"
@@ -100,6 +108,22 @@ def main():
                  {"name": "Claude standalone", "mode": "standalone", "worker": claude},
                  {"name": "Nightweaver Codex + Claude review", "worker": codex, "reviewer": claude},
              ]}
+    if args.agtx_skill:
+        skill = args.agtx_skill.resolve(strict=True)
+        plan["agent_timeout"] = args.seconds
+        plan["budgets"]["max_seconds"] = args.seconds + 45
+        suite["contenders"].pop()
+        hosts = ["claude", "codex"] if args.also_codex_coordinator else ["claude"]
+        for host in hosts:
+            argv = [sys.executable, str(Path(__file__).with_name("agtx_contender.py").resolve()),
+                    "--distro", args.agtx_distro, "--host", host, "--skill", str(skill), "--seconds", str(args.seconds)]
+            if host == "claude" and args.claude_profile:
+                argv.extend(["--profile", str(args.claude_profile.resolve(strict=True))])
+            model = args.claude_model if host == "claude" else args.codex_model
+            if model:
+                argv.extend(["--model", model])
+            suite["contenders"].append({"name": f"AGTX OneShot ({host} coordinator, Codex workers)", "mode": "external",
+                                        "worker": {"kind": "command", "argv": argv, "unavailable_exit_code": 78}})
     for name, value in (("plan.json", plan), ("suite.json", suite)):
         (folder / name).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     print(folder / "suite.json")

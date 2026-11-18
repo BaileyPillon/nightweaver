@@ -249,6 +249,8 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
             argv += ["--include-directories", str(evidence)]
     code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
     current, answer = metadata(log, config["kind"])
+    if config["kind"] == "command" and code == config.get("unavailable_exit_code"):
+        raise ProviderUnavailable(answer.strip()[-1500:] or "External workflow unavailable", "external_environment")
     if code == 0 and config["kind"] != "command":
         for event in json_events(log):
             if (event.get("type") == "result" and (event.get("is_error") is True or event.get("status") == "error")) or event.get("type") == "turn.failed":
