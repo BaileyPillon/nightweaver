@@ -2,6 +2,7 @@
 
 from contextlib import closing
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from .engine import common_dir, git, git_bytes
 from .process import execute
 from .readiness import diagnose
 from .safety import write_json
+from .spec import artifact
 
 
 def preflight(store, spec):
@@ -35,30 +37,38 @@ def preflight(store, spec):
             for step in config["steps"]:
                 if step["action"] == "visual_match":
                     contract = step["value"]
-                    baselines.add((contract["baseline"], contract["sha256"]))
+                    baselines.add((artifact(contract["baseline"]), contract["sha256"]))
     errors = []
+    image_reader = None
     if baselines:
         try:
-            from PIL import Image
-            Image.init()
+            from PIL import Image as image_reader
         except ImportError:
             errors.append("Install the browser extra to compare PNG baselines")
     for name, digest in sorted(baselines):
         try:
-            entry = git(repository, "ls-tree", base, "--", name)
-            meta, _, path = entry.partition("\t")
-            if not entry or path != name:
+            entry = git_bytes(repository, "--literal-pathspecs", "ls-tree", "-z", base, "--", name)
+            if not entry:
                 errors.append(f"Missing baseline: {name}")
                 continue
-            mode, kind = meta.split()[:2]
+            mode, kind, oid = entry.partition(b"\t")[0].decode("ascii").split()
             if kind != "blob" or mode not in ("100644", "100755"):
                 errors.append(f"Nonregular baseline: {name}")
                 continue
-            if int(git(repository, "cat-file", "-s", f"{base}:{name}")) > 32 * 1024 * 1024:
+            if int(git(repository, "cat-file", "-s", oid)) > 32 * 1024 * 1024:
                 errors.append(f"Oversized baseline: {name}")
                 continue
-            if hashlib.sha256(git_bytes(repository, "cat-file", "blob", f"{base}:{name}")).hexdigest() != digest:
+            data = git_bytes(repository, "cat-file", "blob", oid)
+            if hashlib.sha256(data).hexdigest() != digest:
                 errors.append(f"Baseline digest mismatch: {name}")
+            elif image_reader is not None:
+                try:
+                    with image_reader.open(BytesIO(data), formats=("PNG",)) as reference:
+                        if reference.width * reference.height > 16_000_000:
+                            raise ValueError("reference exceeds 16 megapixels")
+                        reference.verify()
+                except (OSError, SyntaxError, ValueError, image_reader.DecompressionBombError) as error:
+                    errors.append(f"Invalid PNG baseline {name}: {error}")
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
     for channel in sorted(browsers):

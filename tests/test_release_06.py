@@ -138,26 +138,30 @@ class RunDiagnostics(unittest.TestCase):
             replay_browser(self.store, run_id, 2)
 
     def test_preflight_collects_every_invalid_visual_baseline(self):
-        (self.repo / "good.png").write_bytes(b"good")
+        from PIL import Image
+        reference = self.repo / "Phare été [1].png"
+        Image.new("RGB", (4, 4)).save(reference)
+        (self.repo / "corrupt.png").write_bytes(b"bad image")
         (self.repo / "wrong.png").write_bytes(b"wrong")
         (self.repo / "big.png").write_bytes(b"\0" * (32 * 1024 * 1024 + 1))
         (self.repo / "dir").mkdir()
         (self.repo / "dir" / "inner.png").write_bytes(b"x")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "baselines")
-        good = hashlib.sha256(b"good").hexdigest()
+        good = hashlib.sha256(reference.read_bytes()).hexdigest()
+        corrupt = hashlib.sha256(b"bad image").hexdigest()
 
         def step(name, digest=good):
             return {"action": "visual_match", "selector": "h1", "value": {"baseline": name, "sha256": digest}}
 
         raw = json.loads(json.dumps(self.raw))
-        raw["gates"][0]["browser"]["steps"] = [step("good.png"), step("missing.png"), step("wrong.png"),
-                                               step("big.png"), step("dir")]
+        raw["gates"][0]["browser"]["steps"] = [step(reference.name), step("missing.png"), step("wrong.png"),
+                                               step("big.png"), step("dir"), step("corrupt.png", corrupt)]
         report = preflight(self.store, validate(raw))
         text = "\n".join(report["errors"])
-        for name in ("missing.png", "wrong.png", "big.png", "dir"):
+        for name in ("missing.png", "wrong.png", "big.png", "dir", "corrupt.png"):
             self.assertIn(name, text)
-        self.assertNotIn("good.png", text)
+        self.assertNotIn(reference.name, text)
         self.assertFalse(report["ready"])
 
     def test_limit_metrics_use_only_recorded_worker_exit(self):
