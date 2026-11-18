@@ -1,10 +1,12 @@
 """Repeatable coding-workflow experiments with frozen baselines and all outcomes retained."""
 
 from copy import deepcopy
+from collections import Counter
 from html import escape
 import json
 from pathlib import Path
 import random
+from itertools import combinations
 from uuid import uuid4
 import platform
 
@@ -12,7 +14,7 @@ from . import __version__
 
 from .engine import create_run, source_info
 from .reports import document, metrics
-from .safety import atomic_write, write_json
+from .safety import atomic_write, redact, write_json
 from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan
 
 
@@ -36,10 +38,14 @@ def create_suite(store, source):
             raise ValueError("Contender names must be unique nonempty strings")
         contender_names.add(contender["name"])
         contender["worker"] = provider(contender.get("worker"), IMPLEMENTERS, "benchmark worker")
-        if contender.get("mode", "nightweaver") not in ("nightweaver", "external"):
-            raise ValueError("Contender mode must be nightweaver or external")
+        mode = contender.get("mode", "nightweaver")
+        if mode not in ("nightweaver", "external", "standalone"):
+            raise ValueError("Contender mode must be nightweaver, standalone or external")
         if contender.get("mode") == "external" and (contender["worker"]["kind"] != "command" or contender.get("reviewer") or contender.get("worker_fallbacks")):
             raise ValueError("External contenders require one command route and manage their own orchestration")
+        if mode == "standalone" and (contender["worker"]["kind"] not in {"codex", "claude", "gemini", "deepseek"}
+                                    or contender.get("reviewer") or contender.get("worker_fallbacks")):
+            raise ValueError("Standalone contenders require one native model CLI without reviewer or fallback")
         if contender.get("reviewer"):
             contender["reviewer"] = provider(contender["reviewer"], IMPLEMENTERS, "benchmark reviewer")
         contender["worker_fallbacks"] = [provider(route, IMPLEMENTERS, "benchmark fallback") for route in
@@ -64,17 +70,26 @@ def create_suite(store, source):
                 for step in plan["milestones"]:
                     step["worker"] = contender["worker"]
                     step["worker_fallbacks"] = contender.get("worker_fallbacks", [])
-                if contender.get("mode") == "external":
+                if contender.get("mode") in ("external", "standalone"):
                     checks = {}
                     for step in plan["milestones"]:
                         for gate in step["gates"]:
                             if gate["name"] in checks and gate != checks[gate["name"]]:
-                                raise ValueError("External benchmark has conflicting gate names")
+                                raise ValueError("Single-invocation benchmark has conflicting gate names")
                             checks[gate["name"]] = gate
-                    plan["milestones"] = [{"title": task["name"], "task": plan["objective"], "worker": contender["worker"],
-                                            "worker_fallbacks": [], "paths": [], "gates": list(checks.values())}]
+                    # Preserve the complete job when removing the controller's milestone loop.
+                    brief = "Complete all of the following work in this single invocation. " \
+                            "Use your own tools to inspect, test and fix the result before returning.\n\n" + "\n\n".join(
+                                f"{i}. {step['title']}\n{step['task']}\nAllowed paths: {step['paths'] or 'repository files needed for the task'}"
+                                for i, step in enumerate(plan["milestones"], 1))
+                    allowed = list(dict.fromkeys(path for step in plan["milestones"] for path in step["paths"])) \
+                        if all(step["paths"] for step in plan["milestones"]) else []
+                    plan["milestones"] = [{"title": task["name"], "task": brief, "worker": contender["worker"],
+                                            "worker_fallbacks": [], "paths": allowed, "gates": list(checks.values())}]
                     plan["attempts"] = 1
                     plan["retry"] = {**plan.get("retry", {}), "transient_attempts": 0}
+                    plan["budgets"] = {**plan["budgets"], "max_calls": 1}
+                    plan.pop("advisory_ollama", None)
                 prepared.append({"task": task["name"], "contender": contender["name"], "repeat": repeat + 1,
                                  "mode": contender.get("mode", "nightweaver"), "plan": plan})
     random.Random(seed).shuffle(prepared)
@@ -98,9 +113,7 @@ def read_suite(store, suite_id):
     return json.loads((store.root / "benchmarks" / f"{suite_id}.json").read_text(encoding="utf-8"))
 
 
-def suite_report(store, suite_id, output=None):
-    suite = read_suite(store, suite_id)
-    runs = [{**item, **metrics(store, item["run_id"])} for item in suite["runs"]]
+def summarize(runs):
     summaries = []
     for name in sorted({row["contender"] for row in runs}):
         rows = [row for row in runs if row["contender"] == name]
@@ -108,19 +121,66 @@ def suite_report(store, suite_id, output=None):
         successes = sum(row["accepted"] for row in rows)
         total_seconds = sum(row["elapsed_seconds"] or 0 for row in rows)
         summaries.append({"contender": name, "planned": len(rows), "finished": len(completed), "accepted": successes,
+                          "outcomes": dict(Counter(row["outcome"] for row in rows)),
+                          "blocked": sum(row["phase"] == "blocked" for row in rows),
+                          "unfinished": len(rows) - len(completed),
                           "acceptance_rate": successes / len(rows), "unassisted": sum(row["unassisted_acceptance"] for row in rows),
+                          "finished_acceptance_rate": successes / len(completed) if completed else None,
                           "calls_all_attempts": sum(row["provider_calls"] for row in rows),
+                          "observed_tokens": sum(row["observed_tokens"] or 0 for row in rows) if any(
+                              row["observed_tokens"] is not None for row in rows) else None,
+                          "usage_unknown_calls": sum(row["usage_unknown_calls"] for row in rows),
+                          "usage_pending_calls": sum(row["usage_pending_calls"] for row in rows),
                           "seconds_all_attempts": round(total_seconds, 3),
                           "seconds_per_acceptance": round(total_seconds / successes, 3) if successes else None})
+    return summaries
+
+
+def paired_outcomes(runs):
+    pairs = []
+    for left, right in combinations(sorted({row["contender"] for row in runs}), 2):
+        sides = [{(row["task"], row["repeat"], row["baseline"]): row for row in runs if row["contender"] == name}
+                 for name in (left, right)]
+        counts = dict(both_accepted=0, left_only_accepted=0, right_only_accepted=0, neither_accepted=0,
+                      unfinished_pairs=0, inconclusive_pairs=0)
+        for key in sides[0].keys() | sides[1].keys():
+            a, b = sides[0].get(key), sides[1].get(key)
+            if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
+                counts["unfinished_pairs"] += 1
+            elif any(row.get("outcome") in ("provider_blocked", "execution_blocked", "interrupted") for row in (a, b)):
+                counts["inconclusive_pairs"] += 1
+            else:
+                label = ("both_accepted" if b["accepted"] else "left_only_accepted") if a["accepted"] else (
+                    "right_only_accepted" if b["accepted"] else "neither_accepted")
+                counts[label] += 1
+        pairs.append({"left": left, "right": right, **counts})
+    return pairs
+
+
+def suite_report(store, suite_id, output=None):
+    suite = read_suite(store, suite_id)
+    runs = [{**item, **metrics(store, item["run_id"])} for item in suite["runs"]]
+    summaries = summarize(runs)
     result = {"benchmark_id": suite_id, "name": suite["name"], "summaries": summaries, "runs": runs,
-              "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. Inspect unfinished runs, modes, model versions and usage coverage."}
+              "per_task": [{"task": task, "summaries": summarize([row for row in runs if row["task"] == task])}
+                           for task in sorted({row["task"] for row in runs})],
+              "paired_outcomes": paired_outcomes(runs), "runtime": suite.get("runtime", {}),
+              "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. "
+              "Unfinished runs are not failures. acceptance_rate uses all planned runs; finished_acceptance_rate uses only done/blocked runs. "
+              "These are operational acceptance rates, including account/environment blockers; matched pairs with those blockers are inconclusive. "
+              "Calls count CLI invocations, not equal model compute. Inspect modes, model versions and usage coverage."}
+    result = redact(result)
     if output:
-        body = f'<header><h1>{escape(suite["name"])}</h1><p>{escape(result["interpretation"])}</p></header><h2>Contenders</h2><div class="table"><table><thead><tr><th>Setup</th><th>Finished</th><th>Accepted</th><th>No intervention</th><th>Total calls</th><th>Seconds / acceptance</th></tr></thead><tbody>'
-        for row in summaries:
-            body += '<tr>' + ''.join(f'<td>{escape(str(value))}</td>' for value in [row["contender"], f'{row["finished"]}/{row["planned"]}', f'{row["accepted"]}/{row["planned"]}', row["unassisted"], row["calls_all_attempts"], row["seconds_per_acceptance"] or "Unavailable"]) + '</tr>'
-        body += '</tbody></table></div><h2>Every task and attempt</h2>'
-        for row in runs:
+        body = f'<header><h1>{escape(result["name"])}</h1><p>{escape(result["interpretation"])}</p></header><h2>Contenders</h2><div class="table"><table><thead><tr><th>Setup</th><th>Finished / planned</th><th>Accepted / finished</th><th>Outcomes</th><th>No intervention</th><th>Total calls</th><th>Seconds / acceptance</th></tr></thead><tbody>'
+        for row in result["summaries"]:
+            body += '<tr>' + ''.join(f'<td>{escape(str(value))}</td>' for value in [row["contender"], f'{row["finished"]}/{row["planned"]}', f'{row["accepted"]}/{row["finished"]}', ", ".join(f"{key.replace('_', ' ')}: {count}" for key, count in row["outcomes"].items()), row["unassisted"], row["calls_all_attempts"], row["seconds_per_acceptance"] if row["seconds_per_acceptance"] is not None else "Unavailable"]) + '</tr>'
+        body += '</tbody></table></div><h2>Matched outcomes</h2><pre>' + escape(json.dumps(result["paired_outcomes"], indent=2)) + '</pre>'
+        body += '<h2>Results by task</h2>'
+        for item in result["per_task"]:
+            body += f'<details><summary>{escape(item["task"])}</summary><pre>{escape(json.dumps(item["summaries"], indent=2))}</pre></details>'
+        body += '<h2>Every task and attempt</h2>'
+        for row in result["runs"]:
             body += f'<details><summary>{escape(row["task"])} · {escape(row["contender"])} · repeat {row["repeat"]} · {escape(row["phase"])}</summary><pre>{escape(json.dumps(row, indent=2))}</pre></details>'
-        atomic_write(output, document(suite["name"], body))
+        atomic_write(output, document(result["name"], body))
         result["report"] = str(Path(output).resolve())
     return result

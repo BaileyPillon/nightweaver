@@ -1,6 +1,6 @@
 # Nightweaver
 
-Version 0.3 adds persistent run budgets, explicit provider fallback, reproducible benchmark suites, browser journeys, Gemini CLI routing, checkpoint forks, pinned context, saved guidance, GitHub issue intake and portable HTML reports. It also hardens retries, evidence, validation and process ownership. See the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md) and the [upgrade guide](docs/v0.3-guide.md).
+Version 0.4 adds owned application servers for browser checks, direct standalone CLI comparisons, complete standalone task handoffs, per-task matched outcomes, and explicit account/environment blockers. See the [0.4 guide and comparison starter](docs/v0.4-guide.md). Version 0.3 introduced the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md); its [guide](docs/v0.3-guide.md) remains applicable except where superseded.
 
 An autonomous workshop for your code, built for Windows.
 

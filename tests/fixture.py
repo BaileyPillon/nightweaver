@@ -1,6 +1,7 @@
 """Harmless native-process demo used by the integration tests."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -52,6 +53,25 @@ elif mode == "flood":
     print("x" * 10000)
 elif mode == "large_artifact":
     Path("receipt.txt").write_text("x" * 10000, encoding="utf-8")
+elif mode in ("serve", "serve_fail", "serve_redirect"):
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    if mode == "serve_fail":
+        print("fixture server could not start", flush=True)
+        raise SystemExit(7)
+    class Handler(SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+        def do_GET(self):
+            if mode == "serve_redirect":
+                self.send_response(302)
+                self.send_header("Location", "https://example.invalid/")
+                self.end_headers()
+            else:
+                super().do_GET()
+    with ThreadingHTTPServer(("127.0.0.1", int(sys.argv[3])), Handler) as server:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        Path(sys.argv[2]).write_text(json.dumps({"pid": os.getpid(), "child": child.pid, "port": server.server_port}))
+        server.serve_forever()
 elif mode == "browser_build":
     feedback = sys.stdin.read()
     width = "100%" if "Horizontal overflow" in feedback else "1400px"

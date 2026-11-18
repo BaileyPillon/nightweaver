@@ -19,16 +19,22 @@ from nightweaver.safety import write_json
 
 def validate_browser(raw):
     from nightweaver.spec import array, artifact, fields, integer, text
-    fields(raw, "page url heading steps viewports channel timeout_ms", "browser")
-    if ("page" in raw) == ("url" in raw):
-        raise ValueError("Browser needs exactly one of page or loopback url")
+    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until", "browser")
+    if sum(key in raw for key in ("page", "url", "server")) != 1:
+        raise ValueError("Browser needs exactly one of page, loopback url or owned server")
     out = dict(raw)
     if "page" in raw:
         out["page"] = artifact(raw["page"])
-    else:
+    elif "url" in raw:
         url = urlparse(text(raw, "url"))
         if url.scheme not in ("http", "https") or url.hostname not in ("127.0.0.1", "localhost", "::1") or url.username or url.password:
             raise ValueError("Browser URLs must be explicit loopback HTTP(S) addresses")
+    else:
+        from nightweaver.server import validate_server
+        out["server"] = validate_server(raw["server"])
+    out["wait_until"] = raw.get("wait_until", "load")
+    if out["wait_until"] not in ("load", "domcontentloaded", "networkidle"):
+        raise ValueError("wait_until must be load, domcontentloaded or networkidle")
     if "heading" in raw:
         out["heading"] = text(raw, "heading")
     if "channel" in raw and raw["channel"] not in ("msedge", "chrome", "chromium"):
@@ -68,9 +74,14 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 
 @contextmanager
-def local_page(config, root):
+def local_page(config, root, output):
+    if "server" in config:
+        from nightweaver.server import managed_server
+        with managed_server(config["server"], root, output) as server:
+            yield server
+        return
     if "url" in config:
-        yield config["url"]
+        yield config["url"], lambda: None
         return
     page = (root / config["page"]).resolve(strict=True)
     if not page.is_relative_to(root) or not page.is_file():
@@ -79,7 +90,7 @@ def local_page(config, root):
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield f"http://127.0.0.1:{server.server_port}/{quote(page.relative_to(root).as_posix())}"
+            yield f"http://127.0.0.1:{server.server_port}/{quote(page.relative_to(root).as_posix())}", lambda: None
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -91,7 +102,7 @@ def run_browser(config, root, output):
     root, output = Path(root).resolve(), Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     results = []
-    with local_page(config, root) as url, sync_playwright() as playwright:
+    with local_page(config, root, output) as (url, server_check), sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel=config.get("channel"))
         try:
             for viewport in config["viewports"]:
@@ -105,12 +116,14 @@ def run_browser(config, root, output):
                 page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
                 result = {"viewport": name, "passed": False, "errors": errors, "completed_steps": 0}
                 try:
-                    response = page.goto(url, wait_until="networkidle", timeout=config["timeout_ms"])
+                    server_check()
+                    response = page.goto(url, wait_until=config["wait_until"], timeout=config["timeout_ms"])
                     if response is None or response.status >= 400:
                         raise ValueError(f"Page response: {response.status if response else 'missing'}")
                     if config.get("heading"):
                         expect(page.get_by_role("heading", name=config["heading"], exact=True)).to_be_visible()
                     for step in config["steps"]:
+                        server_check()
                         locator = page.locator(step["selector"])
                         action = step["action"]
                         if action == "visible":
@@ -127,6 +140,7 @@ def run_browser(config, root, output):
                     result["overflow_px"] = page.evaluate("Math.max(0,document.documentElement.scrollWidth-innerWidth)")
                     if result["overflow_px"] > 1:
                         raise ValueError(f"Horizontal overflow: {result['overflow_px']}px")
+                    server_check()
                     result["passed"] = not errors
                 except Exception as error:
                     errors.append(str(error)[:4000])

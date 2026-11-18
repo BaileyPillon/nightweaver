@@ -27,8 +27,26 @@ def metrics(store, run_id):
     recorded = sum(call.get("observed_tokens") or 0 for call in calls)
     interventions = sum(event["kind"] in ("operator_feedback", "blocked_run_retried") and started is not None
                         and event["seq"] > started["seq"] for event in events)
+    phase = row["state"]["phase"]
+    outcome = "accepted" if phase == "done" else "unfinished"
+    if phase == "blocked":
+        terminal = next((event for event in reversed(events) if event["kind"] in (
+            "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed")), None)
+        if terminal and terminal["kind"] == "provider_unavailable":
+            outcome = "provider_blocked"
+        elif terminal and terminal["kind"] == "budget_exhausted":
+            outcome = "budget_exhausted"
+            recovered = next((event["seq"] for event in reversed(events) if event["kind"] == "interrupted_worker_recovered"), 0)
+            last_call = next((event["seq"] for event in reversed(events) if event["kind"] == "provider_call_started"), 0)
+            if row["spec"].get("budgets", {}).get("max_calls") == 1 and recovered > last_call:
+                outcome = "interrupted"
+        elif terminal and terminal["kind"] == "blocked" and "during" not in terminal["details"]:
+            outcome = "rejected"
+        else:
+            outcome = "execution_blocked"
     return {
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
+        "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
         "accepted_milestones": len(store.accepted_milestones(run_id)), "total_milestones": len(row["spec"]["milestones"]),
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
@@ -66,7 +84,7 @@ def document(title, body):
 
 def run_report(store, run_id, output, include_images=False):
     row = store.get(run_id)
-    measured = metrics(store, run_id)
+    measured = redact(metrics(store, run_id))
     events = redact(store.events(run_id, limit=None))
     title = redact(row["spec"]["title"])
     body = f'<header><h1>{escape(title)}</h1><p class="state">{escape(measured["phase"].capitalize())} · {measured["accepted_milestones"]}/{measured["total_milestones"]} milestones accepted</p><p>{escape(redact(row["spec"]["objective"]))}</p></header>'
