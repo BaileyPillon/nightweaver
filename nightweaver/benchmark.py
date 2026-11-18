@@ -5,6 +5,7 @@ from hashlib import sha256
 from collections import Counter
 from html import escape
 import json
+from math import comb
 from pathlib import Path
 import random
 from statistics import median
@@ -28,7 +29,7 @@ def config_digest(config):
     return sha256(serialized).hexdigest()
 
 
-def create_suite(store, source):
+def create_suite(store, source, *, preview=False):
     source = Path(source).resolve(strict=True)
     raw = json.loads(source.read_text(encoding="utf-8-sig"))
     fields(raw, "name tasks contenders repetitions seed", "benchmark")
@@ -118,6 +119,14 @@ def create_suite(store, source):
                                  "contender": contender["name"], "repeat": repeat + 1,
                                  "mode": contender.get("mode", "nightweaver"), "plan": plan})
     random.Random(seed).shuffle(prepared)
+    if preview:
+        rows = [{**{k: v for k, v in row.items() if k != "plan"}, "baseline": row["plan"]["expected_base"],
+                 "max_seconds": row["plan"]["budgets"]["max_seconds"],
+                 "max_calls": row["plan"]["budgets"].get("max_calls")} for row in prepared]
+        return {"name": name, "seed": seed, "trials": len(rows), "runs": rows,
+                "configured_seconds_total": sum(row["max_seconds"] for row in rows),
+                "configured_call_cap_total": (sum(row["max_calls"] for row in rows)
+                                              if all(row["max_calls"] is not None for row in rows) else None)}
     suite_id = uuid4().hex[:12]
     manifest = {"id": suite_id, "name": name, "seed": seed, "repetitions": repetitions, "runs": [],
                 "runtime": {"nightweaver": __version__, "python": platform.python_version(), "platform": platform.platform()},
@@ -183,7 +192,12 @@ def paired_outcomes(runs):
                     time_ratios.append(b["elapsed_seconds"] / a["elapsed_seconds"])
         scored = sum(counts[k] for k in ("both_accepted", "left_only_accepted", "right_only_accepted", "neither_accepted"))
         difference = counts["left_only_accepted"] - counts["right_only_accepted"]
+        wins, losses = counts["left_only_accepted"], counts["right_only_accepted"]
+        discordant = wins + losses
+        p_value = min(1.0, 2 * sum(comb(discordant, k) for k in range(min(wins, losses) + 1))
+                      / 2 ** discordant) if discordant else None
         pairs.append({"left": left, "right": right, **counts, "scored_pairs": scored,
+                      "discordant_pairs": discordant, "exact_two_sided_p": p_value,
                       "acceptance_gap_left_minus_right_pp": round(100 * difference / scored, 2) if scored else None,
                       "timed_success_pairs": len(time_ratios),
                       "median_right_seconds_over_left": round(median(time_ratios), 3) if time_ratios else None})
@@ -201,6 +215,7 @@ def suite_report(store, suite_id, output=None):
               "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. "
               "Unfinished runs are not failures. acceptance_rate uses all planned runs; finished_acceptance_rate uses only done/blocked runs. "
               "These are operational acceptance rates, including account/environment blockers; matched pairs with those blockers are inconclusive. "
+              "The exploratory exact sign test assumes independent discordant pairs. Repeated tasks may be correlated. "
               "Calls count CLI invocations, not equal model compute. Inspect modes, model versions and usage coverage."}
     result = redact(result)
     if output:
@@ -211,10 +226,11 @@ def suite_report(store, suite_id, output=None):
                  'Time ratio divides right elapsed time by left elapsed time on pairs where both passed. '
                  'A ratio above 1 means the left workflow was faster.</p><div class="table"><table><thead><tr>'
                  '<th>Left</th><th>Right</th><th>Scored pairs</th><th>Acceptance gap</th><th>Median time ratio</th>'
-                 '<th>Timed pairs</th><th>Inconclusive</th><th>Unfinished</th></tr></thead><tbody>')
+                 '<th>Timed pairs</th><th>Inconclusive</th><th>Unfinished</th><th>Discordant pairs</th><th>Exact two-sided p</th></tr></thead><tbody>')
         for pair in result["paired_outcomes"]:
             cells = [pair[key] for key in ("left", "right", "scored_pairs", "acceptance_gap_left_minus_right_pp",
-                                           "median_right_seconds_over_left", "timed_success_pairs", "inconclusive_pairs", "unfinished_pairs")]
+                                           "median_right_seconds_over_left", "timed_success_pairs", "inconclusive_pairs", "unfinished_pairs",
+                                           "discordant_pairs", "exact_two_sided_p")]
             body += '<tr>' + ''.join(f'<td>{escape(str(value)) if value is not None else "—"}</td>' for value in cells) + '</tr>'
         body += '</tbody></table></div>'
         body += '<h2>Results by task</h2>'

@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
+import re
 import select
 import shutil
 import sqlite3
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from threading import Thread
 
 
 def command(args, **kwargs):
@@ -50,6 +53,59 @@ def merged_result(repo, db, base, output):
     return {"baseline": base, "tip": tip, "tasks": rows, "board_complete": complete}
 
 
+BROWSER_HANDOFF = (
+    "When the plan declares Nightweaver browser gates, the Windows evaluator runs them after the board merge. "
+    "Implement the complete visual brief, run available noninteractive checks and commit through the board. "
+    "Delegate those browser gates to that evaluator. Record any checks you defer. Never approve an interactive permission "
+    "request on the operator's behalf or claim an unexecuted check passed."
+)
+
+
+def needs_approval(pane):
+    # Require a live choice menu plus its footer. A transcript mentioning approval is insufficient.
+    tail = "\n".join(pane.splitlines()[-16:]).lower()
+    return (bool(re.search(r"1\.\s+yes, proceed", tail)) and
+            "tell codex what to do differently" in tail and "esc" in tail)
+
+
+def blocked_pane(env):
+    prefix = ["tmux", "-L", "agtx"]
+    listing = subprocess.run([*prefix, "list-panes", "-a", "-F", "#{pane_id}"], env=env,
+                             capture_output=True, text=True, timeout=4)
+    for pane in listing.stdout.splitlines():
+        if not re.fullmatch(r"%\d+", pane):
+            continue
+        capture = subprocess.run([*prefix, "capture-pane", "-p", "-t", pane], env=env,
+                                 capture_output=True, text=True, errors="replace", timeout=4)
+        if capture.returncode == 0 and needs_approval(capture.stdout):
+            return pane
+    return None
+
+
+def save_drafts(repo, base, staging):
+    """Snapshot each unmerged working tree, using a private index to include new files."""
+    paths = command(["git", "worktree", "list", "--porcelain", "-z"], cwd=repo)
+    drafts = []
+    for field in paths.split(b"\0"):
+        if not field.startswith(b"worktree "):
+            continue
+        path = Path(os.fsdecode(field[9:]))
+        if path == repo or not path.is_dir():
+            continue
+        with tempfile.TemporaryDirectory(dir=staging) as scratch:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            command(["git", "read-tree", "HEAD"], cwd=path, env=env)
+            paths_to_save = [".", ":(exclude).agtx", ":(exclude)oneshot-state.md"]
+            command(["git", "add", "-A", "--", *paths_to_save], cwd=path, env=env)
+            data = command(["git", "diff", "--cached", "--binary", "--no-ext-diff", base,
+                            "--", *paths_to_save], cwd=path, env=env)
+        if data:
+            name = f"draft-{len(drafts) + 1}.patch"
+            (staging / name).write_bytes(data)
+            drafts.append({"file": name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
+    return drafts
+
+
 def linux_board(bundle, output, seconds):
     """The stdin pipe owns this board. EOF, deadline and normal return close its tmux servers."""
     root = Path(tempfile.mkdtemp(prefix="nw-agtx-", dir="/tmp"))
@@ -77,6 +133,7 @@ def linux_board(bundle, output, seconds):
     agent_config = agent_home / ".codex"
     agent_config.mkdir(parents=True, mode=0o700)
     agent_config.joinpath("config.toml").write_text(f'[projects."{repo}"]\ntrust_level = "trusted"\n')
+    agent_config.joinpath("AGENTS.md").write_text(BROWSER_HANDOFF + "\n")
     env.update(CODEX_HOME=str(agent_config), AGTX_AGENT_HOME=str(agent_home))
     (root / "coordinator").mkdir()
     command(["git", "config", "user.name", "Nightweaver Benchmark"], cwd=repo)
@@ -102,9 +159,24 @@ def linux_board(bundle, output, seconds):
         print(json.dumps({"root": str(root), "project": str(repo), "baseline": base, "agtx": agtx,
                           "version": command([agtx, "--version"], text=True).strip(),
                           "worker_version": command([worker, "--version"], text=True).strip(), "worker": worker}), flush=True)
-        if not select.select([sys.stdin], [], [], seconds)[0] or sys.stdin.readline().strip() != "export":
-            return
-        print(json.dumps(merged_result(repo, db, base, output)), flush=True)
+        deadline = time.monotonic() + seconds + 45
+        previous = None
+        while time.monotonic() < deadline:
+            if select.select([sys.stdin], [], [], 4)[0]:
+                request = sys.stdin.readline().strip()
+                if request not in {"export", "drafts"}:
+                    return
+                receipt = merged_result(repo, db, base, output)
+                if request == "drafts" or not receipt["board_complete"]:
+                    receipt["drafts"] = save_drafts(repo, base, Path(output).parent)
+                print(json.dumps(receipt), flush=True)
+                return
+            current = blocked_pane(env)
+            if current and previous == current:
+                print(json.dumps({"event": "approval_required", "pane": current}), flush=True)
+                previous = "reported:" + current
+            elif previous != "reported:" + str(current):
+                previous = current
     finally:
         auth_link.unlink(missing_ok=True)
         for socket_name in ("agtx", "board"):
@@ -156,7 +228,8 @@ def evaluate(args):
                       "you must merge through the board. The evaluator's do-not-commit instruction applies only to "
                       "the outer Windows checkout. Keep oneshot-state.md in your private coordinator working directory. "
                       "This small benchmark needs only enough board tasks to meet the brief. On completion return.\n\n"
-                      + instructions + "\n\nBenchmark goal and independent checks:\n" + task)
+                      + instructions + "\n\nInclude this policy in each work and review task description. " + BROWSER_HANDOFF
+                      + "\n\nBenchmark goal and independent checks:\n" + task)
             env = os.environ.copy()
             if args.host == "claude":
                 if args.profile:
@@ -181,21 +254,75 @@ def evaluate(args):
                 argv += ["--model", args.model]
             if args.host == "codex":
                 argv.append("-")
-            with (evidence / "coordinator.jsonl").open("wb") as stream:
-                result = subprocess.run(argv, cwd=evidence, input=prompt.encode("utf-8"), stdout=stream,
-                                        stderr=subprocess.STDOUT, env=env, timeout=args.seconds)
-            details = host_errors(evidence / "coordinator.jsonl")
-            if result.returncode == 124:
+            messages = queue.Queue()
+
+            def read_board():
+                try:
+                    for message in board.stdout:
+                        messages.put(json.loads(message))
+                finally:
+                    messages.put(None)
+
+            Thread(target=read_board, daemon=True).start()
+            deadline = time.monotonic() + args.seconds
+            interruption = None
+            with tempfile.TemporaryFile() as input_file, (evidence / "coordinator.jsonl").open("wb") as stream:
+                input_file.write(prompt.encode("utf-8"))
+                input_file.seek(0)
+                with subprocess.Popen(argv, cwd=evidence, stdin=input_file, stdout=stream,
+                                      stderr=subprocess.STDOUT, env=env) as result:
+                    try:
+                        while result.poll() is None:
+                            if time.monotonic() >= deadline:
+                                interruption = "deadline"
+                                break
+                            try:
+                                signal = messages.get(timeout=1)
+                            except queue.Empty:
+                                continue
+                            if signal is None:
+                                raise RuntimeError("AGTX board closed early")
+                            if signal.get("event") == "approval_required":
+                                interruption = "approval_required"
+                                break
+                    finally:
+                        if result.poll() is None:
+                            result.kill()
+                            result.wait(timeout=10)
+            if result.returncode == 124 and not interruption:
+                interruption = "deadline"
+            board.stdin.write("drafts\n" if interruption else "export\n")
+            board.stdin.flush()
+            while True:
+                try:
+                    receipt = messages.get(timeout=45)
+                except queue.Empty as error:
+                    raise RuntimeError("AGTX board receipt timed out") from error
+                if receipt is None:
+                    raise RuntimeError("AGTX board closed without a receipt")
+                if "event" not in receipt:
+                    break
+                interruption = interruption or receipt["event"]
+            receipt["interruption"] = interruption
+            for draft in receipt.get("drafts", []):
+                name = draft["file"]
+                if not re.fullmatch(r"draft-[1-9]\d*\.patch", name):
+                    raise ValueError("Invalid draft filename")
+                data = command([*wsl, "cat", staging + "/" + name])
+                if hashlib.sha256(data).hexdigest() != draft["sha256"]:
+                    raise ValueError("Draft transfer integrity failure")
+                (evidence / name).write_bytes(data)
+            (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2))
+            print(json.dumps(receipt), flush=True)
+            if interruption == "approval_required":
+                raise RuntimeError("AGTX worker requires operator approval (see private receipt)")
+            if interruption == "deadline":
                 return 124
+            details = host_errors(evidence / "coordinator.jsonl")
             if any(term in details for term in ("oauth", "not logged in", "authenticate", "subscription", "rate limit", "usage limit")):
                 raise RuntimeError(f"{args.host} coordinator account or service denied the request (see private log)")
             if result.returncode:
                 raise RuntimeError(f"{args.host} coordinator exited {result.returncode} (see private log)")
-            board.stdin.write("export\n")
-            board.stdin.flush()
-            receipt = json.loads(board.stdout.readline())
-            (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2))
-            print(json.dumps(receipt), flush=True)
             if not receipt["board_complete"]:
                 if "requires approval" in details or "transport closed" in details:
                     raise RuntimeError("AGTX tools unavailable to the coordinator (see private log)")

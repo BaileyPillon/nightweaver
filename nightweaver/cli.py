@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -14,7 +15,7 @@ from .process import BusyRun, run_lock, runner_active
 from .providers import configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
 from .spec import read_plan, resolve_repository, validate
-from .store import Store, timestamp
+from .store import Store, default_home, timestamp
 from .safety import redact
 
 
@@ -181,6 +182,16 @@ def main(argv=None):
             parser.add_argument("--limit", type=int, default=80)
             parser.add_argument("--all", action="store_true")
             parser.add_argument("--follow", action="store_true", help="Stream new events as JSON lines until the run stops")
+    pre = commands.add_parser("preflight", help="Validate committed context, routes, identity and browser runtime")
+    pre.add_argument("plan")
+    replay = commands.add_parser("replay-browser", help="Recheck an accepted milestone in a private checkout")
+    replay.add_argument("id")
+    replay.add_argument("--milestone", type=int)
+    replay.add_argument("--gate")
+    backup = commands.add_parser("db-backup", help="Snapshot the runtime database to a new file")
+    backup.add_argument("output", type=Path)
+    integrity = commands.add_parser("db-check", help="Verify the live runtime database or a backup")
+    integrity.add_argument("--file", type=Path)
     commands.add_parser("attention", help="List runs requiring an operator decision")
     for command, help_text in (("handoff", "Summarize durable context for a fresh session"),
                                ("changes", "Review accepted changes from immutable Git commits"),
@@ -212,6 +223,7 @@ def main(argv=None):
     bench_sub = benchmark.add_subparsers(dest="benchmark_action", required=True)
     bench_create = bench_sub.add_parser("create")
     bench_create.add_argument("suite")
+    bench_sub.add_parser("preview", help="Resolve the complete matrix and budgets without registering runs").add_argument("suite")
     for action in ("run", "report"):
         bench_parser = bench_sub.add_parser(action)
         bench_parser.add_argument("id")
@@ -236,9 +248,22 @@ def main(argv=None):
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
     try:
+        if args.command in ("db-backup", "db-check"):
+            from .diagnostics import database_backup, database_check
+            database = Path(args.home or default_home()) / "runs.sqlite3"
+            report = (database_backup(database, args.output) if args.command == "db-backup"
+                      else database_check(args.file or database))
+            output(report)
+            return 0 if report["ok"] else 3
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
+        if name in ("preflight", "replay-browser"):
+            from .diagnostics import preflight, replay_browser
+            report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
+                      else replay_browser(store, args.id, args.milestone, args.gate))
+            output(report)
+            return 0 if report.get("ready", report.get("passed")) else 3
         if name == "doctor":
             report = diagnose(store, read_plan(args.plan, store) if args.plan else None,
                               planner_route(args) if args.planner else None, args.live)
@@ -297,8 +322,8 @@ def main(argv=None):
             output(issue_plan(store, args.template, args.repo, args.number, args.output))
         elif name == "benchmark":
             from .benchmark import create_suite, read_suite, suite_report
-            if args.benchmark_action == "create":
-                output(create_suite(store, args.suite))
+            if args.benchmark_action in ("preview", "create"):
+                output(create_suite(store, args.suite, preview=args.benchmark_action == "preview"))
             elif args.benchmark_action == "report":
                 output(suite_report(store, args.id, args.output))
             elif args.benchmark_action == "compare":
@@ -340,7 +365,7 @@ def main(argv=None):
             else:
                 output({"run_id": args.id, "runner_pid": background(store, args.id, args.retry)})
         return 0
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, subprocess.SubprocessError) as error:
         if args.command == "dispatch" and args.watch and "store" in locals():
             record_dispatch(store, str(error))
         print(f"Nightweaver: {redact(str(error))}", file=sys.stderr)

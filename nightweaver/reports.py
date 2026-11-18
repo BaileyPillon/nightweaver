@@ -10,6 +10,34 @@ from pathlib import Path
 from .safety import atomic_write, redact
 
 
+def recovery_metrics(events):
+    attempts = rejections = first_pass = repaired = 0
+    measured_gates = []
+    observed = {}
+    for event in events:
+        kind, detail = event["kind"], event["details"]
+        if kind == "worker_started":
+            attempts += 1
+        elif kind == "attempt_rejected":
+            rejections += 1
+        elif kind == "milestone_accepted":
+            first_pass += int(attempts == 1 and rejections == 0)
+            repaired += int(attempts > 0 and rejections > 0)
+            attempts = rejections = 0
+        elif kind == "gate_finished":
+            if "duration_ms" in detail:
+                measured_gates.append({"name": detail["name"], "duration_ms": detail["duration_ms"]})
+            if detail.get("tree") and detail.get("contract_sha256"):
+                key = detail["name"], detail["tree"], detail["contract_sha256"]
+                passed = detail.get("exit") == 0 and not detail.get("artifact_error")
+                observed.setdefault(key, set()).add(passed)
+    return {"first_pass_milestones": first_pass, "repaired_milestones": repaired,
+            "timed_gate_executions": len(measured_gates),
+            "slowest_gate": max(measured_gates, key=lambda g: g["duration_ms"], default=None),
+            "mixed_gate_results": [{"name": name, "tree": tree, "contract_sha256": digest}
+                                   for (name, tree, digest), outcomes in observed.items() if len(outcomes) == 2]}
+
+
 def metrics(store, run_id):
     row = store.get(run_id)
     events = store.events(run_id, limit=None)
@@ -48,9 +76,14 @@ def metrics(store, run_id):
         elif terminal and (terminal["kind"] == "repeated_failure_stopped" or
                            (terminal["kind"] == "blocked" and "during" not in terminal["details"])):
             outcome = "rejected"
+            rejected = next((e["details"] for e in reversed(events) if e["kind"] == "attempt_rejected"), {})
+            if rejected.get("phase") == "worker":
+                outcome = {124: "worker_timeout", 125: "worker_idle_timeout", 126: "worker_output_limit"}.get(
+                    rejected.get("exit"), outcome)
         else:
             outcome = "execution_blocked"
     return {
+        **recovery_metrics(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
@@ -96,6 +129,10 @@ def run_report(store, run_id, output, include_images=False):
     body = f'<header><h1>{escape(title)}</h1><p class="state">{escape(measured["phase"].capitalize())} · {measured["accepted_milestones"]}/{measured["total_milestones"]} milestones accepted</p><p>{escape(redact(row["spec"]["objective"]))}</p></header>'
     body += '<h2>Run measurements</h2><div class="table"><table><tbody>'
     for key, value in measured.items():
+        if key == "slowest_gate" and value:
+            value = f"{value['name']} ({value['duration_ms']:,} ms)"
+        elif key == "mixed_gate_results":
+            value = ", ".join(f"{g['name']} at {g['tree'][:12]}" for g in value) or "None observed"
         body += f'<tr><th scope="row">{escape(key.replace("_", " ").capitalize())}</th><td>{escape(str(value) if value is not None else "Unavailable")}</td></tr>'
     body += '</tbody></table></div>'
     if include_images:

@@ -228,7 +228,7 @@ class Run:
     def evidence_dir(self, state):
         return self.root / "evidence" / f"{state['step'] + 1:02d}" / f"{state['attempt']:02d}"
 
-    def reject(self, reason, phase, **state):
+    def reject(self, reason, phase, *, exit_code=None, **state):
         current = self.store.get(self.id)["state"]
         reason = redact(reason)
         path = self.root / "worktrees" / f"{current['step'] + 1:02d}"
@@ -243,7 +243,7 @@ class Run:
         blocked = bool(limit and count >= limit)
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
-        self.set("attempt_rejected", {"phase": phase, "issue": reason, "same_failure_count": count},
+        self.set("attempt_rejected", {"phase": phase, "issue": reason, "same_failure_count": count, "exit": exit_code},
                  following_event=("repeated_failure_stopped", {"issue": reason, "count": count}) if blocked else None,
                  phase="blocked" if blocked else "ready", last_error=reason, failure_fingerprint=fingerprint,
                  failure_count=count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
@@ -291,7 +291,7 @@ class Run:
                                                    state.get("worker_session"))
         if code:
             label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", worker_session=None)
+            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None)
             return
         self.set("worker_finished", {"exit": code, "session": session, "log": str(log)},
                  phase="checking", worker_session=session, transient_failures=0)
@@ -320,10 +320,14 @@ class Run:
                 write_json(config_path, check["browser"])
                 argv = [sys.executable, str(Path(__file__).with_name("browser.py")), "--config-file",
                         str(config_path), "--output", str(browser_output)]
+            gate_started = time.monotonic()
             code = execute(argv, path, log, check["timeout"], env=env, paused=self.paused,
                            max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
                            heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
-            receipt = {"name": check["name"], "exit": code, "log": str(log), "tree": snapshot}
+            contract = json.dumps(check, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            receipt = {"name": check["name"], "exit": code, "log": str(log), "tree": snapshot,
+                       "contract_sha256": hashlib.sha256(contract).hexdigest(),
+                       "duration_ms": round((time.monotonic() - gate_started) * 1000)}
             try:
                 receipt["artifacts"] = preserve_artifacts(path, evidence / f"gate-{index:02d}", check["artifacts"], before,
                                                            check.get("max_artifact_bytes", 32 * 1024 * 1024))

@@ -4,11 +4,14 @@ import argparse
 from contextlib import contextmanager
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 import re
 import sys
 from threading import Thread
+from time import monotonic
 from urllib.parse import quote, urlparse
 
 if __package__ in (None, ""):
@@ -19,12 +22,19 @@ from nightweaver.safety import write_json
 
 def validate_browser(raw):
     from nightweaver.spec import array, artifact, fields, integer, text
-    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline", "browser")
+    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline network", "browser")
     if sum(key in raw for key in ("page", "url", "server")) != 1:
         raise ValueError("Browser needs exactly one of page, loopback url or owned server")
     out = dict(raw)
     if type(raw.get("offline", False)) is not bool or (raw.get("offline") and "page" not in raw):
         raise ValueError("Offline browser checks require a local page and a boolean offline option")
+    if "network" in raw:
+        network = raw["network"]
+        fields(network, "require_success max_requests", "network")
+        if type(network.get("require_success", False)) is not bool:
+            raise ValueError("network.require_success must be boolean")
+        if "max_requests" in network:
+            integer(network["max_requests"], "max_requests", 0, 100000)
     if "page" in raw:
         out["page"] = artifact(raw["page"])
     elif "url" in raw:
@@ -45,7 +55,7 @@ def validate_browser(raw):
     out["steps"] = array(raw.get("steps", []), "browser steps", 100)
     checkpoints = set()
     for step in out["steps"]:
-        fields(step, "action selector value", "browser step")
+        fields(step, "action selector locator value", "browser step")
         action = text(step, "action")
         if action == "checkpoint":
             label = text(step, "value")
@@ -55,9 +65,29 @@ def validate_browser(raw):
             checkpoints.add(label)
             continue
         if action not in ("click", "fill", "press", "check", "visible", "hidden", "enabled", "disabled",
-                          "focused", "text", "count"):
+                          "focused", "text", "count", "aria", "visual_match"):
             raise ValueError(f"Unsupported browser action: {action}")
-        text(step, "selector")
+        if ("selector" in step) == ("locator" in step):
+            raise ValueError("Use exactly one selector or semantic locator")
+        if "selector" in step:
+            text(step, "selector")
+        else:
+            loc = step["locator"]
+            fields(loc, "role name label test_id", "locator")
+            if set(loc) not in ({"role"}, {"role", "name"}, {"label"}, {"test_id"}):
+                raise ValueError("Use role with optional name, label or test_id")
+            for key in loc:
+                text(loc, key)
+        if action == "aria":
+            text(step, "value")
+        if action == "visual_match":
+            match = step.get("value")
+            fields(match, "baseline sha256 channel_delta max_changed_ppm", "visual match")
+            artifact(text(match, "baseline"))
+            if not re.fullmatch(r"[a-f0-9]{64}", text(match, "sha256")):
+                raise ValueError("Visual baseline needs an operator-pinned SHA-256")
+            integer(match.get("channel_delta", 0), "channel_delta", 0, 255)
+            integer(match.get("max_changed_ppm", 0), "max_changed_ppm", 0, 1000000)
         if action in ("fill", "press", "text") and not isinstance(step.get("value"), str):
             raise ValueError(f"{action} needs a string value")
         if action == "count":
@@ -69,7 +99,16 @@ def validate_browser(raw):
         raise ValueError("At least one browser viewport is required")
     names = set()
     for viewport in out["viewports"]:
-        fields(viewport, "name width height", "viewport")
+        fields(viewport, "name width height is_mobile has_touch device_scale_factor color_scheme reduced_motion forced_colors", "viewport")
+        for key in ("is_mobile", "has_touch"):
+            if key in viewport and type(viewport[key]) is not bool:
+                raise ValueError(f"{key} must be boolean")
+        if "device_scale_factor" in viewport:
+            integer(viewport["device_scale_factor"], "device_scale_factor", 1, 4)
+        for key, choices in (("color_scheme", ("light", "dark")), ("reduced_motion", ("reduce", "no-preference")),
+                             ("forced_colors", ("active", "none"))):
+            if key in viewport and viewport[key] not in choices:
+                raise ValueError(f"Unsupported viewport {key}")
         name = text(viewport, "name")
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", name) or name in names:
             raise ValueError("Viewport names must be unique lowercase identifiers")
@@ -110,7 +149,46 @@ def local_page(config, root, output):
             thread.join(timeout=5)
 
 
-def run_step(page, step, index, result, output, timeout):
+def semantic_locator(page, step):
+    if "selector" in step:
+        return page.locator(step["selector"])
+    loc = step["locator"]
+    if "role" in loc:
+        return page.get_by_role(loc["role"], name=loc.get("name"), exact=True)
+    if "label" in loc:
+        return page.get_by_label(loc["label"], exact=True)
+    return page.get_by_test_id(loc["test_id"])
+
+
+def visual_match(locator, contract, root, output, prefix, result):
+    from PIL import Image, ImageChops
+    baseline = (root / contract["baseline"]).resolve(strict=True)
+    if not baseline.is_relative_to(root) or not baseline.is_file() or baseline.stat().st_size > 32 * 1024 * 1024:
+        raise ValueError("Invalid visual baseline file")
+    data = baseline.read_bytes()
+    if hashlib.sha256(data).hexdigest() != contract["sha256"]:
+        raise ValueError("Visual baseline hash differs from the plan")
+    bounds = locator.bounding_box()
+    if not bounds or bounds["width"] * bounds["height"] > 16_000_000:
+        raise ValueError("Visual comparison region must be visible and at most 16 megapixels")
+    actual = output / (prefix + ".actual.png")
+    locator.screenshot(path=str(actual), animations="disabled", scale="css", caret="hide")
+    with Image.open(BytesIO(data), formats=("PNG",)) as reference, Image.open(actual) as capture:
+        if reference.size != capture.size or reference.width * reference.height > 16_000_000:
+            raise ValueError(f"Visual dimensions differ or exceed limit: {reference.size}, {capture.size}")
+        delta = ImageChops.difference(reference.convert("RGB"), capture.convert("RGB"))
+        red, green, blue = delta.split()
+        histogram = ImageChops.lighter(red, ImageChops.lighter(green, blue)).histogram()
+        changed = sum(histogram[contract.get("channel_delta", 0) + 1:])
+        total = capture.width * capture.height
+        result.setdefault("visual_matches", []).append({"step": prefix, "changed_pixels": changed,
+                                                       "total_pixels": total, "baseline_sha256": contract["sha256"]})
+        if changed * 1000000 > contract.get("max_changed_ppm", 0) * total:
+            delta.save(output / (prefix + ".diff.png"))
+            raise ValueError(f"Visual regression: {changed}/{total} pixels differ")
+
+
+def run_step(page, step, index, result, output, timeout, root):
     from playwright.sync_api import expect
     action = step["action"]
     if action == "checkpoint":
@@ -118,7 +196,18 @@ def run_step(page, step, index, result, output, timeout):
         page.screenshot(path=str(output / file), animations="disabled")
         result["checkpoints"].append({"step": index, "name": step["value"], "file": file})
         return
-    locator = page.locator(step["selector"])
+    locator = semantic_locator(page, step)
+    prefix = f"{result['viewport']}.{index:02d}"
+    if action == "visual_match":
+        return visual_match(locator, step["value"], root, output, prefix, result)
+    if action == "aria":
+        try:
+            expect(locator).to_match_aria_snapshot(step["value"], timeout=timeout)
+        except AssertionError:
+            if locator.count() == 1:
+                (output / (prefix + ".aria.yml")).write_text(locator.aria_snapshot(timeout=timeout)[:64000], encoding="utf-8")
+            raise
+        return
     if action in ("visible", "hidden", "enabled", "disabled", "focused"):
         getattr(expect(locator), "to_be_" + action)(timeout=timeout)
     elif action in ("text", "count"):
@@ -143,7 +232,8 @@ def run_browser(config, root, output):
                 errors = []
                 offline = config.get("offline", False)
                 context = browser.new_context(viewport={key: viewport[key] for key in ("width", "height")},
-                                              reduced_motion="reduce", offline=offline,
+                                              **{"reduced_motion": "reduce", **{k: v for k, v in viewport.items()
+                                                  if k not in ("name", "width", "height")}}, offline=offline,
                                               service_workers="block" if offline else "allow")
                 context.tracing.start(screenshots=True, snapshots=True, sources=False)
                 page = context.new_page()
@@ -157,6 +247,24 @@ def run_browser(config, root, output):
                     context.on("request", lambda req: record_error("External request during offline playback")
                                if req.url.startswith(("http:", "https:")) else None)
                 result = {"viewport": name, "passed": False, "errors": errors, "completed_steps": 0, "checkpoints": []}
+                started = monotonic()
+                network = config.get("network", {})
+                request_count = 0
+
+                def count_request(req):
+                    nonlocal request_count
+                    if urlparse(req.url).scheme in ("http", "https"):
+                        request_count += 1
+
+                def failed_request(req, reason):
+                    if network.get("require_success") and urlparse(req.url).scheme in ("http", "https"):
+                        record_error(f"{reason} ({req.resource_type}) {urlparse(req.url).path[:240]}")
+
+                if "network" in config:
+                    context.on("request", count_request)
+                    context.on("requestfailed", lambda req: failed_request(req, "Request failed"))
+                    context.on("response", lambda res: failed_request(res.request, f"HTTP {res.status}") if res.status >= 400 else None)
+                result["step_durations_ms"] = []
                 stage = {"action": "navigate"}
                 try:
                     server_check()
@@ -167,9 +275,13 @@ def run_browser(config, root, output):
                         stage = {"action": "heading", "name": config["heading"]}
                         expect(page.get_by_role("heading", name=config["heading"], exact=True)).to_be_visible(timeout=config["timeout_ms"])
                     for index, step in enumerate(config["steps"], 1):
-                        stage = {"index": index, "action": step["action"], "selector": step.get("selector")}
+                        stage = {"index": index, "action": step["action"], "selector": step.get("selector", step.get("locator"))}
                         server_check()
-                        run_step(page, step, index, result, output, config["timeout_ms"])
+                        step_start = monotonic()
+                        try:
+                            run_step(page, step, index, result, output, config["timeout_ms"], root)
+                        finally:
+                            result["step_durations_ms"].append(round((monotonic() - step_start) * 1000))
                         result["completed_steps"] += 1
                     stage = {"action": "layout"}
                     result["overflow_px"] = page.evaluate("Math.max(0,document.documentElement.scrollWidth-innerWidth)")
@@ -195,6 +307,11 @@ def run_browser(config, root, output):
                         record_error(f"Trace unavailable: {error}")
                     finally:
                         context.close()
+                    if "network" in config:
+                        result["http_requests"] = request_count
+                        if "max_requests" in network and request_count > network["max_requests"]:
+                            record_error(f"HTTP request budget exceeded: {request_count}/{network['max_requests']}")
+                    result["duration_ms"] = round((monotonic() - started) * 1000)
                     result["passed"] = result["passed"] and not errors
                     results.append(result)
         finally:

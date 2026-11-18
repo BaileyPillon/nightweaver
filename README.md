@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.6 adds pinned visual comparisons, accessible and mobile browser contracts, model-free replay of accepted commits, repair measurements, and online runtime backups. Read the [ranked top twenty with research sources and commands](docs/v0.6-research.md).
+
 Version 0.5 adds session handoffs, an operator attention queue, accepted Git diffs, offline browser journeys with named screenshots, and matched benchmark history. The [ranked features, reliability improvements and research sources](docs/v0.5-field-guide.md) include commands and an example journey.
 
 Run a [head-to-head benchmark of AGTX OneShot, Codex and Claude Code](docs/head-to-head.md) using a frozen task, shared time limits and independent checks.
