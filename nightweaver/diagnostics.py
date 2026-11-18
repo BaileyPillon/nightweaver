@@ -44,10 +44,23 @@ def preflight(store, spec):
         except ImportError:
             errors.append("Install the browser extra to compare PNG baselines")
     for name, digest in sorted(baselines):
-        if int(git(repository, "cat-file", "-s", f"{base}:{name}")) > 32 * 1024 * 1024:
-            raise ValueError(f"Oversized baseline: {name}")
-        if hashlib.sha256(git_bytes(repository, "cat-file", "blob", f"{base}:{name}")).hexdigest() != digest:
-            errors.append(f"Baseline digest mismatch: {name}")
+        try:
+            entry = git(repository, "ls-tree", base, "--", name)
+            meta, _, path = entry.partition("\t")
+            if not entry or path != name:
+                errors.append(f"Missing baseline: {name}")
+                continue
+            mode, kind = meta.split()[:2]
+            if kind != "blob" or mode not in ("100644", "100755"):
+                errors.append(f"Nonregular baseline: {name}")
+                continue
+            if int(git(repository, "cat-file", "-s", f"{base}:{name}")) > 32 * 1024 * 1024:
+                errors.append(f"Oversized baseline: {name}")
+                continue
+            if hashlib.sha256(git_bytes(repository, "cat-file", "blob", f"{base}:{name}")).hexdigest() != digest:
+                errors.append(f"Baseline digest mismatch: {name}")
+        except ValueError as error:
+            errors.append(f"Unreadable baseline {name}: {error}")
     for channel in sorted(browsers):
         try:
             from playwright.sync_api import sync_playwright

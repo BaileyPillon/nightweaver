@@ -137,6 +137,29 @@ class RunDiagnostics(unittest.TestCase):
         with self.assertRaises(ValueError):
             replay_browser(self.store, run_id, 2)
 
+    def test_preflight_collects_every_invalid_visual_baseline(self):
+        (self.repo / "good.png").write_bytes(b"good")
+        (self.repo / "wrong.png").write_bytes(b"wrong")
+        (self.repo / "big.png").write_bytes(b"\0" * (32 * 1024 * 1024 + 1))
+        (self.repo / "dir").mkdir()
+        (self.repo / "dir" / "inner.png").write_bytes(b"x")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "baselines")
+        good = hashlib.sha256(b"good").hexdigest()
+
+        def step(name, digest=good):
+            return {"action": "visual_match", "selector": "h1", "value": {"baseline": name, "sha256": digest}}
+
+        raw = json.loads(json.dumps(self.raw))
+        raw["gates"][0]["browser"]["steps"] = [step("good.png"), step("missing.png"), step("wrong.png"),
+                                               step("big.png"), step("dir")]
+        report = preflight(self.store, validate(raw))
+        text = "\n".join(report["errors"])
+        for name in ("missing.png", "wrong.png", "big.png", "dir"):
+            self.assertIn(name, text)
+        self.assertNotIn("good.png", text)
+        self.assertFalse(report["ready"])
+
     def test_limit_metrics_use_only_recorded_worker_exit(self):
         for code, outcome in ((124, "worker_timeout"), (125, "worker_idle_timeout"), (126, "worker_output_limit"),
                               (1, "rejected"), (None, "rejected")):
@@ -150,7 +173,7 @@ class BrowserContracts(unittest.TestCase):
     def test_visual_tolerance_boundaries_and_pinned_reference(self):
         from PIL import Image
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()  # run_browser passes a resolved root; match that for 8.3 temp paths
             image = Image.new("RGB", (2, 2), (10, 20, 30))
             reference = root / "reference.png"
             image.save(reference)
