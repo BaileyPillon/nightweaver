@@ -177,8 +177,8 @@ class ComparisonTest(unittest.TestCase):
         self.assertEqual(external_summary["unfinished"], 0)
         self.assertEqual(external_summary["finished_acceptance_rate"], 0)
         self.assertEqual(len(report["per_task"]), 1)
-        rows = [{"task": "a", "repeat": 1, "baseline": "same", "phase": "done", "accepted": True, "contender": "a"},
-                {"task": "a", "repeat": 1, "baseline": "same", "phase": "blocked", "accepted": False, "contender": "b"}]
+        rows = [{"task": "a", "repeat": 1, "baseline": "same", "contract_sha256": "checks", "phase": "done", "accepted": True, "contender": "a"},
+                {"task": "a", "repeat": 1, "baseline": "same", "contract_sha256": "checks", "phase": "blocked", "accepted": False, "contender": "b"}]
         self.assertEqual(paired_outcomes(rows)[0]["left_only_accepted"], 1)
         rows[1]["outcome"] = "provider_blocked"
         self.assertEqual(paired_outcomes(rows)[0]["inconclusive_pairs"], 1)

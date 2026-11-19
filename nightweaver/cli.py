@@ -101,8 +101,9 @@ def plan_goal(store, args):
         + "\nProtected paths: " + json.dumps(raw.get("protected_paths", []))
         + "\n\nGoal:\n" + args.objective
     )
-    if project or "expected_base" in raw:
-        source_info(store, raw)
+    pin_source = args.start or args.enqueue or project or "expected_base" in raw
+    if pin_source:
+        raw["expected_base"] = source_info(store, raw)["base"]
     if args.start:
         from .diagnostics import probe_browser_channels
         checks = [gate_spec(item) for item in array(gates, "gates") + array(final_gates, "final_gates")]
@@ -120,6 +121,8 @@ def plan_goal(store, args):
         raise ValueError(f"Planner did not return one to five milestones. See {log}")
     raw["milestones"] = [{"title": item["title"], "task": item["task"]} for item in milestones]
     spec = validate(raw, store=store)
+    if pin_source:
+        source_info(store, spec)
     if args.start or args.enqueue:
         result = register(store, spec, args)
         return {**result, "milestones": raw["milestones"]}
@@ -139,7 +142,10 @@ def register(store, spec, args):
     run_id = create_run(store, spec, enqueue=args.enqueue, after=args.after)
     result = {"run_id": run_id}
     if args.start:
-        result["runner_pid"] = background(store, run_id, False)
+        if getattr(args, "wait", False):
+            result["phase"] = Run(store, run_id).run()
+        else:
+            result["runner_pid"] = background(store, run_id, False)
     return result
 
 
@@ -169,6 +175,7 @@ def main(argv=None):
     for parser in (add, goal):
         launch = parser.add_mutually_exclusive_group()
         launch.add_argument("--start", action="store_true", help="Start a dedicated runner now")
+        parser.add_argument("--wait", action="store_true", help="With --start, run through verification and return the outcome")
         launch.add_argument("--enqueue", action="store_true", help="Let the persistent dispatcher start this run")
         parser.add_argument("--after", action="append", default=[], metavar="RUN_ID",
                             help="Wait for this prerequisite run to complete. Requires --enqueue.")
@@ -183,11 +190,29 @@ def main(argv=None):
         parser.add_argument("id")
         if name in ("run", "start", "resume"):
             parser.add_argument("--retry", action="store_true", help="Try a blocked run again")
+        if name in ("start", "resume"):
+            parser.add_argument("--wait", action="store_true")
         if name == "events":
             parser.add_argument("--after", type=int)
             parser.add_argument("--limit", type=int, default=80)
             parser.add_argument("--all", action="store_true")
             parser.add_argument("--follow", action="store_true", help="Stream new events as JSON lines until the run stops")
+            parser.add_argument("--kind", action="append", default=[], help="Only return this event kind (repeatable)")
+    wait = commands.add_parser("wait", help="Observe a run until done, blocked, paused or timed out")
+    wait.add_argument("id")
+    wait.add_argument("--timeout", type=float, help="Wall-clock seconds to wait")
+    pd = commands.add_parser("plan-diff", help="Compare normalized plan contracts without calling a model")
+    pd.add_argument("before")
+    pd.add_argument("after")
+    for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
+                              ("timeline","Show milestone attempts, timing and acceptance"),
+                              ("browser-coverage","Measure steps completed per gate and viewport"),
+                              ("evidence-manifest","Export portable evidence hashes and verification results"),
+                              ("ci-summary","Write a Markdown run summary for CI")):
+        p = commands.add_parser(name, help=description)
+        p.add_argument("id")
+        if name in ("ci-summary","evidence-manifest"):
+            p.add_argument("--output", type=Path, required=True)
     pre = commands.add_parser("preflight", help="Validate committed context, routes, identity and browser runtime")
     pre.add_argument("plan")
     for action in ("replay-browser", "replay-checks"):
@@ -205,6 +230,8 @@ def main(argv=None):
         inspect.add_argument("id")
         if action == "trace":
             inspect.add_argument("--output", type=Path, required=True)
+            inspect.add_argument("--after", type=int, default=0)
+            inspect.add_argument("--until", type=int)
     backup = commands.add_parser("db-backup", help="Snapshot the runtime database to a new file")
     backup.add_argument("output", type=Path)
     integrity = commands.add_parser("db-check", help="Verify the live runtime database or a backup")
@@ -241,7 +268,7 @@ def main(argv=None):
     bench_create = bench_sub.add_parser("create")
     bench_create.add_argument("suite")
     bench_sub.add_parser("preview", help="Resolve the complete matrix and budgets without registering runs").add_argument("suite")
-    for action in ("run", "report"):
+    for action in ("run", "report", "retry-blocked"):
         bench_parser = bench_sub.add_parser(action)
         bench_parser.add_argument("id")
         if action == "report":
@@ -259,13 +286,23 @@ def main(argv=None):
     compare = bench_sub.add_parser("compare", help="Compare matching trials from two saved suites")
     compare.add_argument("before")
     compare.add_argument("after")
+    verdict = bench_sub.add_parser("verdict", help="Check two suites for matched regressions with CI exit status")
+    verdict.add_argument("before")
+    verdict.add_argument("after")
+    verdict.add_argument("--minimum-pairs", type=int, default=1)
+    verdict.add_argument("--allow-regressions", type=int, default=0)
     junit = bench_sub.add_parser("junit", help="Export suite results for CI test dashboards")
     junit.add_argument("id")
     junit.add_argument("--output", type=Path, required=True)
-    commands.add_parser("list")
+    for action in ("list","fleet"):
+        p = commands.add_parser(action)
+        p.add_argument("--project")
+        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","done","blocked"))
     args = app.parse_args(argv)
     if args.command in ("add", "goal") and args.after and not args.enqueue:
         app.error("--after requires --enqueue")
+    if args.command in ("add", "goal") and args.wait and not args.start:
+        app.error("--wait requires --start")
     if args.command == "doctor":
         if args.live and not (args.plan or args.planner):
             app.error("--live requires --plan or --planner")
@@ -303,23 +340,42 @@ def main(argv=None):
             else:
                 repository, gitdir = checkout(args.repository.expanduser().resolve(strict=True))
                 output(store.bind_project(args.project_name, repository, gitdir, args.replace))
-        elif name == "list":
-            output([with_live_status(store, row) for row in store.runs()])
+        elif name in ("list","fleet"):
+            from .inspection import matching_runs, fleet
+            rows = matching_runs(store, args.project, args.phase)
+            output(fleet(store, rows) if name == "fleet" else [with_live_status(store, row) for row in rows])
         elif name == "configure":
             output(configure_deepseek_key(args.key_file))
-        elif name == "add":
-            output(register(store, read_plan(args.plan, store), args))
-        elif name == "goal":
-            output(plan_goal(store, args))
+        elif name in ("add","goal"):
+            result = register(store, read_plan(args.plan, store), args) if name == "add" else plan_goal(store, args)
+            output(result)
+            return {"blocked": 3, "paused": 2, "waiting": 4}.get(result.get("phase"), 0)
+        elif name == "wait":
+            from .inspection import wait_for_run
+            result, code = wait_for_run(store, args.id, args.timeout)
+            output(result)
+            return code
+        elif name == "plan-diff":
+            from .inspection import plan_diff
+            output(plan_diff(read_plan(args.before,store), read_plan(args.after,store)))
+        elif name in ("dependencies","timeline","browser-coverage","ci-summary","evidence-manifest"):
+            from .inspection import browser_coverage, ci_summary, evidence_manifest, milestone_timeline
+            from .operations import dependencies
+            if name in ("ci-summary","evidence-manifest"):
+                result = (ci_summary if name == "ci-summary" else evidence_manifest)(store,args.id,args.output)
+                output(result)
+                return 3 if name == "evidence-manifest" and result["status"] != "verified" else 0
+            output({"dependencies":dependencies, "timeline":milestone_timeline,
+                    "browser-coverage":browser_coverage}[name](store,args.id))
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":
             if args.follow:
                 from .operations import follow_events
-                for event in follow_events(store, args.id, args.after or 0, args.limit):
+                for event in follow_events(store, args.id, args.after or 0, args.limit, args.kind):
                     print(json.dumps(event, ensure_ascii=True), flush=True)
             else:
-                output(store.events(args.id, limit=None if args.all else args.limit, after=args.after))
+                output(store.events(args.id, limit=None if args.all else args.limit, after=args.after, kinds=args.kind))
         elif name == "attention":
             from .operations import attention
             output(attention(store))
@@ -332,7 +388,7 @@ def main(argv=None):
             elif name == "budget":
                 output(budget_report(store, args.id))
             else:
-                output(export_trace(store, args.id, args.output))
+                output(export_trace(store, args.id, args.output, args.after, args.until))
         elif name == "handoff":
             from .operations import handoff
             output(handoff(store, args.id))
@@ -370,9 +426,14 @@ def main(argv=None):
             elif args.benchmark_action == "csv":
                 from .benchmark_exports import export_csv
                 output(export_csv(store, args.id, args.output))
-            elif args.benchmark_action == "compare":
-                from .benchmark_exports import compare_suites
-                output(compare_suites(store, args.before, args.after))
+            elif args.benchmark_action in ("compare","verdict"):
+                from .benchmark_exports import compare_suites, regression_verdict
+                comparison = compare_suites(store, args.before, args.after)
+                if args.benchmark_action == "verdict":
+                    result = regression_verdict(comparison,args.minimum_pairs,args.allow_regressions)
+                    output(result)
+                    return {"pass":0,"regression":3,"inconclusive":4}[result["verdict"]]
+                output(comparison)
             elif args.benchmark_action == "junit":
                 from .benchmark_exports import export_junit
                 output(export_junit(store, args.id, args.output))
@@ -381,25 +442,31 @@ def main(argv=None):
                 from .benchmark import select_trials
                 for row in select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat):
                     try:
-                        phase = Run(store, row["run_id"]).run()
+                        retry = args.benchmark_action == "retry-blocked"
+                        phase = Run(store, row["run_id"]).run(retry=retry, only_operational=retry)
                         results.append({"run_id": row["run_id"], "phase": phase})
                     except BusyRun as error:
                         results.append({"run_id": row["run_id"], "waiting": str(error)})
                 output(results)
-                return 0 if all(row.get("phase") == "done" for row in results) else 3
+                return 0 if all(row.get("phase") in ("done","skipped") for row in results) else 3
         elif name == "dispatch":
             if args.tool_path:
                 os.environ["PATH"] = args.tool_path + os.pathsep + os.environ.get("PATH", "")
             output(dispatch(store, args.watch))
         elif name == "pause":
-            store.pause(args.id, True)
-            output({"run_id": args.id, "pause_requested": True})
+            changed = store.pause(args.id, True)
+            output({"run_id": args.id, "pause_requested": store.get(args.id)["pause"], "changed": changed})
         elif name == "run":
             phase = Run(store, args.id).run(retry=args.retry)
             output({"run_id": args.id, "phase": phase})
             return {"done": 0, "paused": 2, "blocked": 3, "waiting": 4}[phase]
         else:
             row = store.get(args.id)
+            phase = row["state"]["phase"]
+            if phase == "done" or (phase == "blocked" and not args.retry) or (name == "start" and row["pause"]):
+                stopped = "paused" if phase not in ("done","blocked") else phase
+                output({"run_id": args.id, "phase": stopped, "launched": False})
+                return {"done":0,"paused":2,"blocked":3}[stopped]
             waiting = pending_dependencies(store, row["state"])
             if waiting and name != "resume":
                 raise ValueError("Waiting for prerequisite runs: " + ", ".join(waiting))
@@ -407,6 +474,18 @@ def main(argv=None):
                 store.pause(args.id, False)
             if waiting:
                 output({"run_id": args.id, "waiting_for": waiting})
+                return 4 if args.wait else 0
+            elif runner_active(store.directory(args.id) / "runner.lock"):
+                if args.wait:
+                    from .inspection import wait_for_run
+                    result, code = wait_for_run(store, args.id)
+                    output(result)
+                    return code
+                output({"run_id": args.id, "runner_active": True, "launched": False})
+            elif args.wait:
+                phase = Run(store,args.id).run(retry=args.retry)
+                output({"run_id":args.id, "phase":phase})
+                return {"done":0,"paused":2,"blocked":3,"waiting":4}[phase]
             else:
                 output({"run_id": args.id, "runner_pid": background(store, args.id, args.retry)})
         return 0

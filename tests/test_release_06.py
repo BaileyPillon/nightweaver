@@ -24,7 +24,7 @@ class Measurements(unittest.TestCase):
         for i in range(8):
             for name, accepted in (("a", True), ("b", i == 6)):
                 outcome = "provider_blocked" if name == "b" and i == 7 else ("accepted" if accepted else "rejected")
-                rows.append(dict(task="one", repeat=i, baseline="sha", contender=name, accepted=accepted,
+                rows.append(dict(task="one", repeat=i, baseline="sha", contract_sha256="checks", contender=name, accepted=accepted,
                                  phase="done" if accepted else "blocked", outcome=outcome))
         pair, = paired_outcomes(rows)
         self.assertEqual((pair["discordant_pairs"], pair["scored_pairs"], pair["inconclusive_pairs"]), (6, 7, 1))

@@ -40,8 +40,8 @@ def observed_pass(receipt):
 
 def verify_saved_sample(receipt, evidence):
     """Validate the stored bytes before reusing an interrupted verification sample."""
-    files = [(receipt["log"], receipt["log_sha256"])]
-    files.extend((a["path"], a["sha256"]) for a in receipt["artifacts"])
+    files = [(receipt["log"], receipt["log_sha256"])] if receipt.get("log_sha256") else []
+    files.extend((a["path"], a["sha256"]) for a in receipt.get("artifacts", []))
     for name, expected in files:
         path = Path(name).resolve(strict=True)
         if not path.is_relative_to(evidence.resolve()) or not path.is_file():

@@ -82,12 +82,13 @@ class Store:
             return dict(row)
 
     def bind_project(self, name, repository, gitdir, replace=False):
+        repository, gitdir = Path(repository).resolve(), Path(gitdir).resolve()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
             raise ValueError("Project names must be 1 to 64 letters, numbers, dots, underscores or hyphens")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
-            if old and not replace and (Path(old["repository"]) != repository or Path(old["git_common_dir"]) != gitdir):
+            if old and not replace and (Path(old["repository"]).resolve() != repository or Path(old["git_common_dir"]).resolve() != gitdir):
                 raise ValueError(f"Project {name!r} is bound to {old['repository']}. Use --replace to change it.")
             db.execute("""INSERT INTO projects VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE
                           SET repository=excluded.repository, git_common_dir=excluded.git_common_dir""",
@@ -141,25 +142,40 @@ class Store:
 
     def pause(self, run_id, value):
         with self.connect() as db:
-            if not db.execute("UPDATE runs SET pause=? WHERE id=?", (int(value), run_id)).rowcount:
-                raise ValueError("Run was not found")
+            db.execute("BEGIN IMMEDIATE")
+            row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            if row["state"]["phase"] == "done" or row["pause"] == bool(value):
+                return False
+            db.execute("UPDATE runs SET pause=?,updated=? WHERE id=?", (int(value), timestamp(), run_id))
             self._event(db, run_id, "pause_requested" if value else "resume_requested", {})
+            return True
 
-    def events(self, run_id, limit=80, after=None):
+    def events(self, run_id, limit=80, after=None, *, kinds=(), until=None):
         self.directory(run_id)
         if limit is not None and (type(limit) is not int or not 1 <= limit <= 10000):
             raise ValueError("Event page size must be 1 to 10000")
         if after is not None and (type(after) is not int or after < 0):
             raise ValueError("Event cursor must be a nonnegative integer")
+        if until is not None and (type(until) is not int or until < (after or 0)):
+            raise ValueError("End cursor must be at or after the start cursor")
+        filters, values = ["run_id=?"], [run_id]
+        if kinds:
+            filters.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
+            values.extend(kinds)
+        if after is not None:
+            filters.append("seq>?")
+            values.append(after)
+        if until is not None:
+            filters.append("seq<=?")
+            values.append(until)
+        latest = after is None and limit is not None
         with self.connect() as db:
             if not db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
                 raise ValueError("Run was not found")
-            if after is not None or limit is None:
-                rows = db.execute("SELECT * FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?",
-                                  (run_id, after or 0, limit or -1)).fetchall()
-            else:
-                rows = list(reversed(db.execute("SELECT * FROM events WHERE run_id=? ORDER BY seq DESC LIMIT ?",
-                                               (run_id, limit)).fetchall()))
+            query = "SELECT * FROM events WHERE " + " AND ".join(filters) + " ORDER BY seq "
+            rows = db.execute(query + ("DESC" if latest else "ASC") + " LIMIT ?", [*values, limit or -1]).fetchall()
+            if latest:
+                rows.reverse()
         return [{"seq": row["seq"], "time": row["time"], "kind": row["kind"],
                  "details": json.loads(row["details"])} for row in rows]
 

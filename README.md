@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.9 rechecks evidence before accepting a milestone, adds blocking OneShot completion, and provides dependency graphs, browser coverage, and matched regression verdicts. [Ranked top 10 issues, improvements and features, with research and verification](docs/v0.9-research.md)
+
 Version 0.8.1 checks browser availability before an immediate OneShot calls its planner. A browser outage during verification preserves the candidate for retry. Passing browser receipts must cover every configured viewport and step. [Browser recovery and evidence requirements](docs/live-stability.md#browser-outages-and-incomplete-results)
 
 Version 0.8 brings stability checks into live OneShot runs. Set `stability_runs` on a repeatable gate to confirm an inconsistent result on the same candidate before spending another worker call. [Behavior, examples and restart recovery](docs/live-stability.md)

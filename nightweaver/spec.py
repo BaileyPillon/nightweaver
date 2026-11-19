@@ -141,7 +141,7 @@ def resolve_repository(raw, relative_to=None, store=None):
     repository = root.resolve(strict=True)
     if not repository.is_dir():
         raise ValueError("Repository must be a folder")
-    if project and repository != Path(project["repository"]):
+    if project and repository != Path(project["repository"]).resolve():
         raise ValueError(f"Project {project['name']!r} is bound to {project['repository']}, but the plan selects {repository}")
     return repository, project
 

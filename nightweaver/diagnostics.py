@@ -182,6 +182,19 @@ def _database_check(file):
                 count = db.execute(query).fetchone()[0]
                 if count:
                     problems.append(f"{label}: {count}")
+            if not problems:
+                semantic = {
+                    "invalid run state": """SELECT count(*) FROM runs WHERE json_type(state)!='object'
+                        OR json_type(spec)!='object' OR coalesce(json_type(state,'$.step'),'')!='integer'
+                        OR coalesce(json_extract(state,'$.phase'),'') NOT IN
+                        ('queued','ready','working','checking','reviewing','promoting','blocked','done')""",
+                    "missing prerequisite": """SELECT count(*) FROM runs r, json_each(r.state,'$.after') d
+                        WHERE NOT EXISTS (SELECT 1 FROM runs p WHERE p.id=d.value)""",
+                }
+                for label, query in semantic.items():
+                    count = db.execute(query).fetchone()[0]
+                    if count:
+                        problems.append(f"{label}: {count}")
         return {"file": str(file), "ok": not problems, "problems": problems}
 
 

@@ -20,10 +20,12 @@ def compare_suites(store, before_id, after_id):
         return {(row["task"], row["contender"], row["repeat"]): row for row in runs}
 
     before, after = indexed(before_id), indexed(after_id)
-    rows, deltas = [], []
+    rows, deltas, call_deltas, token_deltas = [], [], [], []
     for key in sorted(before.keys() | after.keys()):
         left, right = before.get(key), after.get(key)
-        delta = None
+        delta = calls = tokens = None
+        fields = ("baseline", "contract_sha256", "mode", "route_sha256")
+        changed = [k for k in fields if left.get(k) != right.get(k)] if left and right else []
         if not left or not right:
             status = "unmatched"
         elif not left.get("contract_sha256") or not right.get("contract_sha256"):
@@ -31,8 +33,7 @@ def compare_suites(store, before_id, after_id):
         elif any(not row.get(k) for row in (left, right) for k in ("baseline", "mode", "route_sha256")):
             status = "unknown_inputs"
         elif any(
-            left.get(field) != right.get(field)
-            for field in ("baseline", "contract_sha256", "mode", "route_sha256")
+            left.get(field) != right.get(field) for field in fields
         ):
             status = "changed_inputs"
         elif any(
@@ -41,6 +42,13 @@ def compare_suites(store, before_id, after_id):
             status = "inconclusive"
         elif left["accepted"] and right["accepted"]:
             status = "both_accepted"
+            if all(isinstance(r.get("provider_calls"), int) for r in (left, right)):
+                calls = right["provider_calls"] - left["provider_calls"]
+                call_deltas.append(calls)
+            if all(r.get("observed_tokens") is not None and r.get("usage_unknown_calls") == 0
+                   and r.get("usage_pending_calls") == 0 for r in (left, right)):
+                tokens = right["observed_tokens"] - left["observed_tokens"]
+                token_deltas.append(tokens)
             if left["elapsed_seconds"] is not None and right["elapsed_seconds"] is not None:
                 delta = round(right["elapsed_seconds"] - left["elapsed_seconds"], 3)
                 deltas.append(delta)
@@ -59,6 +67,7 @@ def compare_suites(store, before_id, after_id):
                 "before": left["run_id"] if left else None,
                 "after": right["run_id"] if right else None,
                 "elapsed_delta_seconds": delta,
+                "changed_fields": changed, "provider_call_delta": calls, "observed_token_delta": tokens,
             }
         )
     return {
@@ -67,12 +76,32 @@ def compare_suites(store, before_id, after_id):
         "counts": dict(Counter(r["status"] for r in rows)),
         "timed_pairs": len(deltas),
         "median_elapsed_delta_seconds": median(deltas) if deltas else None,
+        "call_pairs": len(call_deltas), "median_provider_call_delta": median(call_deltas) if call_deltas else None,
+        "token_pairs": len(token_deltas), "median_observed_token_delta": median(token_deltas) if token_deltas else None,
         "pairs": rows,
     }
 
 
 def xml_text(value):
     return re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "�", str(value))
+
+
+def regression_verdict(comparison, minimum, allowed):
+    if minimum < 1 or allowed < 0:
+        raise ValueError("Minimum matched pairs must be positive and allowed regressions nonnegative")
+    counts = comparison["counts"]
+    matched = sum(counts.get(k, 0) for k in ("regression", "improvement", "both_accepted", "neither_accepted"))
+    excluded = len(comparison["pairs"]) - matched
+    regressions = counts.get("regression", 0)
+    if regressions > allowed:
+        verdict = "regression"
+    elif matched < minimum or excluded:
+        verdict = "inconclusive"
+    else:
+        verdict = "pass"
+    return {"verdict": verdict, "matched": matched, "excluded": excluded, "regressions": regressions,
+            "allowed_regressions": allowed, "minimum_pairs": minimum, "counts": counts,
+            "before": comparison["before"], "after": comparison["after"]}
 
 
 def export_csv(store, suite_id, output):

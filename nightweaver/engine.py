@@ -59,7 +59,7 @@ def source_info(store, spec):
         raise ValueError("The Nightweaver data directory must be outside the source checkout")
     if "project" in spec:
         project = store.project(spec["project"])
-        if Path(project["repository"]) != root or Path(project["git_common_dir"]) != gitdir:
+        if Path(project["repository"]).resolve() != root or Path(project["git_common_dir"]).resolve() != gitdir:
             raise ValueError(f"The checkout no longer matches the binding for project {project['name']!r}")
     base = git(root, "rev-parse", "HEAD^{commit}")
     if str(spec.get("expected_base", base)).lower() != base:
@@ -91,6 +91,14 @@ def fork_run(store, run_id, milestone, worker=None):
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]
     spec = {**original["spec"], "expected_base": base, "milestones": remaining, "title": original["spec"]["title"] + " (fork)"}
+    repo = Path(spec["repository"])
+    gitdir = common_dir(repo)
+    if gitdir != Path(spec.get("git_common_dir", gitdir)):
+        raise ValueError("The source checkout no longer belongs to the fork's original repository")
+    if spec.get("project"):
+        bound = store.project(spec["project"])
+        if Path(bound["repository"]).resolve() != repo or Path(bound["git_common_dir"]).resolve() != gitdir:
+            raise ValueError("The project binding changed since this run was registered")
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
     pack = context.capture(spec, base)
@@ -327,8 +335,9 @@ class Run:
             self.reject("A check changed tracked evidence or implementation files after the snapshot was taken.", "snapshot")
             return
         write_json(evidence / "checks.json", outputs)
+        digest = hashlib.sha256((evidence / "checks.json").read_bytes()).hexdigest()
         self.set("checks_passed", {"tree": snapshot, "checks": outputs}, phase="reviewing",
-                 candidate_tree=snapshot, verification_batch=None)
+                 candidate_tree=snapshot, verification_batch=None, checks_sha256=digest)
 
     def verify_gate(self, path, state, step, index, check, snapshot, batch):
         count = check.get("stability_runs", 1)
@@ -371,9 +380,15 @@ class Run:
                     accepted[0] = {**accepted[0], "prior_mixed_round": receipts[:count]}
                 return accepted
             if not any(outcomes):
-                last = receipts[(round_index + 1) * count - 1]
-                diagnostic = (json.dumps(last["browser_failures"], ensure_ascii=False)
-                              if last.get("browser_failures") else failure_excerpt(last["log"]))
+                failed = receipts[round_index * count:(round_index + 1) * count]
+                last = failed[-1]
+                messages = []
+                for observation in failed:
+                    message = (json.dumps(observation["browser_failures"], ensure_ascii=False)
+                               if observation.get("browser_failures") else failure_excerpt(observation["log"]))
+                    if message not in messages:
+                        messages.append(message)
+                diagnostic = "\n".join(m[:3600 // len(messages)] for m in messages)
                 if count > 1:
                     diagnostic = f"All {count} samples in this round failed.\n{diagnostic}"
                 self.reject(f"{check['name']} exited {last['exit']}\n{diagnostic}", "check")
@@ -393,12 +408,16 @@ class Run:
                            max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
                            heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
         receipt.update(location)
+        if log.is_file() or observed_pass(receipt) is not None:
+            try:
+                with log.open("rb") as stream:
+                    receipt["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+            except OSError as error:
+                receipt.update(execution_error=True, artifact_error=f"Cannot preserve gate log: {error}")
         if "sample" in location and observed_pass(receipt) is not None:
             try:
                 if self.snapshot(path, state, step) != snapshot:
                     receipt["source_error"] = "The gate changed the candidate during stability verification."
-                with log.open("rb") as stream:
-                    receipt["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
             except ValueError as error:
                 receipt["source_error"] = str(error)
         self.set("gate_finished", receipt)
@@ -414,6 +433,27 @@ class Run:
             self.reject(f"{check['name']} exited {receipt['exit']} and could not collect its required evidence: "
                         f"{receipt.get('artifact_error')}\n{failure_excerpt(receipt['log'])}", "artifact")
 
+    def verified_checks(self, state):
+        evidence = self.evidence_dir(state)
+        try:
+            raw = (evidence / "checks.json").read_bytes()
+            if state.get("checks_sha256") and hashlib.sha256(raw).hexdigest() != state["checks_sha256"]:
+                raise ValueError("The accepted check manifest changed")
+            checks = json.loads(raw)
+            if not state.get("checks_sha256"):
+                saved = next((e["details"] for e in reversed(self.store.events(self.id, limit=None))
+                              if e["kind"] == "checks_passed"), {})
+                if saved.get("tree") != state["candidate_tree"] or saved.get("checks") != redact(checks):
+                    raise ValueError("The legacy check manifest does not match its recorded verification")
+            for receipt in checks:
+                for sample in [receipt, *receipt.get("prior_mixed_round", [])]:
+                    verify_saved_sample(sample, evidence)
+            return raw.decode("utf-8")
+        except (ValueError, OSError, KeyError) as error:
+            self.set("blocked", {"during": "checking", "issue": str(error)}, phase="blocked",
+                     blocked_from="checking", last_error=str(error), verification_batch=None)
+            return None
+
     def review(self, state, step, path):
         if state.get("feedback_version", 0) != state.get("worker_feedback_version", 0):
             self.reject("New operator feedback arrived. Apply the saved update before acceptance.", "feedback", worker_session=None)
@@ -423,7 +463,9 @@ class Run:
             self.set("snapshot_changed", {"previous": snapshot}, phase="checking")
             return
         evidence = self.evidence_dir(state)
-        checks = (evidence / "checks.json").read_text(encoding="utf-8")
+        checks = self.verified_checks(state)
+        if checks is None:
+            return
         diff = git(path, "diff", "--cached", "--stat", state["accepted"])
         decision = (f"Goal: {self.spec['objective']}\n{self.acceptance_brief()}"
                     f"Budget remaining before review: {budget_status(self.spec, state)['remaining']}\nTask: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}\n"
@@ -501,6 +543,8 @@ class Run:
         if current != candidate:
             if current != old and (current is not None or state["step"] != 0):
                 raise ValueError("The result branch moved outside this run. Existing commits were preserved.")
+            if self.verified_checks(state) is None:
+                return
             git(self.repository, "update-ref", self.ref, candidate, current or "0" * len(candidate))
         number = state["step"] + 1
         finished = number == len(self.spec["milestones"])
@@ -514,9 +558,15 @@ class Run:
                  worker_session=None, last_error="", log=None, retry_at=None, failure_count=0,
                  failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0)
 
-    def run(self, *, retry=False, defer_retries=False):
+    def run(self, *, retry=False, defer_retries=False, only_operational=False):
         with run_lock(self.root / "runner.lock"), ExitStack() as project_lock:
-            state = self.store.get(self.id)["state"]
+            row = self.store.get(self.id)
+            state = row["state"]
+            if only_operational:
+                from .reports import metrics
+                if (row["pause"] or state["phase"] != "blocked" or metrics(self.store, self.id)["outcome"]
+                        not in {"provider_blocked", "execution_blocked", "verification_inconsistent"}):
+                    return "skipped"
             if state["phase"] == "done" or (state["phase"] == "blocked" and not retry):
                 return state["phase"]
             pending = pending_dependencies(self.store, state)

@@ -129,6 +129,7 @@ def create_suite(store, source, *, preview=False):
                                               if all(row["max_calls"] is not None for row in rows) else None)}
     suite_id = uuid4().hex[:12]
     manifest = {"id": suite_id, "name": name, "seed": seed, "repetitions": repetitions, "runs": [],
+                "planned_trials": len(prepared),
                 "runtime": {"nightweaver": __version__, "python": platform.python_version(), "platform": platform.platform()},
                 "contenders": contenders}
     target = store.root / "benchmarks" / f"{suite_id}.json"
@@ -144,7 +145,11 @@ def create_suite(store, source, *, preview=False):
 
 def read_suite(store, suite_id):
     store.directory(suite_id)  # validate identifier without accepting arbitrary paths
-    return json.loads((store.root / "benchmarks" / f"{suite_id}.json").read_text(encoding="utf-8"))
+    suite = json.loads((store.root / "benchmarks" / f"{suite_id}.json").read_text(encoding="utf-8"))
+    registered = len(suite["runs"])
+    if registered != suite.get("planned_trials", registered):
+        raise ValueError(f"Incomplete benchmark registration: {registered}/{suite['planned_trials']} trials")
+    return suite
 
 
 def scored(row):
@@ -195,7 +200,8 @@ def summarize(runs):
         rows = [row for row in runs if row["contender"] == name]
         completed = [row for row in rows if row["phase"] in ("done", "blocked")]
         successes = sum(row["accepted"] for row in rows)
-        total_seconds = sum(row["elapsed_seconds"] or 0 for row in rows)
+        times = [row["elapsed_seconds"] for row in rows if row["elapsed_seconds"] is not None]
+        total_seconds = sum(times) if len(times) == len(rows) else None
         valid = [r for r in rows if scored(r)]
         by_task = {}
         for r in valid:
@@ -215,8 +221,9 @@ def summarize(runs):
                               row["observed_tokens"] is not None for row in rows) else None,
                           "usage_unknown_calls": sum(row["usage_unknown_calls"] for row in rows),
                           "usage_pending_calls": sum(row["usage_pending_calls"] for row in rows),
-                          "seconds_all_attempts": round(total_seconds, 3),
-                          "seconds_per_acceptance": round(total_seconds / successes, 3) if successes else None})
+                          "timed_trials": len(times), "known_elapsed_seconds": round(sum(times), 3) if times else None,
+                          "seconds_all_attempts": round(total_seconds, 3) if total_seconds is not None else None,
+                          "seconds_per_acceptance": round(total_seconds / successes, 3) if successes and total_seconds is not None else None})
     return summaries
 
 
@@ -232,7 +239,8 @@ def paired_outcomes(runs):
             a, b = sides[0].get(key), sides[1].get(key)
             if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
                 counts["unfinished_pairs"] += 1
-            elif any(row.get("outcome") in INCONCLUSIVE for row in (a, b)):
+            elif (not a.get("contract_sha256") or a["contract_sha256"] != b.get("contract_sha256")
+                  or any(row.get("outcome") in INCONCLUSIVE for row in (a, b))):
                 counts["inconclusive_pairs"] += 1
             else:
                 label = ("both_accepted" if b["accepted"] else "left_only_accepted") if a["accepted"] else (

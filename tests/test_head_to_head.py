@@ -49,7 +49,7 @@ class PairMeasurements(unittest.TestCase):
                 ("accepted", "unfinished")]):
             for name, outcome, seconds in (("A", left, 20), ("B", right, 80)):
                 phase = {"accepted": "done", "unfinished": "working"}.get(outcome, "blocked")
-                rows.append(dict(contender=name, task="fixture", baseline="sha", repeat=repeat,
+                rows.append(dict(contender=name, task="fixture", baseline="sha", contract_sha256="checks", repeat=repeat,
                                  phase=phase, outcome=outcome, accepted=outcome == "accepted", elapsed_seconds=seconds))
         pair, = paired_outcomes(rows)
         self.assertEqual(pair["scored_pairs"], 2)

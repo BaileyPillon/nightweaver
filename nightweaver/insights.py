@@ -87,6 +87,8 @@ def gate_stats(events):
             groups[(detail["name"], detail.get("contract_sha256"))].append(detail)
     results = []
     for (name, digest), receipts in groups.items():
+        outcomes = [observed_pass(r) for r in receipts]
+        passes, failed = outcomes.count(True), outcomes.count(False)
         durations = sorted(
             item["duration_ms"] for item in receipts if isinstance(item.get("duration_ms"), int)
         )
@@ -97,6 +99,8 @@ def gate_stats(events):
                 "executions": len(receipts),
                 "failures": sum(observed_pass(r) is not True for r in receipts),
                 "unscored": sum(observed_pass(r) is None for r in receipts),
+                "passed": passes, "functional_failures": failed, "scored": passes + failed,
+                "scored_pass_rate": passes / (passes + failed) if passes + failed else None,
                 "timed": len(durations),
                 "median_ms": median(durations) if durations else None,
                 "p95_ms": durations[ceil(0.95 * len(durations)) - 1] if durations else None,
@@ -141,7 +145,7 @@ def diagnosis(store, run_id):
     )
 
 
-def export_trace(store, run_id, output):
+def export_trace(store, run_id, output, after=0, until=None):
     row = store.get(run_id)
     keep = {
         "step",
@@ -166,13 +170,15 @@ def export_trace(store, run_id, output):
     }
     header = {"schema": "nightweaver.trace.v1", "run_id": run_id, "base": row["state"]["base"]}
     records = [header]
-    for e in store.events(run_id, limit=None):
+    cursor = after
+    for e in store.events(run_id, limit=None, after=after, until=until):
+        cursor = e["seq"]
         data = {
             k: v for k, v in e["details"].items() if k in keep and isinstance(v, (str, int, float, bool))
         }
         records.append({"seq": e["seq"], "time": e["time"], "kind": e["kind"], "data": redact(data)})
     atomic_write(output, "".join(json.dumps(r, ensure_ascii=True) + "\n" for r in records))
-    return {"run_id": run_id, "events": len(records) - 1, "path": str(Path(output).resolve())}
+    return {"run_id": run_id, "events": len(records) - 1, "last_seq": cursor, "path": str(Path(output).resolve())}
 
 
 def provider_totals(events):
