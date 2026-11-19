@@ -18,7 +18,8 @@ from .spec import strict_json
 def verify_tools(gates):
     for gate in gates:
         argv = gate["argv"]
-        executable = argv[4] if gate["name"].startswith(".NET ") else argv[0]
+        wrapped = gate["name"].startswith(".NET ") or gate["name"] == "npm test"
+        executable = argv[4] if wrapped else argv[0]
         if not shutil.which(executable):
             raise ValueError(
                 f"{gate['name']} needs {executable} available before starting this OneShot"
@@ -87,16 +88,27 @@ def needs_pytest(source, filename):
     )
 
 
+def node_installation():
+    return Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "nodejs"
+
+
+def node_command():
+    native = node_installation() / "node.exe"
+    return shutil.which("node") or (str(native) if native.is_file() else "node")
+
+
 def npm_command():
     npm = shutil.which("npm")
-    if not npm:
-        return None
-    npm_cli = Path(npm).parent / "node_modules/npm/bin/npm-cli.js"
-    node = shutil.which("node")
-    if npm_cli.is_file() and node:
-        return [node, str(npm_cli), "test"]
-    if Path(npm).suffix.lower() == ".exe":
+    if npm and Path(npm).suffix.lower() == ".exe":
         return [npm, "test"]
+    folders = [Path(npm).parent] if npm else []
+    folders.append(node_installation())
+    for folder in folders:
+        npm_cli = folder / "node_modules/npm/bin/npm-cli.js"
+        sibling = folder / "node.exe"
+        node = str(sibling) if sibling.is_file() else shutil.which("node")
+        if npm_cli.is_file() and node:
+            return [node, str(npm_cli), "test"]
     return None
 
 
@@ -215,7 +227,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
                 {
                     "name": "Node tests",
                     "argv": [
-                        "node",
+                        node_command(),
                         "--test",
                         "--test-reporter=junit",
                         "--test-reporter-destination={junit}",
@@ -238,8 +250,22 @@ def discover(repository, objective, worker, rescue=None, python=None):
                 raise ValueError(
                     "The committed npm test script needs a native Node/npm installation. Use an explicit plan for another package manager."
                 )
-            gates.append({"name": "npm test", "argv": argv})
+            gates.append(
+                {
+                    "name": "npm test",
+                    "argv": [sys.executable, "-B", runner, "npm", *argv],
+                }
+            )
             protected.update(js_files)
+            script = re.fullmatch(
+                r"""node\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))""", declared.strip()
+            )
+            if script:
+                entry = PurePosixPath(
+                    next(value for value in script.groups() if value).replace("\\", "/")
+                ).as_posix()
+                if entry in blobs:
+                    protected.add(entry)
             protected.update({"package.json", "package-lock.json"} & blobs.keys())
     projects = []
     all_projects = sorted(p for p in blobs if p.endswith(".csproj"))

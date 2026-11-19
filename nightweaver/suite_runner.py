@@ -1,5 +1,6 @@
 """Native suite adapters used by repository OneShots. Invoked as a standalone script."""
 
+import os
 import subprocess
 import sys
 import unittest
@@ -66,4 +67,9 @@ if __name__ == "__main__":
         sys.exit(unittest_suite(sys.argv[2]))
     if sys.argv[1] == "dotnet":
         sys.exit(dotnet_suite(*sys.argv[2:]))
+    if sys.argv[1] == "npm":
+        argv = sys.argv[2:]
+        env = os.environ.copy()
+        env["PATH"] = str(Path(argv[0]).parent) + os.pathsep + env.get("PATH", "")
+        sys.exit(subprocess.run(argv, env=env, check=False).returncode)
     sys.exit("Unknown suite adapter")

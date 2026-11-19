@@ -20,6 +20,23 @@ from nightweaver.reports import metrics
 
 
 class AdapterTests(unittest.TestCase):
+    def test_standard_node_install_when_desktop_path_has_no_npm(self):
+        with TemporaryDirectory() as directory:
+            install = Path(directory) / "nodejs"
+            npm = install / "node_modules/npm/bin/npm-cli.js"
+            npm.parent.mkdir(parents=True)
+            npm.touch()
+            (install / "node.exe").touch()
+            with (
+                patch.dict(os.environ, {"ProgramFiles": directory}),
+                patch("nightweaver.discovery.shutil.which", return_value=None),
+            ):
+                self.assertEqual(discovery.node_command(), str(install / "node.exe"))
+                self.assertEqual(
+                    discovery.npm_command(),
+                    [str(install / "node.exe"), str(npm), "test"],
+                )
+
     def test_provider_boundary(self):
         for data in (
             '{"verdict":"REVISE","verdict":"PASS"}',
@@ -99,6 +116,26 @@ class OneShotTests(unittest.TestCase):
     setUp = fixtures.WindowsRunTest.setUp
     cli = operator.OperatorRelease.cli
     configured = fixtures.WindowsRunTest.configured
+
+    def test_declared_npm_check_protects_its_script(self):
+        self.commit(
+            {
+                "package.json": json.dumps(
+                    {"scripts": {"test": 'node "./verify gallery.cjs"'}}
+                ),
+                "verify gallery.cjs": "process.exitCode = 0",
+            }
+        )
+        with patch(
+            "nightweaver.discovery.npm_command",
+            return_value=["node.exe", "npm-cli.js", "test"],
+        ):
+            raw = self.cli("oneshot", self.repo, "Verify", "--preview")
+        self.assertEqual(raw["gates"][0]["name"], "npm test")
+        self.assertEqual(
+            raw["gates"][0]["argv"][-4:], ["npm", "node.exe", "npm-cli.js", "test"]
+        )
+        self.assertIn("verify gallery.cjs", raw["protected_paths"])
 
     def commit(self, files):
         for name, data in files.items():
