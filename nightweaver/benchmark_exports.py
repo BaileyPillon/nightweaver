@@ -16,10 +16,10 @@ def compare_suites(store, before_id, after_id):
         raise ValueError("Select two different benchmarks")
 
     def indexed(suite_id):
-        runs = suite_report(store, suite_id)["runs"]
-        return {(row["task"], row["contender"], row["repeat"]): row for row in runs}
+        report = suite_report(store, suite_id)
+        return {(row["task"], row["contender"], row["repeat"]): row for row in report["runs"]}, report.get("runtime", {})
 
-    before, after = indexed(before_id), indexed(after_id)
+    (before, old_runtime), (after, new_runtime) = indexed(before_id), indexed(after_id)
     rows, deltas, call_deltas, token_deltas = [], [], [], []
     for key in sorted(before.keys() | after.keys()):
         left, right = before.get(key), after.get(key)
@@ -73,6 +73,10 @@ def compare_suites(store, before_id, after_id):
     return {
         "before": before_id,
         "after": after_id,
+        "runtime_changes": {k: {"before": old_runtime.get(k), "after": new_runtime.get(k)}
+                            for k in sorted(old_runtime.keys() | new_runtime.keys())
+                            if old_runtime.get(k) != new_runtime.get(k)},
+        "runtime_recorded_both": bool(old_runtime and new_runtime),
         "counts": dict(Counter(r["status"] for r in rows)),
         "timed_pairs": len(deltas),
         "median_elapsed_delta_seconds": median(deltas) if deltas else None,
@@ -86,28 +90,32 @@ def xml_text(value):
     return re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "�", str(value))
 
 
-def regression_verdict(comparison, minimum, allowed):
-    if minimum < 1 or allowed < 0:
-        raise ValueError("Minimum matched pairs must be positive and allowed regressions nonnegative")
+def regression_verdict(comparison, minimum, allowed, minimum_tasks=1):
+    if minimum < 1 or minimum_tasks < 1 or allowed < 0:
+        raise ValueError("Minimum matched pairs and tasks must be positive and allowed regressions nonnegative")
     counts = comparison["counts"]
     matched = sum(counts.get(k, 0) for k in ("regression", "improvement", "both_accepted", "neither_accepted"))
     excluded = len(comparison["pairs"]) - matched
     regressions = counts.get("regression", 0)
+    scored_statuses = {"regression", "improvement", "both_accepted", "neither_accepted"}
+    tasks = {row["task"] for row in comparison["pairs"] if row["status"] in scored_statuses}
     if regressions > allowed:
         verdict = "regression"
-    elif matched < minimum or excluded:
+    elif matched < minimum or len(tasks) < minimum_tasks or excluded:
         verdict = "inconclusive"
     else:
         verdict = "pass"
     return {"verdict": verdict, "matched": matched, "excluded": excluded, "regressions": regressions,
             "allowed_regressions": allowed, "minimum_pairs": minimum, "counts": counts,
+            "matched_tasks": len(tasks), "minimum_tasks": minimum_tasks,
             "before": comparison["before"], "after": comparison["after"]}
 
 
 def export_csv(store, suite_id, output):
     report = suite_report(store, suite_id)
     keys = ("run_id", "task", "contender", "repeat", "baseline", "contract_sha256", "route_sha256", "mode",
-            "phase", "outcome", "accepted", "provider_calls", "observed_tokens", "usage_unknown_calls", "elapsed_seconds")
+            "phase", "outcome", "accepted", "provider_calls", "observed_tokens", "usage_unknown_calls", "elapsed_seconds",
+            "usage_pending_calls", "interventions", "worker_attempts", "queue_seconds", "seconds_to_first_acceptance")
     stream = StringIO(newline="")
     writer = csv.writer(stream)
     writer.writerow(keys)

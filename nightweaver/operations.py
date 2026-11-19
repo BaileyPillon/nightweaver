@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .engine import common_dir, git, pending_dependencies
+from .engine import common_dir, git, pending_dependencies, verify_registered_repository
 from .process import runner_active
 from .safety import redact
 
@@ -161,9 +161,7 @@ def changes(store, run_id, milestone=None, include_patch=False):
         base = entries[milestone - 2]["commit"] if milestone > 1 else base
         tip = entries[milestone - 1]["commit"]
     repo = Path(spec["repository"])
-    gitdir = common_dir(repo)
-    if gitdir != Path(spec.get("git_common_dir", gitdir)):
-        raise ValueError("The registered checkout now belongs to another repository")
+    verify_registered_repository(spec, common_dir(repo))
     args = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames"]
     names = git(repo, *args, "--name-only", "-z", base, tip, "--")
     out = {

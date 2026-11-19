@@ -53,14 +53,31 @@ def checkout(path):
     return root, common_dir(root)
 
 
+def verify_project_binding(store, spec, root, gitdir):
+    if spec.get("project"):
+        bound = store.project(spec["project"])
+        if Path(bound["repository"]).resolve() != root.resolve() or Path(bound["git_common_dir"]).resolve() != gitdir:
+            raise ValueError(f"The project binding changed. The checkout no longer matches {bound['name']!r}")
+
+
+def directory_identity(path):
+    info = Path(path).stat()
+    return f"{info.st_dev:x}:{info.st_ino:x}" if info.st_ino else None
+
+
+def verify_registered_repository(spec, gitdir):
+    if Path(spec.get("git_common_dir", gitdir)) != gitdir:
+        raise ValueError("The source checkout now points to a different Git repository")
+    expected = spec.get("git_directory_identity")
+    if expected and directory_identity(gitdir) != expected:
+        raise ValueError("The registered Git directory was replaced at its pinned location")
+
+
 def source_info(store, spec):
     root, gitdir = checkout(Path(spec["repository"]))
     if store.root.is_relative_to(root) or store.root.is_relative_to(gitdir):
         raise ValueError("The Nightweaver data directory must be outside the source checkout")
-    if "project" in spec:
-        project = store.project(spec["project"])
-        if Path(project["repository"]).resolve() != root or Path(project["git_common_dir"]).resolve() != gitdir:
-            raise ValueError(f"The checkout no longer matches the binding for project {project['name']!r}")
+    verify_project_binding(store, spec, root, gitdir)
     base = git(root, "rev-parse", "HEAD^{commit}")
     if str(spec.get("expected_base", base)).lower() != base:
         raise ValueError(f"The chosen checkout is at {base}, expected {spec['expected_base']}")
@@ -75,7 +92,8 @@ def create_run(store, spec, *, enqueue=False, after=()):
         store.directory(dependency)
         store.get(dependency)
     pack = context.capture(spec, source["base"])
-    run_id = store.create({**spec, "git_common_dir": source["git_common_dir"]}, source["base"],
+    run_id = store.create({**spec, "git_common_dir": source["git_common_dir"],
+                           "git_directory_identity": directory_identity(source["git_common_dir"])}, source["base"],
                           enqueue=enqueue, after=dict.fromkeys(after))
     context.save(store, run_id, pack)
     return run_id
@@ -93,12 +111,9 @@ def fork_run(store, run_id, milestone, worker=None):
     spec = {**original["spec"], "expected_base": base, "milestones": remaining, "title": original["spec"]["title"] + " (fork)"}
     repo = Path(spec["repository"])
     gitdir = common_dir(repo)
-    if gitdir != Path(spec.get("git_common_dir", gitdir)):
-        raise ValueError("The source checkout no longer belongs to the fork's original repository")
-    if spec.get("project"):
-        bound = store.project(spec["project"])
-        if Path(bound["repository"]).resolve() != repo or Path(bound["git_common_dir"]).resolve() != gitdir:
-            raise ValueError("The project binding changed since this run was registered")
+    verify_registered_repository(spec, gitdir)
+    spec["git_directory_identity"] = directory_identity(gitdir)
+    verify_project_binding(store, spec, repo, gitdir)
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
     pack = context.capture(spec, base)
@@ -204,7 +219,7 @@ class Run:
         receipt = usage(Path(pending["log"]), pending["provider"])
         state = self.store.get(self.id)["state"]
         self.set("provider_call_finished", {**pending, **receipt, "recovered": recovered,
-                 "seconds": max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds())},
+                 "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds())},
                  pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
                  usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None))
 
@@ -212,7 +227,8 @@ class Run:
         self.check_budget(call=True)
         state = self.store.get(self.id)["state"]
         pending = {"call": state.get("provider_calls", 0) + 1, "role": role, "provider": config["kind"],
-                   "model": config.get("model"), "started": timestamp(), "log": str(log)}
+                   "model": config.get("model"), "started": timestamp(), "log": str(log),
+                   "step": state["step"] + 1, "attempt": state["attempt"]}
         self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
         limits = self.spec.get("budgets", {})
         health = {"max_log_bytes": limits.get("max_log_bytes", 16 * 1024 * 1024),
@@ -276,6 +292,7 @@ class Run:
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
             f"Work in this supplied Git worktree. Keep edits within {paths}. "
+            f"Protected paths: {', '.join(self.spec.get('protected_paths', [])) or 'none declared'}. "
             "Preserve unrelated behavior. Do not commit, push, merge, edit verification rules "
             "to hide failures, or touch another worktree. Return a concise summary and stop. "
             "The controller independently runs these exact checks and decides whether to advance.\n"
@@ -414,10 +431,10 @@ class Run:
                     receipt["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
             except OSError as error:
                 receipt.update(execution_error=True, artifact_error=f"Cannot preserve gate log: {error}")
-        if "sample" in location and observed_pass(receipt) is not None:
+        if observed_pass(receipt) is not None:
             try:
                 if self.snapshot(path, state, step) != snapshot:
-                    receipt["source_error"] = "The gate changed the candidate during stability verification."
+                    receipt["source_error"] = "The gate changed tracked candidate files during verification."
             except ValueError as error:
                 receipt["source_error"] = str(error)
         self.set("gate_finished", receipt)
@@ -499,6 +516,7 @@ class Run:
             current = self.store.get(self.id)["state"]
             pending = {"call": current.get("provider_calls", 0) + 1, "role": "advisory", "provider": "ollama",
                        "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
+                       "step": state["step"] + 1, "attempt": state["attempt"],
                        "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
             self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
             try:
@@ -536,6 +554,7 @@ class Run:
             return
         candidate = state["candidate"]
         old = state["accepted"]
+        verify_registered_repository(self.spec, common_dir(self.repository))
         try:
             current = git(self.repository, "rev-parse", "--verify", self.ref)
         except ValueError:
@@ -599,8 +618,7 @@ class Run:
                         continue
                     if self.gitdir is None:
                         gitdir = common_dir(self.repository)
-                        if Path(self.spec.get("git_common_dir", gitdir)) != gitdir:
-                            raise ValueError("The source checkout now points to a different Git repository")
+                        verify_registered_repository(self.spec, gitdir)
                         project_lock.enter_context(run_lock(gitdir / "nightweaver.lock",
                                                             "Another Nightweaver run owns this Git repository"))
                         self.gitdir = gitdir

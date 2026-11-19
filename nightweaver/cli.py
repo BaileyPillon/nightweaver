@@ -206,6 +206,8 @@ def main(argv=None):
     pd.add_argument("after")
     for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
                               ("timeline","Show milestone attempts, timing and acceptance"),
+                              ("call-ledger","Inspect individual provider calls, usage and interruptions"),
+                              ("browser-hotspots","Locate failing or slow actions per browser viewport"),
                               ("browser-coverage","Measure steps completed per gate and viewport"),
                               ("evidence-manifest","Export portable evidence hashes and verification results"),
                               ("ci-summary","Write a Markdown run summary for CI")):
@@ -268,7 +270,7 @@ def main(argv=None):
     bench_create = bench_sub.add_parser("create")
     bench_create.add_argument("suite")
     bench_sub.add_parser("preview", help="Resolve the complete matrix and budgets without registering runs").add_argument("suite")
-    for action in ("run", "report", "retry-blocked"):
+    for action in ("run", "report", "retry-blocked", "shard"):
         bench_parser = bench_sub.add_parser(action)
         bench_parser.add_argument("id")
         if action == "report":
@@ -277,6 +279,16 @@ def main(argv=None):
             bench_parser.add_argument("--task")
             bench_parser.add_argument("--contender")
             bench_parser.add_argument("--repeat", type=int)
+            bench_parser.add_argument("--shard", required=action == "shard", metavar="INDEX/TOTAL")
+    for action, help_text in (("sensitivity", "Measure how omitting one task changes a paired acceptance gap"),
+                              ("frontier", "Compare accepted tasks against observed provider calls"),
+                              ("failures", "Group unsuccessful trials by outcome and rejection stage"),
+                              ("calibrate", "Test the grader against matched positive and negative controls")):
+        analysis = bench_sub.add_parser(action, help=help_text)
+        analysis.add_argument("id")
+        if action == "calibrate":
+            analysis.add_argument("--positive", required=True)
+            analysis.add_argument("--negative", required=True)
     reliability_cmd = bench_sub.add_parser("reliability", help="Estimate any-pass and all-pass rates over k trials")
     reliability_cmd.add_argument("id")
     reliability_cmd.add_argument("--k", type=int, default=2)
@@ -290,6 +302,7 @@ def main(argv=None):
     verdict.add_argument("before")
     verdict.add_argument("after")
     verdict.add_argument("--minimum-pairs", type=int, default=1)
+    verdict.add_argument("--minimum-tasks", type=int, default=1)
     verdict.add_argument("--allow-regressions", type=int, default=0)
     junit = bench_sub.add_parser("junit", help="Export suite results for CI test dashboards")
     junit.add_argument("id")
@@ -367,6 +380,9 @@ def main(argv=None):
                 return 3 if name == "evidence-manifest" and result["status"] != "verified" else 0
             output({"dependencies":dependencies, "timeline":milestone_timeline,
                     "browser-coverage":browser_coverage}[name](store,args.id))
+        elif name in ("call-ledger", "browser-hotspots"):
+            from .trajectory import call_ledger, browser_hotspots
+            output((call_ledger if name == "call-ledger" else browser_hotspots)(store, args.id))
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":
@@ -423,6 +439,18 @@ def main(argv=None):
             elif args.benchmark_action == "reliability":
                 from .benchmark import reliability
                 output(reliability(suite_report(store, args.id)["runs"], args.k))
+            elif args.benchmark_action in ("calibrate", "frontier", "sensitivity", "failures"):
+                from .evaluation import calibration, call_frontier, task_sensitivity, failure_groups
+                report = suite_report(store, args.id)
+                if args.benchmark_action == "calibrate":
+                    result = calibration(report["runs"], args.positive, args.negative)
+                    output(result)
+                    return {"pass": 0, "failed": 3, "inconclusive": 4}[result["verdict"]]
+                if args.benchmark_action == "sensitivity":
+                    output(task_sensitivity(report))
+                else:
+                    analyze = call_frontier if args.benchmark_action == "frontier" else failure_groups
+                    output(analyze(report["runs"]))
             elif args.benchmark_action == "csv":
                 from .benchmark_exports import export_csv
                 output(export_csv(store, args.id, args.output))
@@ -430,7 +458,7 @@ def main(argv=None):
                 from .benchmark_exports import compare_suites, regression_verdict
                 comparison = compare_suites(store, args.before, args.after)
                 if args.benchmark_action == "verdict":
-                    result = regression_verdict(comparison,args.minimum_pairs,args.allow_regressions)
+                    result = regression_verdict(comparison,args.minimum_pairs,args.allow_regressions,args.minimum_tasks)
                     output(result)
                     return {"pass":0,"regression":3,"inconclusive":4}[result["verdict"]]
                 output(comparison)
@@ -440,7 +468,13 @@ def main(argv=None):
             else:
                 results = []
                 from .benchmark import select_trials
-                for row in select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat):
+                from .evaluation import shard_trials
+                rows = select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat)
+                rows = shard_trials(rows, args.shard)
+                if args.benchmark_action == "shard":
+                    output({"shard": args.shard, "trials": len(rows), "runs": rows})
+                    return 0
+                for row in rows:
                     try:
                         retry = args.benchmark_action == "retry-blocked"
                         phase = Run(store, row["run_id"]).run(retry=retry, only_operational=retry)

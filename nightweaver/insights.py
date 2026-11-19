@@ -76,7 +76,12 @@ def budget_report(store, run_id):
             stop = datetime.fromisoformat(row["state"]["started_at"]) + timedelta(
                 seconds=measured["elapsed_seconds"]
             )
-    return {"run_id": run_id, **budget_status(row["spec"], row["state"], stop)}
+    result = budget_status(row["spec"], row["state"], stop)
+    if row["state"]["phase"] in ("done", "blocked") and stop is None:
+        result["used"]["max_seconds"] = None
+        if "max_seconds" in result["remaining"]:
+            result["remaining"]["max_seconds"] = None
+    return {"run_id": run_id, **result}
 
 
 def gate_stats(events):
@@ -102,10 +107,15 @@ def gate_stats(events):
                 "passed": passes, "functional_failures": failed, "scored": passes + failed,
                 "scored_pass_rate": passes / (passes + failed) if passes + failed else None,
                 "timed": len(durations),
+                "total_measured_ms": sum(durations) if durations else None,
                 "median_ms": median(durations) if durations else None,
                 "p95_ms": durations[ceil(0.95 * len(durations)) - 1] if durations else None,
             }
         )
+    total = sum(r["total_measured_ms"] or 0 for r in results)
+    for row in results:
+        ms = row["total_measured_ms"]
+        row["measured_time_share"] = ms / total if ms is not None and total else None
     return sorted(results, key=lambda r: (-r["failures"], r["gate"]))
 
 

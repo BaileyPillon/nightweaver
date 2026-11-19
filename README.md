@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.10 checks that every verifier observed the same candidate, tests graders against known-good and known-bad controls, and checks saved browser state across reloads. Compare contenders by distinct tasks and observed calls, or trace a slow run down to the provider call and browser step. [Thirty ranked changes, research sources and verification](docs/v0.10-research.md)
+
 Version 0.9 rechecks evidence before accepting a milestone, adds blocking OneShot completion, and provides dependency graphs, browser coverage, and matched regression verdicts. [Ranked top 10 issues, improvements and features, with research and verification](docs/v0.9-research.md)
 
 Version 0.8.1 checks browser availability before an immediate OneShot calls its planner. A browser outage during verification preserves the candidate for retry. Passing browser receipts must cover every configured viewport and step. [Browser recovery and evidence requirements](docs/live-stability.md#browser-outages-and-incomplete-results)

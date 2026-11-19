@@ -123,7 +123,14 @@ def create_suite(store, source, *, preview=False):
         rows = [{**{k: v for k, v in row.items() if k != "plan"}, "baseline": row["plan"]["expected_base"],
                  "max_seconds": row["plan"]["budgets"]["max_seconds"],
                  "max_calls": row["plan"]["budgets"].get("max_calls")} for row in prepared]
-        return {"name": name, "seed": seed, "trials": len(rows), "runs": rows,
+        budgets = []
+        for label in sorted(contender_names):
+            trials = [r for r in rows if r["contender"] == label]
+            caps = [r["max_calls"] for r in trials if r["max_calls"] is not None]
+            budgets.append({"contender": label, "trials": len(trials), "capped_call_trials": len(caps),
+                            "max_calls": sum(caps) if len(caps) == len(trials) else None,
+                            "max_seconds": sum(r["max_seconds"] for r in trials)})
+        return {"name": name, "seed": seed, "trials": len(rows), "runs": rows, "contender_budgets": budgets,
                 "configured_seconds_total": sum(row["max_seconds"] for row in rows),
                 "configured_call_cap_total": (sum(row["max_calls"] for row in rows)
                                               if all(row["max_calls"] is not None for row in rows) else None)}
@@ -149,6 +156,13 @@ def read_suite(store, suite_id):
     registered = len(suite["runs"])
     if registered != suite.get("planned_trials", registered):
         raise ValueError(f"Incomplete benchmark registration: {registered}/{suite['planned_trials']} trials")
+    coordinates, ids = set(), set()
+    for row in suite["runs"]:
+        key = (row["task"], row["contender"], row["repeat"])
+        if key in coordinates or row["run_id"] in ids:
+            raise ValueError("Duplicate trial coordinate or run ID in benchmark manifest")
+        coordinates.add(key)
+        ids.add(row["run_id"])
     return suite
 
 
@@ -172,14 +186,14 @@ def reliability(runs, k):
         raise ValueError("k must be between 1 and 20")
     groups = {}
     for row in runs:
-        key = row["contender"], row["task"], row["baseline"], row.get("contract_sha256"), row.get("route_sha256")
+        key = row["contender"], row["task"], row.get("baseline"), row.get("contract_sha256"), row.get("route_sha256"), row.get("mode")
         groups.setdefault(key, []).append(row)
     results = []
-    for (name, task, base, contract, route), rows in groups.items():
+    for (name, task, base, contract, route, mode), rows in groups.items():
         valid = [r for r in rows if scored(r)]
         n, c = len(valid), sum(r["accepted"] for r in valid)
-        den = comb(n, k) if n >= k and contract and route else 0
-        results.append({"contender":name, "task":task, "base":base, "contract_sha256":contract, "route_sha256":route,
+        den = comb(n, k) if n >= k and base and contract and route and mode else 0
+        results.append({"contender":name, "task":task, "base":base, "contract_sha256":contract, "route_sha256":route, "mode":mode,
                         "scored":n, "accepted":c, "excluded":len(rows)-n, "k":k,
                         "pass_at_k":1 - comb(n-c,k)/den if den else None, "pass_all_k":comb(c,k)/den if den else None})
     return results
@@ -201,7 +215,7 @@ def summarize(runs):
         completed = [row for row in rows if row["phase"] in ("done", "blocked")]
         successes = sum(row["accepted"] for row in rows)
         times = [row["elapsed_seconds"] for row in rows if row["elapsed_seconds"] is not None]
-        total_seconds = sum(times) if len(times) == len(rows) else None
+        total_seconds = sum(times) if len(times) == len(completed) == len(rows) else None
         valid = [r for r in rows if scored(r)]
         by_task = {}
         for r in valid:
@@ -230,7 +244,7 @@ def summarize(runs):
 def paired_outcomes(runs):
     pairs = []
     for left, right in combinations(sorted({row["contender"] for row in runs}), 2):
-        sides = [{(row["task"], row["repeat"], row["baseline"]): row for row in runs if row["contender"] == name}
+        sides = [{(row["task"], row["repeat"], row.get("baseline")): row for row in runs if row["contender"] == name}
                  for name in (left, right)]
         counts = dict(both_accepted=0, left_only_accepted=0, right_only_accepted=0, neither_accepted=0,
                       unfinished_pairs=0, inconclusive_pairs=0)
@@ -239,7 +253,7 @@ def paired_outcomes(runs):
             a, b = sides[0].get(key), sides[1].get(key)
             if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
                 counts["unfinished_pairs"] += 1
-            elif (not a.get("contract_sha256") or a["contract_sha256"] != b.get("contract_sha256")
+            elif (not a.get("baseline") or not a.get("contract_sha256") or a["contract_sha256"] != b.get("contract_sha256")
                   or any(row.get("outcome") in INCONCLUSIVE for row in (a, b))):
                 counts["inconclusive_pairs"] += 1
             else:
@@ -266,9 +280,12 @@ def suite_report(store, suite_id, output=None):
     suite = read_suite(store, suite_id)
     runs = [{**item, **metrics(store, item["run_id"])} for item in suite["runs"]]
     summaries = summarize(runs)
+    per_task = []
+    for task in sorted({r["task"] for r in runs}):
+        group = [r for r in runs if r["task"] == task]
+        per_task.append({"task": task, "summaries": summarize(group), "paired_outcomes": paired_outcomes(group)})
     result = {"benchmark_id": suite_id, "name": suite["name"], "summaries": summaries, "runs": runs,
-              "per_task": [{"task": task, "summaries": summarize([row for row in runs if row["task"] == task])}
-                           for task in sorted({row["task"] for row in runs})],
+              "per_task": per_task,
               "paired_outcomes": paired_outcomes(runs), "runtime": suite.get("runtime", {}),
               "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. "
               "Unfinished runs are not failures. acceptance_rate uses all planned runs; finished_acceptance_rate uses only done/blocked runs. "
@@ -294,7 +311,8 @@ def suite_report(store, suite_id, output=None):
         body += '</tbody></table></div>'
         body += '<h2>Results by task</h2>'
         for item in result["per_task"]:
-            body += f'<details><summary>{escape(item["task"])}</summary><pre>{escape(json.dumps(item["summaries"], indent=2))}</pre></details>'
+            detail = {"summaries": item["summaries"], "paired_outcomes": item["paired_outcomes"]}
+            body += f'<details><summary>{escape(item["task"])}</summary><pre>{escape(json.dumps(detail, indent=2))}</pre></details>'
         body += '<h2>Every task and attempt</h2>'
         for row in result["runs"]:
             body += f'<details><summary>{escape(row["task"])} · {escape(row["contender"])} · repeat {row["repeat"]} · {escape(row["phase"])}</summary><pre>{escape(json.dumps(row, indent=2))}</pre></details>'

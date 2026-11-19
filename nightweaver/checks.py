@@ -123,10 +123,18 @@ def read_browser_evidence(config, out, receipt, max_bytes):
         required.update(f"checkpoint.{name}.{label}.png" for i, label in checkpoints if i <= completed)
         if missing := required - nonempty_files:
             raise ValueError(f"Missing or empty browser evidence for {name}: {', '.join(sorted(missing))}")
-        coverage.append({"viewport": name, "passed": passed, "completed_steps": completed, "planned_steps": planned})
+        coverage_row = {"viewport": name, "passed": passed, "completed_steps": completed, "planned_steps": planned}
+        timings = view.get("step_durations_ms")
+        if timings is not None:
+            if (not isinstance(timings, list) or not completed <= len(timings) <= min(completed + 1, planned)
+                    or any(type(v) is not int or v < 0 for v in timings)):
+                raise ValueError(f"Invalid browser step durations for {name}")
+            coverage_row["step_durations_ms"] = timings
+        coverage.append(coverage_row)
         if not passed:
             failures.append({"viewport": name, "stage": view.get("failed_at"),
-                             "error": str(next(iter(view["errors"]), ""))[:600]})
+                             "error": str(next(iter(view["errors"]), ""))[:600],
+                             "errors": [str(error)[:240] for error in dict.fromkeys(map(str, view["errors"]))][:4]})
     if report["passed"] == bool(failures):
         raise ValueError("Browser verdict disagrees with viewport results")
     receipt["browser_coverage"] = coverage

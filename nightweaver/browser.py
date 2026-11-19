@@ -58,6 +58,10 @@ def validate_browser(raw):
     for step in out["steps"]:
         fields(step, "action selector locator value", "browser step")
         action = text(step, "action")
+        if action == "reload":
+            if set(step) != {"action"}:
+                raise ValueError("reload takes no selector or value")
+            continue
         if action == "checkpoint":
             label = text(step, "value")
             if (set(step) != {"action", "value"} or label != step["value"] or
@@ -66,7 +70,7 @@ def validate_browser(raw):
             checkpoints.add(label)
             continue
         if action not in ("click", "fill", "press", "check", "visible", "hidden", "enabled", "disabled",
-                          "focused", "text", "count", "aria", "visual_match"):
+                          "focused", "text", "count", "aria", "visual_match", "value", "checked", "unchecked"):
             raise ValueError(f"Unsupported browser action: {action}")
         if ("selector" in step) == ("locator" in step):
             raise ValueError("Use exactly one selector or semantic locator")
@@ -89,7 +93,9 @@ def validate_browser(raw):
                 raise ValueError("Visual baseline needs an operator-pinned SHA-256")
             integer(match.get("channel_delta", 0), "channel_delta", 0, 255)
             integer(match.get("max_changed_ppm", 0), "max_changed_ppm", 0, 1000000)
-        if action in ("fill", "press", "text") and not isinstance(step.get("value"), str):
+        if action in ("checked", "unchecked") and "value" in step:
+            raise ValueError(f"{action} takes no value")
+        if action in ("fill", "press", "text", "value") and not isinstance(step.get("value"), str):
             raise ValueError(f"{action} needs a string value")
         if action == "count":
             integer(step.get("value"), "browser count", 0, 1000000)
@@ -111,8 +117,9 @@ def validate_browser(raw):
             if key in viewport and viewport[key] not in choices:
                 raise ValueError(f"Unsupported viewport {key}")
         name = text(viewport, "name")
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", name) or name in names:
+        if name != viewport["name"] or not re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", name) or name in names:
             raise ValueError("Viewport names must be unique lowercase identifiers")
+        artifact(name + ".png")
         names.add(name)
         integer(viewport.get("width"), "viewport width", 240, 3840)
         integer(viewport.get("height"), "viewport height", 240, 2160)
@@ -195,6 +202,11 @@ def visual_match(locator, contract, root, output, prefix, result):
 def run_step(page, step, index, result, output, timeout, root):
     from playwright.sync_api import expect
     action = step["action"]
+    if action == "reload":
+        response = page.reload(wait_until="load", timeout=timeout)
+        if response and response.status >= 400:
+            raise ValueError(f"Reload returned HTTP {response.status}")
+        return
     if action == "checkpoint":
         file = f"checkpoint.{result['viewport']}.{step['value']}.png"
         page.screenshot(path=str(output / file), animations="disabled")
@@ -212,9 +224,11 @@ def run_step(page, step, index, result, output, timeout, root):
                 (output / (prefix + ".aria.yml")).write_text(locator.aria_snapshot(timeout=timeout)[:64000], encoding="utf-8")
             raise
         return
-    if action in ("visible", "hidden", "enabled", "disabled", "focused"):
+    if action in ("checked", "unchecked"):
+        expect(locator).to_be_checked(checked=action == "checked", timeout=timeout)
+    elif action in ("visible", "hidden", "enabled", "disabled", "focused"):
         getattr(expect(locator), "to_be_" + action)(timeout=timeout)
-    elif action in ("text", "count"):
+    elif action in ("text", "count", "value"):
         getattr(expect(locator), "to_have_" + action)(step["value"], timeout=timeout)
     elif action in ("fill", "press"):
         getattr(locator, action)(step["value"])

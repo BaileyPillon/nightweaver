@@ -68,13 +68,21 @@ def metrics(store, run_id):
         if terminal:
             stop = terminal["time"]
     seconds = None
-    if start:
+    if start and (stop or row["state"]["phase"] not in ("blocked", "done")):
         seconds = max(0, ((datetime.fromisoformat(stop) if stop else datetime.now(timezone.utc)) - datetime.fromisoformat(start)).total_seconds())
+    queued = next((e["time"] for e in events if e["kind"] == "queued"), None)
+    first_acceptance = next((e["time"] for e in events if e["kind"] == "milestone_accepted"), None)
+
+    def interval(begin, end):
+        if begin and end:
+            return round(max(0, (datetime.fromisoformat(end) - datetime.fromisoformat(begin)).total_seconds()), 3)
+        return None
     unknown = sum(call.get("observed_tokens") is None for call in calls)
     recorded = sum(call.get("observed_tokens") or 0 for call in calls)
     interventions = sum(event["kind"] in ("operator_feedback", "blocked_run_retried") and started is not None
                         and event["seq"] > started["seq"] for event in events)
     phase = row["state"]["phase"]
+    rejection = next((e["details"] for e in reversed(events) if e["kind"] == "attempt_rejected"), {})
     outcome = "accepted" if phase == "done" else "unfinished"
     if phase == "blocked":
         if terminal and terminal["kind"] == "verification_inconsistent":
@@ -101,9 +109,11 @@ def metrics(store, run_id):
         "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
+        "last_rejection_stage": rejection.get("phase"),
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
         "accepted_milestones": len(store.accepted_milestones(run_id)), "total_milestones": len(row["spec"]["milestones"]),
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
+        "queue_seconds": interval(queued, start), "seconds_to_first_acceptance": interval(start, first_acceptance),
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
         "failed_attempts": kinds.count("attempt_rejected"), "gate_failures": sum(
             event["kind"] == "gate_finished" and observed_pass(event["details"]) is not True for event in events),

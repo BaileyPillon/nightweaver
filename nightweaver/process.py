@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 
 
@@ -121,7 +122,9 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
     changed_at = beat_at = time.monotonic()
     last_size = 0
     shim = [sys.executable, str(Path(__file__).with_name("_child.py")), json.dumps(argv), str(source)]
-    with log.open("wb") as out, WindowsJob() as job:
+    with TemporaryDirectory(prefix="nw-launch-") as temp, log.open("wb") as out, WindowsJob() as job:
+        error_file = Path(temp) / "launch-error"
+        shim.append(str(error_file))
         child = subprocess.Popen(shim, cwd=cwd, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
                                  env=env, creationflags=subprocess.CREATE_NO_WINDOW)
         attached = False
@@ -147,6 +150,8 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
                     heartbeat({"pid": child.pid, "log_bytes": size})
                     beat_at = now
                 time.sleep(.2)
+            if error_file.is_file():
+                raise OSError(error_file.read_text(encoding="utf-8"))
             if log.stat().st_size > max_log_bytes:
                 return 126
             return child.returncode

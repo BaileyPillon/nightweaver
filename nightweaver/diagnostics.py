@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from . import context
 from .checks import evidence_folder, run_gate, verify_inputs
-from .engine import common_dir, git, git_bytes
+from .engine import common_dir, git, git_bytes, verify_registered_repository
 from .readiness import diagnose
 from .safety import write_json
 from .spec import artifact
@@ -130,8 +130,7 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
     if not gates:
         raise ValueError("No matching gate for that milestone")
     repo = Path(row["spec"]["repository"])
-    if common_dir(repo) != Path(row["spec"]["git_common_dir"]):
-        raise ValueError("Registered repository identity changed")
+    verify_registered_repository(row["spec"], common_dir(repo))
     evidence = store.directory(run_id) / "replays" / uuid4().hex
     evidence.mkdir(parents=True)
     report = {"run_id": run_id, "milestone": number, "commit": event["commit"], "evidence": str(evidence), "gates": []}
@@ -188,8 +187,21 @@ def _database_check(file):
                         OR json_type(spec)!='object' OR coalesce(json_type(state,'$.step'),'')!='integer'
                         OR coalesce(json_extract(state,'$.phase'),'') NOT IN
                         ('queued','ready','working','checking','reviewing','promoting','blocked','done')""",
+                    "invalid milestone cursor": """SELECT count(*) FROM runs WHERE
+                        coalesce(json_type(spec,'$.milestones'),'') != 'array'
+                        OR json_array_length(spec,'$.milestones') < 1
+                        OR json_extract(state,'$.step') < 0
+                        OR CASE WHEN json_extract(state,'$.phase')='done'
+                            THEN json_extract(state,'$.step') != json_array_length(spec,'$.milestones')
+                            ELSE json_extract(state,'$.step') >= json_array_length(spec,'$.milestones') END""",
                     "missing prerequisite": """SELECT count(*) FROM runs r, json_each(r.state,'$.after') d
                         WHERE NOT EXISTS (SELECT 1 FROM runs p WHERE p.id=d.value)""",
+                    "cyclic prerequisite": """WITH RECURSIVE edges(child,parent) AS (
+                        SELECT r.id,d.value FROM runs r,json_each(r.state,'$.after') d
+                    ), ancestors(child,parent) AS (
+                        SELECT child,parent FROM edges UNION
+                        SELECT a.child,e.parent FROM ancestors a JOIN edges e ON e.child=a.parent
+                    ) SELECT count(*) FROM ancestors WHERE child=parent""",
                 }
                 for label, query in semantic.items():
                     count = db.execute(query).fetchone()[0]
