@@ -163,6 +163,15 @@ class Store:
         return [{"seq": row["seq"], "time": row["time"], "kind": row["kind"],
                  "details": json.loads(row["details"])} for row in rows]
 
+    def gate_samples(self, run_id, batch, gate_index):
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT details FROM events WHERE run_id=? AND kind='gate_finished'
+                AND json_extract(details, '$.verification_batch')=?
+                AND json_extract(details, '$.gate_index')=? ORDER BY seq
+            """, (run_id, batch, gate_index))
+            return [json.loads(row["details"]) for row in rows]
+
     def feedback(self, run_id, message):
         if not isinstance(message, str) or not message.strip() or len(message) > 12000:
             raise ValueError("Feedback must contain 1 to 12000 characters")

@@ -31,6 +31,26 @@ class InputDrift(ValueError):
     pass
 
 
+def observed_pass(receipt):
+    """Only a completed, evidenced check on the named source can score a sample."""
+    if type(receipt.get("exit")) is not int or receipt.get("artifact_error") or receipt.get("source_error"):
+        return None
+    return receipt["exit"] == 0
+
+
+def verify_saved_sample(receipt, evidence):
+    """Validate the stored bytes before reusing an interrupted verification sample."""
+    files = [(receipt["log"], receipt["log_sha256"])]
+    files.extend((a["path"], a["sha256"]) for a in receipt["artifacts"])
+    for name, expected in files:
+        path = Path(name).resolve(strict=True)
+        if not path.is_relative_to(evidence.resolve()) or not path.is_file():
+            raise ValueError(f"Invalid saved gate evidence: {name}")
+        with path.open("rb") as stream:
+            if file_digest(stream, "sha256").hexdigest() != expected:
+                raise ValueError(f"Saved gate evidence changed: {name}")
+
+
 def verify_inputs(check, cwd, base=None):
     for pin in check.get("pinned_inputs", []):
         name = pin["path"]
@@ -41,7 +61,8 @@ def verify_inputs(check, cwd, base=None):
             entry = git(cwd, "--literal-pathspecs", "ls-tree", base, "--", name)
             if entry.split(" ", 1)[0] not in ("100644", "100755"):
                 raise InputDrift(f"Missing or nonregular pinned check input at baseline: {name}")
-            digest = sha256(git_bytes(cwd, "cat-file", "blob", f"{base}:{name}")).hexdigest()
+            # The verifier runs checked-out bytes, including the pinned revision's EOL and smudge rules.
+            digest = sha256(git_bytes(cwd, "cat-file", "--filters", f"{base}:{name}", attributes_from=base)).hexdigest()
         else:
             if not path.is_file():
                 raise InputDrift(f"Missing pinned check input: {name}")

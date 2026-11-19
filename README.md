@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.8 brings stability checks into live OneShot runs. Set `stability_runs` on a repeatable gate to confirm an inconsistent result on the same candidate before spending another worker call. [Behavior, examples and restart recovery](docs/live-stability.md)
+
 Version 0.7 adds pinned verifier inputs, repeatable command and browser checks on accepted commits, failure diagnostics and repeated-trial benchmark measurements. The [three ranked lists and research sources](docs/v0.7-research.md) cover all 30 changes, their checks and CLI examples.
 
 Version 0.6 adds pinned visual comparisons, accessible and mobile browser contracts, model-free replay of accepted commits, repair measurements, and online runtime backups. Read the [ranked top twenty with research sources and commands](docs/v0.6-research.md).

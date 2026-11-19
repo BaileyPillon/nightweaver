@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from uuid import uuid4
 import subprocess
 import time
 
 from .process import BusyRun, PausedRun, run_lock
 from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, usage
-from .checks import contract_hash, evidence_folder, run_gate
+from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
 from . import context
 from .safety import atomic_write, redact, write_json
@@ -22,9 +23,12 @@ class BudgetExceeded(ValueError):
     pass
 
 
-def git_bytes(repo, *args):
+def git_bytes(repo, *args, attributes_from=None):
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    if attributes_from is not None:
+        env["GIT_ATTR_SOURCE"] = attributes_from
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=90,
-                            creationflags=subprocess.CREATE_NO_WINDOW, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                            creationflags=subprocess.CREATE_NO_WINDOW, env=env)
     if result.returncode:
         raise ValueError(result.stderr.decode("utf-8", "replace").strip() or f"Git {args[0]} failed")
     return result.stdout
@@ -305,38 +309,110 @@ class Run:
             self.reject(str(error), "snapshot")
             return
         evidence = self.evidence_dir(state)
+        batch = None
+        if any(check.get("stability_runs", 1) > 1 for check in step["gates"]):
+            identity = [state["step"], state["attempt"], snapshot]
+            saved = state.get("verification_batch") or {}
+            if saved.get("identity") != identity:
+                saved = {"id": uuid4().hex, "identity": identity}
+                self.set("verification_batch_started", saved, verification_batch=saved)
+            batch = saved["id"]
         outputs = []
         for index, check in enumerate(step["gates"], 1):
-            folder = evidence_folder(evidence, index)
-            log = folder / "gate.log"
-            location = {"step": state["step"] + 1, "attempt": state["attempt"], "gate_index": index}
-            self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
-                     "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
-            receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
-                               max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
-                               heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
-            receipt.update(location)
-            code = receipt["exit"]
-            if receipt.get("artifact_error"):
-                self.set("gate_finished", receipt)
-                if receipt.get("input_error") or receipt.get("execution_error"):
-                    self.set("blocked", {"during": "checking", "issue": receipt["artifact_error"]},
-                             phase="blocked", blocked_from="checking", last_error=receipt["artifact_error"])
-                    return
-                self.reject(f"{check['name']} exited {code} and could not collect its required evidence: {receipt['artifact_error']}\n{failure_excerpt(log)}", "artifact")
+            receipts = self.verify_gate(path, state, step, index, check, snapshot, batch)
+            if receipts is None:
                 return
-            self.set("gate_finished", receipt)
-            if code:
-                diagnostic = (json.dumps(receipt["browser_failures"], ensure_ascii=False)
-                              if receipt.get("browser_failures") else failure_excerpt(log))
-                self.reject(f"{check['name']} exited {code}\n{diagnostic}", "check")
-                return
-            outputs.append(receipt)
+            outputs.extend(receipts)
         if self.snapshot(path, state, step) != snapshot:
             self.reject("A check changed tracked evidence or implementation files after the snapshot was taken.", "snapshot")
             return
         write_json(evidence / "checks.json", outputs)
-        self.set("checks_passed", {"tree": snapshot, "checks": outputs}, phase="reviewing", candidate_tree=snapshot)
+        self.set("checks_passed", {"tree": snapshot, "checks": outputs}, phase="reviewing",
+                 candidate_tree=snapshot, verification_batch=None)
+
+    def verify_gate(self, path, state, step, index, check, snapshot, batch):
+        count = check.get("stability_runs", 1)
+        digest = contract_hash(check)
+        evidence = self.evidence_dir(state)
+        location = {"step": state["step"] + 1, "attempt": state["attempt"], "gate_index": index}
+        receipts = []
+        if count > 1:
+            if self.snapshot(path, state, step) != snapshot:
+                self.reject("A previous check changed the candidate before stability verification.", "snapshot")
+                return None
+            receipts = self.store.gate_samples(self.id, batch, index)
+            if receipts:
+                verify_inputs(check, path)
+                for sample, receipt in enumerate(receipts, 1):
+                    if (receipt["tree"], receipt["contract_sha256"], receipt.get("sample")) != (snapshot, digest, sample):
+                        raise ValueError("Saved gate samples do not match the active verification")
+                    if observed_pass(receipt) is not None:
+                        verify_saved_sample(receipt, evidence)
+            location.update(verification_batch=batch, stability_runs=count)
+
+        # A mixed first round earns one whole confirmation round on the same candidate.
+        for round_index in range(2 if count > 1 else 1):
+            for number in range(round_index * count + 1, (round_index + 1) * count + 1):
+                if self.paused():
+                    raise PausedRun()
+                if number <= len(receipts):
+                    receipt = receipts[number - 1]
+                else:
+                    sample_location = {**location, "sample": number} if count > 1 else location
+                    receipt = self.observe_gate(check, path, state, step, snapshot, sample_location)
+                    receipts.append(receipt)
+                if observed_pass(receipt) is None:
+                    self.invalid_gate(check, receipt)
+                    return None
+            outcomes = [observed_pass(r) for r in receipts[round_index * count:(round_index + 1) * count]]
+            if all(outcomes):
+                accepted = receipts[round_index * count:(round_index + 1) * count]
+                if round_index:
+                    accepted[0] = {**accepted[0], "prior_mixed_round": receipts[:count]}
+                return accepted
+            if not any(outcomes):
+                last = receipts[(round_index + 1) * count - 1]
+                diagnostic = (json.dumps(last["browser_failures"], ensure_ascii=False)
+                              if last.get("browser_failures") else failure_excerpt(last["log"]))
+                if count > 1:
+                    diagnostic = f"All {count} samples in this round failed.\n{diagnostic}"
+                self.reject(f"{check['name']} exited {last['exit']}\n{diagnostic}", "check")
+                return None
+        reason = f"{check['name']} produced both passes and failures in two rounds on tree {snapshot[:12]}."
+        self.set("verification_inconsistent", {**location, "name": check["name"], "tree": snapshot,
+                 "issue": reason, "logs": [r["log"] for r in receipts]}, phase="blocked",
+                 blocked_from="checking", last_error=reason)
+        return None
+
+    def observe_gate(self, check, path, state, step, snapshot, location):
+        folder = evidence_folder(self.evidence_dir(state), location["gate_index"])
+        log = folder / "gate.log"
+        self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
+                 "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
+        receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
+                           max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
+                           heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
+        receipt.update(location)
+        if "sample" in location and observed_pass(receipt) is not None:
+            try:
+                if self.snapshot(path, state, step) != snapshot:
+                    receipt["source_error"] = "The gate changed the candidate during stability verification."
+                with log.open("rb") as stream:
+                    receipt["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+            except ValueError as error:
+                receipt["source_error"] = str(error)
+        self.set("gate_finished", receipt)
+        return receipt
+
+    def invalid_gate(self, check, receipt):
+        if receipt.get("source_error"):
+            self.reject(receipt["source_error"], "snapshot")
+        elif receipt.get("input_error") or receipt.get("execution_error"):
+            self.set("blocked", {"during": "checking", "issue": receipt["artifact_error"]},
+                     phase="blocked", blocked_from="checking", last_error=receipt["artifact_error"])
+        else:
+            self.reject(f"{check['name']} exited {receipt['exit']} and could not collect its required evidence: "
+                        f"{receipt.get('artifact_error')}\n{failure_excerpt(receipt['log'])}", "artifact")
 
     def review(self, state, step, path):
         if state.get("feedback_version", 0) != state.get("worker_feedback_version", 0):
@@ -448,7 +524,7 @@ class Run:
                 raise BusyRun("Waiting for prerequisite runs: " + ", ".join(pending))
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
-                         attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None,
+                         attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,
                          transient_failures=0, failure_count=0, failure_fingerprint=None)
             if state.get("pending_call"):
                 self.finish_call(state["pending_call"], recovered=True)

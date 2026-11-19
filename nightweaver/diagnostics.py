@@ -113,8 +113,8 @@ def replay_browser(store, run_id, number=None, gate_name=None):
     return replay_checks(store, run_id, number, gate_name, browser_only=True)
 
 
-def replay_checks(store, run_id, number=None, gate_name=None, repeat=1, *, browser_only=False):
-    if type(repeat) is not int or not 1 <= repeat <= 20:
+def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, browser_only=False):
+    if repeat is not None and (type(repeat) is not int or not 1 <= repeat <= 20):
         raise ValueError("Replay repetitions must be between 1 and 20")
     row = store.get(run_id)
     accepted = store.accepted_milestones(run_id)
@@ -133,7 +133,10 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=1, *, brows
     evidence.mkdir(parents=True)
     report = {"run_id": run_id, "milestone": number, "commit": event["commit"], "evidence": str(evidence), "gates": []}
     with TemporaryDirectory(prefix="nw-replay-") as temp:
-        for idx, gate in enumerate(gates * repeat, 1):
+        repetitions = [repeat or gate.get("stability_runs", 1) for gate in gates]
+        schedule = ((gate, sample) for sample in range(1, max(repetitions) + 1)
+                    for gate, count in zip(gates, repetitions) if sample <= count)
+        for idx, (gate, sample) in enumerate(schedule, 1):
             # Each server may write into its working directory. Give every gate its own checkout.
             copy = Path(temp) / str(idx)
             git(repo, "clone", "--local", "--no-hardlinks", "--no-checkout", "--", str(repo), str(copy))
@@ -143,14 +146,20 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=1, *, brows
                               max_log_bytes=row["spec"].get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024))
             git(copy, "add", "-A", "--", ".")
             changed = git(copy, "write-tree") != tree or git(copy, "rev-parse", "HEAD") != event["commit"]
-            report["gates"].append({**record, "gate": gate["name"], "repeat": (idx-1)//len(gates)+1,
+            report["gates"].append({**record, "gate": gate["name"], "repeat": sample,
                                     "changed_source": changed, "passed": record["exit"] == 0 and
                                     not record.get("artifact_error") and not changed})
     report["stability"] = {}
     for gate in gates:
-        outcomes = [g["passed"] for g in report["gates"] if g["gate"] == gate["name"]]
-        report["stability"][gate["name"]] = ("mixed" if any(outcomes) and not all(outcomes)
-                                            else "all_passed" if all(outcomes) else "all_failed")
+        observations = [g for g in report["gates"] if g["gate"] == gate["name"]]
+        outcomes = {g["passed"] for g in observations}
+        if any(g.get("artifact_error") or g["changed_source"] for g in observations):
+            status = "inconclusive"
+        elif len(outcomes) > 1:
+            status = "mixed"
+        else:
+            status = "all_passed" if True in outcomes else "all_failed"
+        report["stability"][gate["name"]] = status
     report["model_calls"] = 0
     report["passed"] = all(g["passed"] for g in report["gates"])
     write_json(evidence / "replay.json", report)

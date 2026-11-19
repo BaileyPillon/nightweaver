@@ -21,7 +21,7 @@ from .safety import atomic_write, redact, write_json
 from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan
 
 
-INCONCLUSIVE = {"provider_blocked", "execution_blocked", "interrupted"}
+INCONCLUSIVE = {"provider_blocked", "execution_blocked", "interrupted", "verification_inconsistent"}
 
 
 def config_digest(config):

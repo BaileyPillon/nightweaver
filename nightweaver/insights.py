@@ -9,6 +9,7 @@ import re
 from statistics import median
 
 from .safety import atomic_write, redact
+from .checks import observed_pass
 
 
 def failure_excerpt(path, size=3600):
@@ -94,7 +95,8 @@ def gate_stats(events):
                 "gate": name,
                 "contract_sha256": digest,
                 "executions": len(receipts),
-                "failures": sum(r.get("exit") != 0 or bool(r.get("artifact_error")) for r in receipts),
+                "failures": sum(observed_pass(r) is not True for r in receipts),
+                "unscored": sum(observed_pass(r) is None for r in receipts),
                 "timed": len(durations),
                 "median_ms": median(durations) if durations else None,
                 "p95_ms": durations[ceil(0.95 * len(durations)) - 1] if durations else None,
@@ -112,6 +114,7 @@ def diagnosis(store, run_id):
         "provider_unavailable",
         "dispatcher_run_failed",
         "repeated_failure_stopped",
+        "verification_inconsistent",
         "blocked",
     }
     failures = [e for e in events if e["kind"] in kinds]
@@ -121,7 +124,7 @@ def diagnosis(store, run_id):
             e
             for e in reversed(events)
             if e["kind"] == "gate_finished"
-            and (e["details"].get("exit") != 0 or e["details"].get("artifact_error"))
+            and observed_pass(e["details"]) is not True
         ),
         None,
     )
@@ -155,6 +158,9 @@ def export_trace(store, run_id, output):
         "call",
         "observed_tokens",
         "gate_index",
+        "verification_batch",
+        "sample",
+        "stability_runs",
         "seconds",
         "same_failure_count",
     }

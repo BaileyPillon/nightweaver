@@ -9,12 +9,14 @@ from pathlib import Path
 
 from .safety import atomic_write, redact
 from .insights import provider_totals
+from .checks import observed_pass
 
 
 def recovery_metrics(events):
     attempts = rejections = first_pass = repaired = 0
     measured_gates = []
     observed = {}
+    stability = {}
     for event in events:
         kind, detail = event["kind"], event["details"]
         if kind == "worker_started":
@@ -28,12 +30,21 @@ def recovery_metrics(events):
         elif kind == "gate_finished":
             if "duration_ms" in detail:
                 measured_gates.append({"name": detail["name"], "duration_ms": detail["duration_ms"]})
-            if detail.get("tree") and detail.get("contract_sha256"):
+            passed = observed_pass(detail)
+            if passed is not None and detail.get("tree") and detail.get("contract_sha256"):
                 key = detail["name"], detail["tree"], detail["contract_sha256"]
-                passed = detail.get("exit") == 0 and not detail.get("artifact_error")
                 observed.setdefault(key, set()).add(passed)
+                if detail.get("verification_batch"):
+                    group = (detail["verification_batch"], detail["gate_index"], detail["stability_runs"])
+                    stability.setdefault(group, {})[detail["sample"]] = passed
+    confirmations = recovered = 0
+    for (_, _, count), samples in stability.items():
+        if count + 1 in samples:
+            confirmations += 1
+            recovered += all(samples.get(i) is True for i in range(count + 1, 2 * count + 1))
     return {"first_pass_milestones": first_pass, "repaired_milestones": repaired,
-            "timed_gate_executions": len(measured_gates),
+            "timed_gate_executions": len(measured_gates), "gate_confirmation_rounds": confirmations,
+            "gate_confirmation_recoveries": recovered,
             "slowest_gate": max(measured_gates, key=lambda g: g["duration_ms"], default=None),
             "mixed_gate_results": [{"name": name, "tree": tree, "contract_sha256": digest}
                                    for (name, tree, digest), outcomes in observed.items() if len(outcomes) == 2]}
@@ -53,7 +64,7 @@ def metrics(store, run_id):
     if row["state"]["phase"] == "blocked":
         terminal = next((event for event in reversed(events) if event["kind"] in (
             "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed",
-            "repeated_failure_stopped")), None)
+            "repeated_failure_stopped", "verification_inconsistent")), None)
         if terminal:
             stop = terminal["time"]
     seconds = None
@@ -66,7 +77,9 @@ def metrics(store, run_id):
     phase = row["state"]["phase"]
     outcome = "accepted" if phase == "done" else "unfinished"
     if phase == "blocked":
-        if terminal and terminal["kind"] == "provider_unavailable":
+        if terminal and terminal["kind"] == "verification_inconsistent":
+            outcome = "verification_inconsistent"
+        elif terminal and terminal["kind"] == "provider_unavailable":
             outcome = "provider_blocked"
         elif terminal and terminal["kind"] == "budget_exhausted":
             outcome = "budget_exhausted"
@@ -93,7 +106,7 @@ def metrics(store, run_id):
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
         "failed_attempts": kinds.count("attempt_rejected"), "gate_failures": sum(
-            event["kind"] == "gate_finished" and (event["details"].get("exit") != 0 or bool(event["details"].get("artifact_error"))) for event in events),
+            event["kind"] == "gate_finished" and observed_pass(event["details"]) is not True for event in events),
         "interventions": interventions, "unassisted_acceptance": row["state"]["phase"] == "done" and interventions == 0,
         "interruptions_recovered": kinds.count("interrupted_worker_recovered"),
         "fallbacks": kinds.count("provider_fallback"), "observed_tokens": recorded if calls and unknown < len(calls) else None,

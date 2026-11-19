@@ -190,7 +190,7 @@ def main(argv=None):
         replay.add_argument("--milestone", type=int)
         replay.add_argument("--gate")
         if action == "replay-checks":
-            replay.add_argument("--repeat", type=int, default=1)
+            replay.add_argument("--repeat", type=int, help="Override the gate's configured sample count")
     for action, help_text in (("diagnose-run", "Locate recorded failures and their evidence"),
                               ("gate-stats", "Measure repeated checks by contract"),
                               ("budget", "Show remaining time, calls and observed-token allowance"),
@@ -282,7 +282,7 @@ def main(argv=None):
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
-                      else replay_checks(store, args.id, args.milestone, args.gate, getattr(args, "repeat", 1),
+                      else replay_checks(store, args.id, args.milestone, args.gate, getattr(args, "repeat", None),
                                          browser_only=name == "replay-browser"))
             output(report)
             return 0 if report.get("ready", report.get("passed")) else 3
