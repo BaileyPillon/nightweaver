@@ -114,8 +114,8 @@ def plan_goal(store, args):
                                             "agent_timeout_seconds":prepared["agent_timeout"]})
     if fixed:
         boundaries = [{k:s[k] for k in ("title","task","paths","gates")} for s in prepared["milestones"]]
-        prompt += ("\nUse exactly one entry per fixed milestone in its original order. Retain its task, "
-                   "allowed paths and checks.\n" + json.dumps(boundaries, ensure_ascii=False))
+        prompt += ("\nUse exactly one entry per fixed milestone in its original order. Return only title and task. "
+                   "The controller attaches the following operator-owned paths and checks.\n" + json.dumps(boundaries, ensure_ascii=False))
     pin_source = args.start or args.enqueue or project or "expected_base" in raw or prepared["context_files"] or prepared["repository_map"]
     if pin_source:
         source = source_info(store, raw)
@@ -147,13 +147,25 @@ def plan_goal(store, args):
     milestones = response.get("milestones", [])
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 5:
         raise ValueError("Planner did not return one to five milestones")
-    for item in milestones:
-        fields(item, "title task", "planned milestone")
+    if fixed and len(milestones) != len(template_steps):
+        raise ValueError("Planner response does not cover the fixed milestone count")
+    for index, item in enumerate(milestones):
+        fields(
+            item,
+            "title task paths gates" if fixed else "title task",
+            "planned milestone",
+        )
+        if fixed:
+            for key in ("paths", "gates"):
+                if key in item and json.dumps(item[key], sort_keys=True) != json.dumps(
+                    boundaries[index][key], sort_keys=True
+                ):
+                    raise ValueError(
+                        f"Planner changed fixed milestone {index + 1} {key}"
+                    )
         text(item, "title")
         text(item, "task")
     if fixed:
-        if len(milestones) != len(template_steps):
-            raise ValueError("Planner response does not cover the fixed milestone count")
         raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"]}
                              for original,proposed in zip(template_steps, milestones)]
     elif not gates and len(milestones) > 1:
@@ -265,14 +277,44 @@ def main(argv=None):
     commands.add_parser("catalog-history", help="Trace catalog losses and repairs across attempts").add_argument("id")
     commands.add_parser("check-schedule", help="Preview effective checks, retention and nominal timeouts").add_argument("plan")
     commands.add_parser("test-history", help="Inspect measured JUnit results across attempts").add_argument("id")
-    for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
-                              ("timeline","Show milestone attempts, timing and acceptance"),
-                              ("call-ledger","Inspect individual provider calls, usage and interruptions"),
-                              ("browser-matrix","Inspect the latest outcome and evidence per scenario and viewport"),
-                              ("browser-hotspots","Locate failing or slow actions per browser viewport"),
-                              ("browser-coverage","Measure steps completed per gate and viewport"),
-                              ("evidence-manifest","Export portable evidence hashes and verification results"),
-                              ("ci-summary","Write a Markdown run summary for CI")):
+    for action in ("check-baseline", "compare-revisions"):
+        probe = commands.add_parser(
+            action, help="Verify named regression cases in isolated Git revisions"
+        )
+        probe.add_argument("plan")
+        probe.add_argument("--milestone", type=int, default=1)
+        probe.add_argument("--gate", required=True)
+        probe.add_argument(
+            "--before",
+            help="Baseline Git revision, defaulting to the plan baseline or HEAD",
+        )
+        if action == "compare-revisions":
+            probe.add_argument("--after", required=True, help="Candidate Git revision")
+    cases = commands.add_parser(
+        "case-history", help="Read one case from hash-verified archived JUnit reports"
+    )
+    cases.add_argument("id")
+    cases.add_argument("--classname", required=True)
+    cases.add_argument("--name", required=True)
+    cases.add_argument(
+        "--suite", action="append", help="Repeat for each component of the suite path"
+    )
+    for name, description in (
+        ("dependencies", "Show upstream and downstream prerequisite edges"),
+        ("timeline", "Show milestone attempts, timing and acceptance"),
+        ("call-ledger", "Inspect individual provider calls, usage and interruptions"),
+        (
+            "browser-matrix",
+            "Inspect the latest outcome and evidence per scenario and viewport",
+        ),
+        ("browser-hotspots", "Locate failing or slow actions per browser viewport"),
+        ("browser-coverage", "Measure steps completed per gate and viewport"),
+        (
+            "evidence-manifest",
+            "Export portable evidence hashes and verification results",
+        ),
+        ("ci-summary", "Write a Markdown run summary for CI"),
+    ):
         p = commands.add_parser(name, help=description)
         p.add_argument("id")
         if name in ("ci-summary","evidence-manifest"):
@@ -464,6 +506,33 @@ def main(argv=None):
         elif name == "test-history":
             from .junit import history
             output(history(store, args.id))
+        elif name in ("check-baseline", "compare-revisions"):
+            from .proof import compare
+
+            result = compare(
+                store,
+                read_plan(args.plan, store),
+                args.milestone,
+                args.gate,
+                args.before,
+                getattr(args, "after", None),
+            )
+            output(redact(result))
+            return 0 if result["passed"] else 3
+        elif name == "case-history":
+            from .proof import case_history
+
+            output(
+                case_history(
+                    store,
+                    args.id,
+                    {
+                        "name": args.name,
+                        "classname": args.classname,
+                        **({"suite": args.suite} if args.suite is not None else {}),
+                    },
+                )
+            )
         elif name in ("scope", "plan-lint", "catalog-check", "catalog-history"):
             from .contracts import catalog_history, inspect_catalog, lint_plan, scope_report
             if name == "catalog-history":

@@ -45,7 +45,7 @@ def lint_plan(spec):
             keys = [json.dumps(r, sort_keys=True) for r in routes if r]
             if len(set(keys)) != len(keys):
                 findings.append({"severity": "warning", "code": "repeated_route", "role": role, "step": i})
-        configured = sum(g.get("stability_runs", 1) * g["timeout"] for g in step["gates"])
+        configured = sum(g.get("stability_runs", 1) * (1+g.get("proof",{}).get("samples",0)) * g["timeout"] for g in step["gates"])
         if (wall := spec["budgets"].get("max_seconds")) and configured > wall:
             findings.append(
                 {
@@ -75,14 +75,30 @@ def check_schedule(spec):
     for number, step in enumerate(spec["milestones"], 1):
         for gate in step["gates"]:
             samples = gate.get("stability_runs", 1)
-            rows.append({"milestone": number, "title": step["title"], "gate": gate["name"],
-                         "kind": "junit" if "junit" in gate else gate.get("kind", "command"),
-                         "samples": samples, "timeout_seconds": samples * gate["timeout"],
-                         "retained_from": step.get("retained_from", {}).get(gate["name"], []),
-                         "contract_sha256": contract_hash(gate)})
-    return {"checks": rows, "samples": sum(row["samples"] for row in rows),
-            "timeout_seconds": sum(row["timeout_seconds"] for row in rows),
-            "retained_samples": sum(row["samples"] for row in rows if row["retained_from"]), "model_calls": 0}
+            controls = samples * gate.get("proof", {}).get("samples", 0)
+            rows.append(
+                {
+                    "milestone": number,
+                    "title": step["title"],
+                    "gate": gate["name"],
+                    "kind": "junit" if "junit" in gate else gate.get("kind", "command"),
+                    "samples": samples,
+                    "baseline_samples": controls,
+                    "timeout_seconds": (samples + controls) * gate["timeout"],
+                    "retained_from": step.get("retained_from", {}).get(
+                        gate["name"], []
+                    ),
+                    "contract_sha256": contract_hash(gate),
+                }
+            )
+    return {
+        "checks": rows,
+        "samples": sum(row["samples"] for row in rows),
+        "baseline_samples": sum(row["baseline_samples"] for row in rows),
+        "timeout_seconds": sum(row["timeout_seconds"] for row in rows),
+        "retained_samples": sum(row["samples"] for row in rows if row["retained_from"]),
+        "model_calls": 0,
+    }
 
 
 def catalog_history(store, run_id):

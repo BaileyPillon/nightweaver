@@ -331,6 +331,25 @@ def read_browser_evidence(config, out, receipt, max_bytes):
 
 
 def run_gate(check, path, folder, tree, *, baseline=None, **process_options):
+    started = time.monotonic()
+    receipt = _single_gate(check, path, folder, tree, baseline=baseline, **process_options)
+    if "proof" in check and observed_pass(receipt) is not None:
+        from .proof import apply_proof, baseline_check
+        from .engine import BudgetExceeded
+        try:
+            if not baseline:
+                raise ValueError("Proof gate requires the recorded baseline commit")
+            before, artifacts = baseline_check(check, path, baseline, folder / "baseline", process_options)
+            apply_proof(receipt, check, before, artifacts)
+        except (OSError, ValueError) as error:
+            if isinstance(error, BudgetExceeded):
+                raise
+            receipt.update(execution_error=True, artifact_error=f"Cannot verify baseline: {error}")
+        receipt["duration_ms"] = round((time.monotonic() - started) * 1000)
+    return receipt
+
+
+def _single_gate(check, path, folder, tree, *, baseline=None, **process_options):
     from .engine import artifact_stamp, preserve_artifacts
 
     log = folder / "gate.log"
@@ -395,7 +414,8 @@ def run_gate(check, path, folder, tree, *, baseline=None, **process_options):
         if "junit" in check:
             from .junit import read_report
             try:
-                read_report(report_path, receipt, max_bytes, check["junit"])
+                from .proof import tracked
+                read_report(report_path, receipt, max_bytes, check["junit"], tracked(check))
             except (OSError, ValueError) as error:
                 receipt["execution_error"] = True
                 raise ValueError(f"JUnit verification unavailable: {error}") from error

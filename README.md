@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.15 can require a named test to fail for a specified reason on the original Git commit and pass on the candidate, while a known-good control passes on both. Use `check-baseline` before a model call or `compare-revisions` on two existing commits. Read the [30 ranked changes, research sources, Windows trial and proof example](docs/v0.15-research.md).
+
 Version 0.14 lets a OneShot carry earlier checks into later milestones and grade individual JUnit test results. On a Windows watchlist fixture, it caught a later change that broke an accepted feature even though the test command exited zero. See the [30 ranked changes, research sources, Windows trials and plan example](docs/v0.14-research.md).
 
 Version 0.13 checks a change for new and returning visitors on desktop and phone. A OneShot can now seed an existing collection, close and reopen the app, verify what persisted, and tell a repair worker exactly which visitor failed. [All 30 ranked changes, a working browser contract and the Afterimage experiment](docs/v0.13-research.md)

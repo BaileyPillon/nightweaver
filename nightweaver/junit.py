@@ -8,28 +8,66 @@ from xml.etree import ElementTree as ET
 from .spec import array, fields, integer, text
 
 
+def selector(raw, *, symptom=False):
+    fields(
+        raw,
+        "classname name suite" + (" message_contains" if symptom else ""),
+        "case selector",
+    )
+    if not isinstance(raw.get("classname"), str):
+        raise ValueError("Case selectors require a classname string")  # noqa: TRY004 - plan validation uses ValueError
+    text(raw, "name")
+    if len(raw["classname"]) + len(raw["name"]) > 2048:
+        raise ValueError("Case selector is too long")
+    out = {"classname": raw["classname"], "name": raw["name"]}
+    if "suite" in raw:
+        path = array(raw["suite"], "suite path", 64)
+        if any(not isinstance(s, str) or not s or len(s) > 512 for s in path):
+            raise ValueError("Use an array of nonempty suite names")
+        out["suite"] = list(path)
+    if "message_contains" in raw:
+        msg = raw["message_contains"]
+        if not isinstance(msg, str) or not msg.strip() or len(msg) > 512:
+            raise ValueError("message_contains needs 1 to 512 characters")
+        out["message_contains"] = msg
+    return out
+
+
+def selectors(raw, label, *, symptom=False):
+    items = []
+    seen = set()
+    for case in array(raw, label, 100):
+        item = selector(case, symptom=symptom)
+        key = (
+            tuple(item["suite"]) if "suite" in item else None,
+            item["classname"],
+            item["name"],
+        )
+        if key in seen:
+            raise ValueError(f"Duplicate {label} test identity")
+        seen.add(key)
+        items.append(item)
+    return items
+
+
 def contract(raw):
-    fields(raw, "min_passed max_skipped required max_case_ms", "junit")
+    fields(
+        raw,
+        "min_passed max_skipped required max_case_ms max_total_case_ms max_flaky",
+        "junit",
+    )
     policy = {"min_passed": integer(raw.get("min_passed", 1), "min_passed", 1, 100_000)}
-    for key, high in (("max_skipped", 100_000), ("max_case_ms", 2_147_483_647)):
+    for key, high in (
+        ("max_skipped", 100_000),
+        ("max_flaky", 100_000),
+        ("max_case_ms", 2_147_483_647),
+        ("max_total_case_ms", 2_147_483_647),
+    ):
         if key in raw:
             policy[key] = integer(raw[key], key, 0, high)
-    required = []
-    for case in array(raw.get("required", []), "required tests", 100):
-        fields(case, "classname name", "required test")
-        if not isinstance(case.get("classname"), str):
-            raise ValueError(  # noqa: TRY004 - CLI validation uses ValueError
-                "Required tests need classname (an empty string is allowed)"
-            )
-        text(case, "name")
-        key = (case["classname"], case["name"])
-        if key in required:
-            raise ValueError("Duplicate required test identity")
-        required.append(key)
+    required = selectors(raw.get("required", []), "required")
     if required:
-        policy["required"] = [
-            {"classname": cls, "name": name} for cls, name in required
-        ]
+        policy["required"] = required
     return policy
 
 
@@ -68,79 +106,139 @@ TOTALS = {
 }
 
 
+OUTCOMES = {
+    "passed": "passed",
+    "success": "passed",
+    "failed": "failed",
+    "failure": "failed",
+    "error": "errors",
+    "notrun": "skipped",
+    "suppressed": "skipped",
+    "disabled": "skipped",
+    "skipped": "skipped",
+}
+RECOVERED = {"flakyFailure", "flakyError"}
+RETRIED = {"rerunFailure", "rerunError"}
+STRUCTURAL = (
+    set(STATUSES) | RECOVERED | RETRIED | {"testsuite", "testsuites", "testcase"}
+)
+METADATA = {"properties", "system-out", "system-err"}
+
+
 def duration(case):
     if "time" not in case.attrib:
         return None
     try:
-        seconds = Decimal(case.get("time"))
+        raw = case.get("time")
+        if len(raw) > 256:
+            raise ValueError
+        seconds = Decimal(raw)
         if not seconds.is_finite() or not 0 <= seconds <= 1_000_000_000:
             raise ValueError
-        return int((seconds * 1000).to_integral_value(rounding=ROUND_CEILING))
+        # Shift the decimal point exactly before rounding. Arithmetic multiplication
+        # can round away a positive fraction just above the configured boundary.
+        value = seconds.as_tuple()
+        if not seconds:
+            return 0
+        if seconds < Decimal("0.001"):
+            return 1
+        ms = Decimal((value.sign, value.digits, value.exponent + 3))
+        return int(ms.to_integral_value(rounding=ROUND_CEILING))
     except (InvalidOperation, ValueError):
         raise ValueError("Invalid JUnit testcase time") from None
 
 
-def cases_in(element, cases, identities):
-    """Recompute each suite's declared counters from its actual descendants."""
+def validate_extension(node):
+    if tag(node.tag) not in METADATA and any(
+        tag(n.tag) in STRUCTURAL for n in node.iter()
+    ):
+        raise ValueError(f"Misplaced JUnit result or test beneath {tag(node.tag)}")
+
+
+def read_case(child, suite):
+    name, cls = child.get("name"), child.get("classname", "")
+    if not name or not name.strip() or len(name) + len(cls) > 2048:
+        raise ValueError("JUnit test needs a nonempty bounded case identity")
+    results = []
+    retries = recovered = 0
+    for node in child:
+        kind = tag(node.tag)
+        if kind in STATUSES:
+            results.append(node)
+        elif kind in RECOVERED:
+            recovered += 1
+        elif kind in RETRIED:
+            retries += 1
+        else:
+            validate_extension(node)
+    states = {STATUSES[tag(node.tag)] for node in results}
+    hints = {child.get(k, "").casefold() for k in ("status", "result")} - {
+        "",
+        "run",
+        "completed",
+    }
+    for hint in hints:
+        if hint not in OUTCOMES:
+            raise ValueError(f"Unsupported JUnit testcase outcome: {hint[:80]}")
+        states.add(OUTCOMES[hint])
+    if len(states) > 1:
+        raise ValueError(f"Contradictory JUnit outcomes for {name}")
+    status = next(iter(states), "passed")
+    if (recovered and status != "passed") or (
+        retries and status not in ("failed", "errors")
+    ):
+        raise ValueError(f"Inconsistent JUnit retry evidence for {name}")
+    messages = [
+        part for node in results for part in (node.get("message"), node.text) if part
+    ]
+    return {
+        "suite": suite,
+        "classname": cls,
+        "name": name,
+        "status": status,
+        "ms": duration(child),
+        "disabled": bool(hints & {"notrun", "suppressed", "disabled"}),
+        "flaky": bool(recovered),
+        "retry_failures": recovered + retries,
+        "messages": messages,
+    }
+
+
+def cases_in(element, cases, identities, suite=()):
     counts = Counter()
+    if tag(element.tag) == "testsuite" and element.get("name"):
+        name = element.get("name")
+        if len(name) > 512:
+            raise ValueError("JUnit suite name exceeds 512 characters")
+        suite = (*suite, name)
     for child in element:
         kind = tag(child.tag)
         if kind in ("testsuite", "testsuites"):
-            counts.update(cases_in(child, cases, identities))
+            counts.update(cases_in(child, cases, identities, suite))
         elif kind == "testcase":
-            name, cls = child.get("name"), child.get("classname", "")
-            if not name or not name.strip() or len(name) + len(cls) > 2048:
-                raise ValueError("JUnit test needs a nonempty bounded case identity")
-            if (cls, name) in identities:
-                raise ValueError(f"Duplicate JUnit test identity: {cls} / {name}")
-            identities.add((cls, name))
-            results = [node for node in child if tag(node.tag) in STATUSES]
-            states = {STATUSES[tag(node.tag)] for node in results}
-            for attr in ("status", "result"):
-                hint = child.get(attr, "").casefold()
-                if hint in ("", "run", "completed"):
-                    continue
-                outcome = {
-                    "passed": "passed",
-                    "success": "passed",
-                    "failed": "failed",
-                    "failure": "failed",
-                    "error": "errors",
-                    "notrun": "skipped",
-                    "suppressed": "skipped",
-                    "disabled": "skipped",
-                    "skipped": "skipped",
-                }.get(hint)
-                if outcome is None:
-                    raise ValueError(f"Unsupported JUnit testcase {attr}: {hint[:80]}")
-                states.add(outcome)
-            if len(states) > 1:
-                raise ValueError(f"Contradictory JUnit outcomes for {name}")
-            status = next(iter(states), "passed")
-            case = {
-                "classname": cls,
-                "name": name,
-                "status": status,
-                "ms": duration(child),
-            }
-            if status in ("failed", "errors"):
-                case["message"] = (
-                    (results[0].get("message") or results[0].text or "")[:300]
-                    if results
-                    else ""
-                )
+            case = read_case(child, suite)
+            key = (suite, case["classname"], case["name"])
+            if key in identities:
+                raise ValueError(f"Duplicate JUnit test identity: {key}")
+            identities.add(key)
             cases.append(case)
             if len(cases) > 100_000:
                 raise ValueError("JUnit report exceeds 100000 cases")
-            counts.update(("tests", status))
-    for attr, key in TOTALS.items():
+            counts.update(("tests", case["status"]))
+            counts["disabled"] += int(case["disabled"])
+        else:
+            validate_extension(child)
+    for attr, key in {**TOTALS, "disabled": "disabled"}.items():
         if attr in element.attrib:
+            measured = counts[key]
+            if attr == "skipped" and "disabled" in element.attrib:
+                measured -= counts["disabled"]
             declared = element.get(attr)
             if (
                 not declared.isascii()
                 or not declared.isdecimal()
                 or len(declared) > 10
-                or int(declared) != counts[key]
+                or int(declared) != measured
             ):
                 raise ValueError(
                     f"JUnit {attr} disagrees with measured cases in {element.get('name', 'report')}"
@@ -148,7 +246,39 @@ def cases_in(element, cases, identities):
     return counts
 
 
-def grade(data, policy):
+def summarize_case(case):
+    return {
+        k: case[k]
+        for k in (
+            "suite",
+            "classname",
+            "name",
+            "status",
+            "ms",
+            "flaky",
+            "retry_failures",
+        )
+    }
+
+
+def select_case(index, query):
+    matches = index.get((query["classname"], query["name"]), [])
+    if "suite" in query:
+        matches = [c for c in matches if c["suite"] == tuple(query["suite"])]
+    if len(matches) != 1:
+        return {"selector": query, "status": "ambiguous" if matches else "missing"}
+    case = matches[0]
+    row = {**summarize_case(case), "selector": query}
+    if case["messages"]:
+        row["message"] = case["messages"][0][:300]
+    if "message_contains" in query:
+        row["symptom_matched"] = any(
+            query["message_contains"] in m for m in case["messages"]
+        )
+    return row
+
+
+def grade(data, policy, tracked=()):
     try:
         root = ET.fromstring(data, parser=ET.XMLParser(target=ReportTree()))
     except (ET.ParseError, LookupError) as exc:
@@ -156,50 +286,72 @@ def grade(data, policy):
     if tag(root.tag) not in ("testsuite", "testsuites"):
         raise ValueError("Expected a JUnit testsuite or testsuites document")
     cases = []
-    counts = cases_in(root, cases, set())
-    counts = {
-        key: counts[key] for key in ("tests", "passed", "failed", "errors", "skipped")
-    }
+    totals = cases_in(root, cases, set())
+    counts = {k: totals[k] for k in ("tests", "passed", "failed", "errors", "skipped")}
+    index = {}
+    for c in cases:
+        index.setdefault((c["classname"], c["name"]), []).append(c)
     issues = []
+    total_issues = 0
 
     def issue(message):
+        nonlocal total_issues
+        total_issues += 1
         if len(issues) < 12:
             issues.append(message)
 
+    for req in policy.get("required", []):
+        observed = select_case(index, req)
+        if observed["status"] != "passed":
+            issue(
+                f"Required test did not pass: {req['classname']} / {req['name']} ({observed['status']})"
+            )
     for case in cases:
         if case["status"] in ("failed", "errors"):
-            issue(
-                f"{case['classname']} / {case['name']} ({case['status']}): {case['message']}"
-            )
+            msg = case["messages"][0][:300] if case["messages"] else ""
+            issue(f"{case['classname']} / {case['name']} ({case['status']}): {msg}")
     if counts["passed"] < policy["min_passed"]:
         issue(f"Passing tests {counts['passed']} below required {policy['min_passed']}")
     if "max_skipped" in policy and counts["skipped"] > policy["max_skipped"]:
         issue(
             f"Skipped tests {counts['skipped']} exceed allowed {policy['max_skipped']}"
         )
-    passed = {(c["classname"], c["name"]) for c in cases if c["status"] == "passed"}
-    for req in policy.get("required", []):
-        if (req["classname"], req["name"]) not in passed:
-            issue(f"Required test did not pass: {req['classname']} / {req['name']}")
-    timed = sorted((c for c in cases if c["ms"] is not None), key=lambda c: -c["ms"])
-    if "max_case_ms" in policy:
-        for c in cases:
-            if c["status"] != "skipped" and (
-                c["ms"] is None or c["ms"] > policy["max_case_ms"]
-            ):
-                issue(
-                    f"Missing or over-limit timing: {c['classname']} / {c['name']} (limit {policy['max_case_ms']} ms)"
-                )
+    flaky = sum(c["flaky"] for c in cases)
+    if "max_flaky" in policy and flaky > policy["max_flaky"]:
+        issue(f"Recovered flaky tests {flaky} exceed allowed {policy['max_flaky']}")
+    executed = [c for c in cases if c["status"] != "skipped"]
+    timed = sorted((c for c in executed if c["ms"] is not None), key=lambda c: -c["ms"])
+    total_ms = sum(c["ms"] for c in timed)
+    if "max_total_case_ms" in policy and (
+        len(timed) != len(executed) or total_ms > policy["max_total_case_ms"]
+    ):
+        issue(
+            f"Total case time {total_ms} ms across {len(timed)}/{len(executed)} timed executions; budget {policy['max_total_case_ms']} ms"
+        )
+    for c in executed:
+        if "max_case_ms" in policy and (
+            c["ms"] is None or c["ms"] > policy["max_case_ms"]
+        ):
+            issue(
+                f"Missing or over-limit timing: {c['classname']} / {c['name']} (limit {policy['max_case_ms']} ms)"
+            )
     return {
         "counts": counts,
         "passed": not issues,
         "issues": issues,
+        "omitted_issues": total_issues - len(issues),
+        "disabled_cases": totals["disabled"],
+        "flaky_cases": flaky,
+        "retry_failures": sum(c["retry_failures"] for c in cases),
         "timed_cases": len(timed),
-        "slowest": [{k: c[k] for k in ("classname", "name", "ms")} for c in timed[:5]],
+        "executed_cases": len(executed),
+        "measured_case_ms": total_ms,
+        "slowest": [summarize_case(c) for c in timed[:5]],
+        "tracked": [select_case(index, q) for q in tracked],
     }
 
 
-def read_report(path, receipt, limit, policy):
+def read_report(path, receipt, limit, policy, tracked=()):
     if (
         path.is_symlink()
         or not path.is_file()
@@ -215,7 +367,7 @@ def read_report(path, receipt, limit, policy):
     receipt["artifacts"].append(
         {"name": path.name, "path": str(path), "sha256": sha256(data).hexdigest()}
     )
-    receipt["junit"] = grade(data, policy)
+    receipt["junit"] = grade(data, policy, tracked)
 
 
 def history(store, run_id):
@@ -244,6 +396,7 @@ def history(store, run_id):
                 "passed": observed_pass(detail),
                 "error": detail.get("artifact_error") or detail.get("source_error"),
                 "report": detail.get("junit"),
+                "proof": detail.get("proof"),
             }
         )
     return {"run_id": run_id, "observations": rows, "model_calls": 0}

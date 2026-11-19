@@ -110,6 +110,8 @@ def fork_run(store, run_id, milestone, worker=None):
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]
     spec = {**original["spec"], "expected_base": base, "milestones": remaining, "title": original["spec"]["title"] + " (fork)"}
+    if any("proof" in gate for step in remaining for gate in step["gates"]):
+        spec["proof_base"] = original["spec"].get("proof_base", original["state"]["base"])
     repo = Path(spec["repository"])
     gitdir = common_dir(repo)
     verify_registered_repository(spec, gitdir)
@@ -437,8 +439,9 @@ class Run:
         log = folder / "gate.log"
         self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
                  "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
+        baseline = self.spec.get("proof_base", state["base"]) if "proof" in check else state["base"]
         receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
-                           **({"baseline": state["base"]} if check.get("kind") == "catalog" else {}),
+                           **({"baseline": baseline} if check.get("kind") == "catalog" or "proof" in check else {}),
                            max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
                            heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
         receipt.update(location)
@@ -454,6 +457,8 @@ class Run:
                     receipt["source_error"] = "The gate changed tracked candidate files during verification."
             except ValueError as error:
                 receipt["source_error"] = str(error)
+        if "proof" in receipt:
+            receipt["proof"]["passed"] = observed_pass(receipt) is True
         self.set("gate_finished", receipt)
         return receipt
 

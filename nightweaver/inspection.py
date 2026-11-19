@@ -329,6 +329,13 @@ def ci_summary(store, run_id, output):
     from .junit import history
     tests = history(store, run_id)["observations"]
     if tests:
+        proofs = [t["proof"] for t in tests if t.get("proof")]
+        if proofs:
+            controls = [sample for p in proofs for sample in p["baseline"]["samples"]]
+            lines.append(
+                f"| Baseline samples reproducing the contracted behavior | {sum(c['passed'] for c in controls)} / {len(controls)} |"
+            )
+            lines.append(f"| Matched proof observations passed | {sum(p['passed'] for p in proofs)} / {len(proofs)} |")
         counts = [t["report"]["counts"] for t in tests if t["report"] and t["passed"] is not None]
         lines.append(f"| JUnit test executions passed / measured across attempts | {sum(c['passed'] for c in counts)} / {sum(c['tests'] for c in counts)} |")
         lines.append(f"| JUnit test executions skipped | {sum(c['skipped'] for c in counts)} |")

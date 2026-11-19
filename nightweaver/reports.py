@@ -176,6 +176,24 @@ def run_report(store, run_id, output, include_images=False):
             body += (f'<tr><td>{obs["step"]} / {obs["attempt"]} / {obs["sample"]}</td>'
                      f'<td>{escape(obs["name"])}</td><td>{verdict}</td><td>{coverage}</td><td>{outcomes}</td></tr>')
         body += '</tbody></table></div>'
+        proofs = [o for o in observations if o.get("proof")]
+        if proofs:
+            body += '<h2>Regression proof</h2><div class="table"><table><thead><tr><th>Milestone / attempt</th><th>Check</th><th>Baseline commit</th><th>Baseline samples matched</th><th>Joint verdict</th></tr></thead><tbody>'
+            for obs in proofs:
+                base = obs["proof"]["baseline"]
+                samples = base["samples"]
+                verdict = (
+                    "Unscored"
+                    if obs["passed"] is None
+                    else "Passed"
+                    if obs["passed"]
+                    else "Failed"
+                )
+                body += (
+                    f"<tr><td>{obs['step']} / {obs['attempt']}</td><td>{escape(obs['name'])}</td>"
+                    f"<td>{escape(base['commit'][:12])}</td><td>{sum(s['passed'] for s in samples)} / {len(samples)}</td><td>{verdict}</td></tr>"
+                )
+            body += "</tbody></table></div>"
     if include_images:
         body += '<h2>Verified screenshots</h2>'
         seen, total = set(), 0

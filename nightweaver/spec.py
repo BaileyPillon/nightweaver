@@ -139,7 +139,7 @@ def artifact(value):
 
 
 def gate_spec(item):
-    fields(item, "name argv timeout artifacts kind browser catalog junit max_artifact_bytes pinned_inputs stability_runs", "gate")
+    fields(item, "name argv timeout artifacts kind browser catalog junit proof max_artifact_bytes pinned_inputs stability_runs", "gate")
     timeout = item.get("timeout", 120)
     if type(timeout) is not int or not 1 <= timeout <= 7200:
         raise ValueError("Gate timeout must be between 1 and 7200 seconds")
@@ -149,6 +149,11 @@ def gate_spec(item):
     result = {"name": text(item, "name"), "timeout": timeout, "artifacts": artifacts,
               "max_artifact_bytes": integer(item.get("max_artifact_bytes", 32 * 1024 * 1024), "max_artifact_bytes", 1, 256 * 1024 * 1024)}
     kind = item.get("kind", "command")
+    if "proof" in item:
+        from .proof import proof_contract
+        if kind != "command" or "junit" not in item:
+            raise ValueError("A proof requires a JUnit command gate")
+        result["proof"] = proof_contract(item["proof"])
     if "junit" in item:
         from .junit import contract
         if kind != "command":

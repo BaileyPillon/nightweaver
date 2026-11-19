@@ -173,14 +173,17 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
             git(repo, "clone", "--local", "--no-hardlinks", "--no-checkout", "--", str(repo), str(copy))
             git(copy, "checkout", "--detach", event["commit"])
             tree = git(copy, "rev-parse", "HEAD^{tree}")
+            baseline = row["spec"].get("proof_base", row["state"]["base"]) if "proof" in gate else row["state"]["base"]
             record = run_gate(gate, copy, evidence_folder(evidence, idx), tree,
-                              **({"baseline": row["state"]["base"]} if gate.get("kind") == "catalog" else {}),
+                              **({"baseline": baseline} if gate.get("kind") == "catalog" or "proof" in gate else {}),
                               max_log_bytes=row["spec"].get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024))
             if Path(record["log"]).is_file():
                 with Path(record["log"]).open("rb") as stream:
                     record["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
             git(copy, "add", "-A", "--", ".")
             changed = git(copy, "write-tree") != tree or git(copy, "rev-parse", "HEAD") != event["commit"]
+            if changed and "proof" in record:
+                record["proof"]["passed"] = False
             report["gates"].append({**record, "gate": gate["name"], "repeat": sample,
                                     "scheduled_milestones": origins[contract_hash(gate)],
                                     "changed_source": changed, "passed": observed_pass(record) is True and not changed})
