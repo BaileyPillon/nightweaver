@@ -129,13 +129,18 @@ def catalog_history(store, run_id):
                 "added_ids": result.get("added_ids"),
                 "removed_ids": result.get("removed_ids"),
                 "violations": result.get("violations", {}),
+                "changed_records": result.get("changed_records"),
+                "unchanged_records": result.get("unchanged_records"),
+                "examples": result.get("examples", []),
+                "omitted_examples": result.get("omitted_examples"),
+                "error": detail.get("artifact_error") or detail.get("source_error") or result.get("diagnostic"),
             }
         )
-    return {"run_id": run_id, "observations": observations}
+    return {"run_id": run_id, "observations": observations, "model_calls": 0}
 
 
-def inspect_catalog(spec, milestone, name, revision):
-    from .catalog import check_catalog
+def inspect_catalog(spec, milestone, name, revision, before=None, profile_fields=None):
+    from .catalog import check_catalog, field_profile, object_data
     from .engine import git
 
     if not 1 <= milestone <= len(spec["milestones"]):
@@ -148,10 +153,16 @@ def inspect_catalog(spec, milestone, name, revision):
     if not gates:
         raise ValueError("No matching catalog checks in the selected milestone")
     repo = spec["repository"]
-    base = git(
-        repo, "rev-parse", "--verify", "--end-of-options", spec.get("expected_base", "HEAD") + "^{commit}"
-    )
     tree = git(repo, "rev-parse", "--verify", "--end-of-options", revision + "^{tree}")
+    if profile_fields is not None:
+        profiles = []
+        for gate in gates:
+            records = object_data(repo, tree, gate["catalog"])
+            profiles.append({"gate": gate["name"], "records": len(records), "fields": field_profile(records, profile_fields)})
+        return {"tree": tree, "profiles": profiles, "model_calls": 0}
+    base = git(
+        repo, "rev-parse", "--verify", "--end-of-options", (before or spec.get("expected_base", "HEAD")) + "^{commit}"
+    )
     results = [{"gate": g["name"], **check_catalog(repo, base, tree, g["catalog"])} for g in gates]
     return {
         "base": base,

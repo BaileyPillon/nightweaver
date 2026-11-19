@@ -194,6 +194,17 @@ def run_report(store, run_id, output, include_images=False):
                     f"<td>{escape(base['commit'][:12])}</td><td>{sum(s['passed'] for s in samples)} / {len(samples)}</td><td>{verdict}</td></tr>"
                 )
             body += "</tbody></table></div>"
+    from .contracts import catalog_history
+    catalog_rows = catalog_history(store, run_id)["observations"]
+    if catalog_rows:
+        body += '<h2>Catalog changes by attempt</h2><div class="table"><table><thead><tr><th>Milestone / attempt</th><th>Check</th><th>Verdict</th><th>Added / removed / modified</th><th>Findings</th></tr></thead><tbody>'
+        for obs in catalog_rows:
+            delta = " / ".join(str(obs[k]) if obs[k] is not None else "?" for k in ("added_ids", "removed_ids", "changed_records"))
+            verdict = "Unscored" if obs["passed"] is None else "Passed" if obs["passed"] else "Failed"
+            findings = obs["error"] or ", ".join(f"{k} ({v})" for k,v in obs["violations"].items()) or "None recorded"
+            body += (f"<tr><td>{obs['step']} / {obs['attempt']}</td><td>{escape(redact(obs['gate']))}</td>"
+                     f"<td>{verdict}</td><td>{delta}</td><td>{escape(redact(findings))}</td></tr>")
+        body += '</tbody></table></div>'
     if include_images:
         body += '<h2>Verified screenshots</h2>'
         seen, total = set(), 0

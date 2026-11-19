@@ -38,6 +38,7 @@ def preflight(store, spec):
     browsers, baselines, verified_pins = set(), set(), set()
     from .journeys import browser_cases
     browser_work = []
+    catalog_cache, catalog_baselines = {}, []
     for number,milestone in enumerate(spec["milestones"],1):
         for gate in milestone["gates"]:
             try:
@@ -48,9 +49,17 @@ def preflight(store, spec):
                     errors.append(str(error))
             if gate.get("kind") == "catalog":
                 from .catalog import check_catalog
-                result = check_catalog(repository, base, base, gate["catalog"])
+                digest = contract_hash(gate["catalog"])
+                if digest not in catalog_cache:
+                    catalog_cache[digest] = check_catalog(repository, base, base, gate["catalog"])
+                result = catalog_cache[digest]
+                catalog_baselines.append({"milestone": number, "gate": gate["name"], "commit": base,
+                                         "records": result["baseline_records"], "violations": result["violations"],
+                                         "input_error": result.get("input_error")})
                 if result.get("input_error"):
-                    errors.append(f"{gate['name']}: {result['input_error']}")
+                    message = f"{gate['name']}: {result['input_error']}"
+                    if message not in errors:
+                        errors.append(message)
                 continue
             if gate.get("kind") != "browser":
                 program = gate["argv"][0]
@@ -111,7 +120,7 @@ def preflight(store, spec):
             errors.append(f"Unreadable baseline {name}: {error}")
     errors.extend(probe_browser_channels(browsers))
     from .contracts import check_schedule
-    return {**report, "check_schedule": check_schedule(spec), "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+    return {**report, "check_schedule": check_schedule(spec), "catalog_baselines":catalog_baselines, "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
             "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 

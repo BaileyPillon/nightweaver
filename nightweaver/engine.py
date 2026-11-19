@@ -416,6 +416,11 @@ class Run:
                 for observation in failed:
                     if observation.get("junit", {}).get("issues"):
                         message = "\n".join(observation["junit"]["issues"])
+                    elif catalog := observation.get("catalog"):
+                        parts = [catalog["diagnostic"]] if catalog.get("diagnostic") else []
+                        parts.append("Catalog violations " + json.dumps(catalog["violations"], ensure_ascii=True))
+                        parts.extend(json.dumps(ex, ensure_ascii=True) for ex in catalog.get("examples", []))
+                        message = "\n".join(parts)
                     elif observation.get("browser_failures"):
                         message = json.dumps(observation["browser_failures"], ensure_ascii=False)
                     else:

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, source_info
 from .process import BusyRun, run_lock, runner_active
-from .providers import configure_deepseek_key, invoke, json_response
+from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
 from .spec import anchor_provider_paths, fields, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
@@ -139,7 +139,17 @@ def plan_goal(store, args):
     else:
         config = planner_route(args)
         log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
-        code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
+        try:
+            code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
+        except ProviderUnavailable as error:
+            if error.kind != "authentication":
+                raise
+            profile = config.get("profile_dir", "the default profile")
+            raise ValueError(
+                f"{config['kind']} planner authentication failed for {profile} before run creation. "
+                "Rerun the goal with --profile-dir pointing to a signed-in CLI profile, "
+                "or sign in to the selected profile and rerun the goal."
+            ) from error
         if code:
             raise ValueError(f"Planner exited {code}. See {log}")
         response = json_response(answer)
@@ -272,8 +282,15 @@ def main(argv=None):
     catalog = commands.add_parser("catalog-check", help="Check a committed catalog against the plan baseline")
     catalog.add_argument("plan")
     catalog.add_argument("--ref", default="HEAD")
+    catalog.add_argument("--before", help="Override the baseline commit for this comparison")
     catalog.add_argument("--milestone", type=int, default=1)
     catalog.add_argument("--gate")
+    profile = commands.add_parser("catalog-profile", help="Measure field coverage and diversity on a Git revision")
+    profile.add_argument("plan")
+    profile.add_argument("--ref", default="HEAD")
+    profile.add_argument("--milestone", type=int, default=1)
+    profile.add_argument("--gate")
+    profile.add_argument("--field", action="append", required=True, help="JSON Pointer to profile (repeatable)")
     commands.add_parser("catalog-history", help="Trace catalog losses and repairs across attempts").add_argument("id")
     commands.add_parser("check-schedule", help="Preview effective checks, retention and nominal timeouts").add_argument("plan")
     commands.add_parser("test-history", help="Inspect measured JUnit results across attempts").add_argument("id")
@@ -533,7 +550,7 @@ def main(argv=None):
                     },
                 )
             )
-        elif name in ("scope", "plan-lint", "catalog-check", "catalog-history"):
+        elif name in ("scope", "plan-lint", "catalog-check", "catalog-history", "catalog-profile"):
             from .contracts import catalog_history, inspect_catalog, lint_plan, scope_report
             if name == "catalog-history":
                 output(catalog_history(store, args.id))
@@ -546,7 +563,10 @@ def main(argv=None):
                     output(report)
                     return 3 if not report["feasible"] or (args.strict and report["findings"]) else 0
                 else:
-                    report = inspect_catalog(contract,args.milestone,args.gate,args.ref)
+                    if name == "catalog-profile":
+                        output(inspect_catalog(contract, args.milestone, args.gate, args.ref, profile_fields=args.field))
+                        return 0
+                    report = inspect_catalog(contract,args.milestone,args.gate,args.ref,args.before)
                     output(report)
                     if any(item.get("input_error") for item in report["checks"]):
                         return 4

@@ -344,9 +344,13 @@ def ci_summary(store, run_id, output):
     if samples:
         lines.append(f"| Catalog observations passed | {sum(s['passed'] is True for s in samples)} / {len(samples)} |")
         lines.append(f"| Unscored catalog observations | {sum(s['passed'] is None for s in samples)} |")
+        issues = sum(sum(s["violations"].values()) for s in samples if s["passed"] is not None)
+        lines.append(f"| Catalog rule violations across scored attempts | {issues} |")
         for sample in reversed(samples):
             if sample["candidate_records"] is not None:
                 lines.append(f"| Last measured catalog, baseline / candidate records | {sample['baseline_records']} / {sample['candidate_records']} |")
+                if sample["changed_records"] is not None:
+                    lines.append(f"| Last measured catalog, modified / unchanged matched records | {sample['changed_records']} / {sample['unchanged_records']} |")
                 break
     atomic_write(output, "\n".join(lines) + "\n")
     return {"run_id": run_id, "outcome": m["outcome"], "output": str(output.resolve())}

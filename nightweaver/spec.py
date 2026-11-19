@@ -10,7 +10,7 @@ IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
 REVIEWERS = IMPLEMENTERS
 
 
-def strict_json(data):
+def strict_json(data, *, parse_float=None):
     def unique(pairs):
         obj = {}
         for key, value in pairs:
@@ -29,7 +29,7 @@ def strict_json(data):
         return number
 
     try:
-        return json.loads(data, object_pairs_hook=unique, parse_constant=invalid, parse_float=finite)
+        return json.loads(data, object_pairs_hook=unique, parse_constant=invalid, parse_float=parse_float or finite)
     except RecursionError as error:
         raise ValueError("JSON nesting exceeds the supported depth") from error
 

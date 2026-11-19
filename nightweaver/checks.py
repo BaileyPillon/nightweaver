@@ -421,24 +421,24 @@ def _single_gate(check, path, folder, tree, *, baseline=None, **process_options)
                 raise ValueError(f"JUnit verification unavailable: {error}") from error
         if catalog:
             try:
+                if catalog_file.is_symlink() or not catalog_file.is_file() or catalog_file.resolve().parent != folder.resolve():
+                    raise ValueError("Missing regular catalog receipt in this gate's evidence folder")
                 if catalog_file.stat().st_size > max_bytes:
                     raise ValueError("Catalog receipt exceeds the gate artifact limit")
                 data = catalog_file.read_bytes()
                 if len(data) > max_bytes:
                     raise ValueError("Catalog receipt exceeds the gate artifact limit")
                 from .spec import strict_json
+                from .catalog import validate_receipt
                 report = strict_json(data)
-                if not isinstance(report, dict):
-                    raise ValueError("Expected a catalog receipt object")
-                if report.get("input_error"):
-                    raise InputDrift(report["input_error"])
-                if (report.get("schema") != "nightweaver.catalog.v1" or report.get("base") != baseline
-                        or report.get("tree") != tree or type(report.get("passed")) is not bool
-                        or receipt["exit"] != int(not report["passed"])):
-                    raise ValueError("Catalog verdict does not match the expected objects and exit status")
+                validate_receipt(report, baseline, tree, receipt["exit"])
                 receipt["catalog"] = report
                 receipt["artifacts"].append({"path": str(catalog_file), "name": catalog_file.name,
                                              "sha256": sha256(data).hexdigest()})
+                if report.get("input_error"):
+                    raise InputDrift(report["input_error"])
+            except InputDrift:
+                raise
             except (ValueError, OSError) as error:
                 receipt["execution_error"] = True
                 raise ValueError(f"Catalog verification unavailable: {error}") from error

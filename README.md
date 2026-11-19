@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.16 lets agents enrich a prompt catalog while preserving the tags people search for. Compare catalog revisions, profile a field, and enforce compound uniqueness, deletion budgets and tag retention during a OneShot. See the [30 ranked changes and the 1,493-prompt Afterimage trial](docs/v0.16-research.md).
+
 Version 0.15 can require a named test to fail for a specified reason on the original Git commit and pass on the candidate, while a known-good control passes on both. Use `check-baseline` before a model call or `compare-revisions` on two existing commits. Read the [30 ranked changes, research sources, Windows trial and proof example](docs/v0.15-research.md).
 
 Version 0.14 lets a OneShot carry earlier checks into later milestones and grade individual JUnit test results. On a Windows watchlist fixture, it caught a later change that broke an accepted feature even though the test command exited zero. See the [30 ranked changes, research sources, Windows trials and plan example](docs/v0.14-research.md).
