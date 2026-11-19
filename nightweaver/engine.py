@@ -7,12 +7,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
-from tempfile import mkdtemp
 import time
 
-from .process import BusyRun, PausedRun, execute, run_lock
+from .process import BusyRun, PausedRun, run_lock
 from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, usage
+from .checks import contract_hash, evidence_folder, run_gate
+from .insights import budget_status, failure_excerpt
 from . import context
 from .safety import atomic_write, redact, write_json
 from .store import timestamp
@@ -86,7 +86,7 @@ def fork_run(store, run_id, milestone, worker=None):
     if not remaining:
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]
-    spec = {**original["spec"], "milestones": remaining, "title": original["spec"]["title"] + " (fork)"}
+    spec = {**original["spec"], "expected_base": base, "milestones": remaining, "title": original["spec"]["title"] + " (fork)"}
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
     pack = context.capture(spec, base)
@@ -268,8 +268,10 @@ class Run:
             "to hide failures, or touch another worktree. Return a concise summary and stop. "
             "The controller independently runs these exact checks and decides whether to advance.\n"
             f"{checks}\n\n{context.brief(self.store, self.id)}\n\n"
+            f"Budget remaining before this call: {budget_status(self.spec, state)['remaining']}\n"
             f"Operator updates\n{self.store.feedback_text(self.id) or 'None'}\n\n"
-            f"Last observed failure (if any)\n{state['last_error'] or 'None'}"
+            f"Last observed failure (if any)\n{state['last_error'] or 'None'}\n"
+            f"Previous diagnostic log: {state.get('log') if state.get('last_error') else 'None'}"
         )
 
     def acceptance_brief(self):
@@ -305,56 +307,28 @@ class Run:
         evidence = self.evidence_dir(state)
         outputs = []
         for index, check in enumerate(step["gates"], 1):
-            log = evidence / f"gate-{index:02d}.log"
-            before = {name: artifact_stamp(path, name) for name in check["artifacts"]}
-            self.set("gate_started", {"name": check["name"], "tree": snapshot}, log=str(log))
-            env = {**os.environ, "NIGHTWEAVER_EVIDENCE": str(evidence), "NIGHTWEAVER_TREE": snapshot,
-                   "ROOKLINE_EVIDENCE": str(evidence), "ROOKLINE_TREE": snapshot}
-            browser_output = evidence / f"gate-{index:02d}" / "browser"
-            argv = check.get("argv")
-            if check.get("kind") == "browser":
-                # A crash can restart this gate in the same attempt. Keep each capture distinct.
-                if browser_output.exists():
-                    browser_output = Path(mkdtemp(prefix="browser-replay-", dir=browser_output.parent))
-                config_path = evidence / f"gate-{index:02d}.browser.json"
-                write_json(config_path, check["browser"])
-                argv = [sys.executable, str(Path(__file__).with_name("browser.py")), "--config-file",
-                        str(config_path), "--output", str(browser_output)]
-            gate_started = time.monotonic()
-            code = execute(argv, path, log, check["timeout"], env=env, paused=self.paused,
-                           max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
-                           heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
-            contract = json.dumps(check, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            receipt = {"name": check["name"], "exit": code, "log": str(log), "tree": snapshot,
-                       "contract_sha256": hashlib.sha256(contract).hexdigest(),
-                       "duration_ms": round((time.monotonic() - gate_started) * 1000)}
-            try:
-                receipt["artifacts"] = preserve_artifacts(path, evidence / f"gate-{index:02d}", check["artifacts"], before,
-                                                           check.get("max_artifact_bytes", 32 * 1024 * 1024))
-                if check.get("kind") == "browser":
-                    for file in sorted(browser_output.iterdir()):
-                        if not file.is_file() or file.is_symlink() or file.stat().st_size > check["max_artifact_bytes"]:
-                            raise ValueError(f"Invalid or oversized browser evidence: {file.name}")
-                        with file.open("rb") as stream:
-                            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                        receipt["artifacts"].append({"name": file.name, "path": str(file), "sha256": digest})
-                    report = json.loads((browser_output / "browser.json").read_text(encoding="utf-8"))
-                    failures = [{"viewport": view.get("viewport"), "stage": view.get("failed_at"),
-                                 "error": next(iter(view.get("errors") or []), "")[:600]}
-                                for view in report.get("viewports", []) if not view.get("passed")]
-                    if failures:
-                        receipt["browser_failures"] = failures
-                    if code == 0 and report.get("passed") is not True:
-                        raise ValueError("Browser returned no passing receipt")
-            except (OSError, ValueError) as error:
-                receipt["artifact_error"] = str(error)
+            folder = evidence_folder(evidence, index)
+            log = folder / "gate.log"
+            location = {"step": state["step"] + 1, "attempt": state["attempt"], "gate_index": index}
+            self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
+                     "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
+            receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
+                               max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
+                               heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
+            receipt.update(location)
+            code = receipt["exit"]
+            if receipt.get("artifact_error"):
                 self.set("gate_finished", receipt)
-                self.reject(f"{check['name']} exited {code} and could not collect its required evidence: {error}\n{tail(log)}", "artifact")
+                if receipt.get("input_error") or receipt.get("execution_error"):
+                    self.set("blocked", {"during": "checking", "issue": receipt["artifact_error"]},
+                             phase="blocked", blocked_from="checking", last_error=receipt["artifact_error"])
+                    return
+                self.reject(f"{check['name']} exited {code} and could not collect its required evidence: {receipt['artifact_error']}\n{failure_excerpt(log)}", "artifact")
                 return
             self.set("gate_finished", receipt)
             if code:
                 diagnostic = (json.dumps(receipt["browser_failures"], ensure_ascii=False)
-                              if receipt.get("browser_failures") else tail(log))
+                              if receipt.get("browser_failures") else failure_excerpt(log))
                 self.reject(f"{check['name']} exited {code}\n{diagnostic}", "check")
                 return
             outputs.append(receipt)
@@ -376,7 +350,7 @@ class Run:
         checks = (evidence / "checks.json").read_text(encoding="utf-8")
         diff = git(path, "diff", "--cached", "--stat", state["accepted"])
         decision = (f"Goal: {self.spec['objective']}\n{self.acceptance_brief()}"
-                    f"Task: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}\n"
+                    f"Budget remaining before review: {budget_status(self.spec, state)['remaining']}\nTask: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}\n"
                     f"{context.brief(self.store, self.id)}\nOperator updates\n{self.store.feedback_text(self.id) or 'None'}")
         if self.spec.get("reviewer"):
             log = evidence / f"review-{state.get('provider_calls', 0) + 1:04d}.jsonl"

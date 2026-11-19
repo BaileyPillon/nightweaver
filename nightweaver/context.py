@@ -15,17 +15,21 @@ def capture(spec, base):
         size = int(git(repository, "cat-file", "-s", reference))
         if size > 16000 or size > remaining:
             raise ValueError(f"Context file exceeds the 16KB per-file / 48KB pack budget: {name}")
-        mode = git(repository, "ls-tree", base, "--", name).split(" ", 1)[0]
+        mode = git(repository, "--literal-pathspecs", "ls-tree", base, "--", name).split(" ", 1)[0]
         if mode not in ("100644", "100755"):
             raise ValueError(f"Context must be a regular committed file: {name}")
         raw = git_bytes(repository, "cat-file", "blob", reference)
         if b"\x00" in raw:
             raise ValueError(f"Context must be text: {name}")
-        content = raw.decode("utf-8", "replace")
+        try:
+            content = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"Context must be UTF-8 text: {name}") from error
         digest = hashlib.sha256(raw).hexdigest()
         files.append({"path": name, "sha256": digest, "content": redact(content)})
         remaining -= size
-    names = git(repository, "ls-tree", "-r", "--name-only", base).splitlines() if spec.get("repository_map") else []
+    names = git(repository, "ls-tree", "-r", "--name-only", "-z", base).rstrip("\0").split("\0") if spec.get("repository_map") else []
+    names = [name for name in names if name]
     return {"base": base, "files": files, "repository_map": names[:240], "map_total_files": len(names)}
 
 

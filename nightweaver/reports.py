@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from .safety import atomic_write, redact
+from .insights import provider_totals
 
 
 def recovery_metrics(events):
@@ -84,6 +85,7 @@ def metrics(store, run_id):
             outcome = "execution_blocked"
     return {
         **recovery_metrics(events),
+        "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
@@ -133,6 +135,9 @@ def run_report(store, run_id, output, include_images=False):
             value = f"{value['name']} ({value['duration_ms']:,} ms)"
         elif key == "mixed_gate_results":
             value = ", ".join(f"{g['name']} at {g['tree'][:12]}" for g in value) or "None observed"
+        elif key == "provider_usage":
+            value = " · ".join(f"{r['role']} / {r['provider']} ({r['model'] or 'default'}), "
+                               f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
         body += f'<tr><th scope="row">{escape(key.replace("_", " ").capitalize())}</th><td>{escape(str(value) if value is not None else "Unavailable")}</td></tr>'
     body += '</tbody></table></div>'
     if include_images:

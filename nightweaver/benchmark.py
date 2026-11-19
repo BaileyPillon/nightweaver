@@ -5,7 +5,7 @@ from hashlib import sha256
 from collections import Counter
 from html import escape
 import json
-from math import comb
+from math import comb, sqrt
 from pathlib import Path
 import random
 from statistics import median
@@ -147,6 +147,48 @@ def read_suite(store, suite_id):
     return json.loads((store.root / "benchmarks" / f"{suite_id}.json").read_text(encoding="utf-8"))
 
 
+def scored(row):
+    return row["phase"] in ("done", "blocked") and row["outcome"] not in INCONCLUSIVE
+
+
+def wilson_interval(successes, total):
+    if not total:
+        return None
+    z = 1.959963984540054
+    p = successes / total
+    scale = 1 + z*z / total
+    midpoint = (p + z*z/(2*total)) / scale
+    margin = z * sqrt(p*(1-p)/total + z*z/(4*total*total)) / scale
+    return [max(0, midpoint-margin), min(1, midpoint+margin)]
+
+
+def reliability(runs, k):
+    if type(k) is not int or not 1 <= k <= 20:
+        raise ValueError("k must be between 1 and 20")
+    groups = {}
+    for row in runs:
+        key = row["contender"], row["task"], row["baseline"], row.get("contract_sha256"), row.get("route_sha256")
+        groups.setdefault(key, []).append(row)
+    results = []
+    for (name, task, base, contract, route), rows in groups.items():
+        valid = [r for r in rows if scored(r)]
+        n, c = len(valid), sum(r["accepted"] for r in valid)
+        den = comb(n, k) if n >= k and contract and route else 0
+        results.append({"contender":name, "task":task, "base":base, "contract_sha256":contract, "route_sha256":route,
+                        "scored":n, "accepted":c, "excluded":len(rows)-n, "k":k,
+                        "pass_at_k":1 - comb(n-c,k)/den if den else None, "pass_all_k":comb(c,k)/den if den else None})
+    return results
+
+
+def select_trials(rows, task=None, contender=None, repeat=None):
+    selected = [r for r in rows if (task is None or r["task"] == task)
+                and (contender is None or r["contender"] == contender)
+                and (repeat is None or r["repeat"] == repeat)]
+    if not selected:
+        raise ValueError("No registered benchmark trials match the selection")
+    return selected
+
+
 def summarize(runs):
     summaries = []
     for name in sorted({row["contender"] for row in runs}):
@@ -154,7 +196,15 @@ def summarize(runs):
         completed = [row for row in rows if row["phase"] in ("done", "blocked")]
         successes = sum(row["accepted"] for row in rows)
         total_seconds = sum(row["elapsed_seconds"] or 0 for row in rows)
+        valid = [r for r in rows if scored(r)]
+        by_task = {}
+        for r in valid:
+            by_task.setdefault(r["task"], []).append(r["accepted"])
+        scored_passes = sum(r["accepted"] for r in valid)
         summaries.append({"contender": name, "planned": len(rows), "finished": len(completed), "accepted": successes,
+                          "scored_trials": len(valid), "scored_tasks": len(by_task),
+                          "macro_task_acceptance": (sum(sum(v)/len(v) for v in by_task.values())/len(by_task) if by_task else None),
+                          "scored_wilson_95": wilson_interval(scored_passes, len(valid)),
                           "outcomes": dict(Counter(row["outcome"] for row in rows)),
                           "blocked": sum(row["phase"] == "blocked" for row in rows),
                           "unfinished": len(rows) - len(completed),
@@ -215,6 +265,7 @@ def suite_report(store, suite_id, output=None):
               "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. "
               "Unfinished runs are not failures. acceptance_rate uses all planned runs; finished_acceptance_rate uses only done/blocked runs. "
               "These are operational acceptance rates, including account/environment blockers; matched pairs with those blockers are inconclusive. "
+              "Macro task acceptance weights each scored task equally. The descriptive Wilson interval assumes independent trials. "
               "The exploratory exact sign test assumes independent discordant pairs. Repeated tasks may be correlated. "
               "Calls count CLI invocations, not equal model compute. Inspect modes, model versions and usage coverage."}
     result = redact(result)

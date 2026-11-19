@@ -57,6 +57,8 @@ def attention(store):
 
 
 def handoff(store, run_id):
+    from .insights import budget_report
+
     row = store.get(run_id)
     state, spec = row["state"], row["spec"]
     index = state["step"]
@@ -91,6 +93,7 @@ def handoff(store, run_id):
             "provider_issue": state.get("provider_issue"),
             "last_error": state.get("last_error"),
             "operator_feedback": store.feedback_text(run_id),
+            "budget": budget_report(store, run_id),
             "waiting_for": pending_dependencies(store, state),
         }
     )

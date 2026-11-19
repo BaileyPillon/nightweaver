@@ -152,6 +152,8 @@ class Store:
         if after is not None and (type(after) is not int or after < 0):
             raise ValueError("Event cursor must be a nonnegative integer")
         with self.connect() as db:
+            if not db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
+                raise ValueError("Run was not found")
             if after is not None or limit is None:
                 rows = db.execute("SELECT * FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?",
                                   (run_id, after or 0, limit or -1)).fetchall()
@@ -178,9 +180,18 @@ class Store:
 
     def feedback_text(self, run_id):
         with self.connect() as db:
-            rows = db.execute("SELECT time,details FROM events WHERE run_id=? AND kind='operator_feedback' ORDER BY seq DESC LIMIT 12",
+            rows = db.execute("SELECT time,details FROM events WHERE run_id=? AND kind='operator_feedback' ORDER BY seq DESC LIMIT 13",
                               (run_id,)).fetchall()
-        return "\n".join(f"{row['time']}: {json.loads(row['details'])['message']}" for row in reversed(rows))[-24000:]
+        selected, size = [], 0
+        for row in rows[:12]:
+            message = f"{row['time']}: {json.loads(row['details'])['message']}"
+            if size + len(message) + 1 > 23900:
+                break
+            selected.append(message)
+            size += len(message) + 1
+        if len(rows) > len(selected):
+            selected.append("[Earlier operator updates are available in the run events.]")
+        return "\n".join(reversed(selected))
 
     def accepted_milestones(self, run_id):
         with self.connect() as db:

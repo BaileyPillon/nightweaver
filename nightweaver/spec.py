@@ -89,7 +89,7 @@ def artifact(value):
 
 
 def gate_spec(item):
-    fields(item, "name argv timeout artifacts kind browser max_artifact_bytes", "gate")
+    fields(item, "name argv timeout artifacts kind browser max_artifact_bytes pinned_inputs", "gate")
     timeout = item.get("timeout", 120)
     if type(timeout) is not int or not 1 <= timeout <= 7200:
         raise ValueError("Gate timeout must be between 1 and 7200 seconds")
@@ -99,6 +99,18 @@ def gate_spec(item):
     result = {"name": text(item, "name"), "timeout": timeout, "artifacts": artifacts,
               "max_artifact_bytes": integer(item.get("max_artifact_bytes", 32 * 1024 * 1024), "max_artifact_bytes", 1, 256 * 1024 * 1024)}
     kind = item.get("kind", "command")
+    pins = {}
+    for entry in array(item.get("pinned_inputs", []), "pinned inputs", 32):
+        fields(entry, "path sha256", "pinned input")
+        name = text(entry, "path")
+        digest = text(entry, "sha256").lower()
+        if not Path(name).is_absolute():
+            name = artifact(name)
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or name.casefold() in pins:
+            raise ValueError("Pinned inputs require distinct file paths and SHA-256 digests")
+        pins[name.casefold()] = {"path": name, "sha256": digest}
+    if pins:
+        result["pinned_inputs"] = list(pins.values())
     if kind == "browser":
         from .browser import validate_browser
         if "argv" in item or artifacts:

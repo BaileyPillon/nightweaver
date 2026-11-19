@@ -3,17 +3,16 @@
 from contextlib import closing
 import hashlib
 from io import BytesIO
-import json
 import os
+import shutil
 from pathlib import Path
 import sqlite3
-import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from uuid import uuid4
 
 from . import context
+from .checks import evidence_folder, run_gate, verify_inputs
 from .engine import common_dir, git, git_bytes
-from .process import execute
 from .readiness import diagnose
 from .safety import write_json
 from .spec import artifact
@@ -25,12 +24,34 @@ def preflight(store, spec):
     repository = Path(spec["repository"])
     pack = context.capture(spec, base)
     report["context"] = [{"path": f["path"], "sha256": f["sha256"]} for f in pack["files"]]
+    errors = []
     for identity in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
-        git(repository, "var", identity)
+        try:
+            git(repository, "var", identity)
+        except ValueError as error:
+            errors.append(f"{identity}: {error}")
+    executables = {}
     browsers, baselines = set(), set()
     for milestone in spec["milestones"]:
         for gate in milestone["gates"]:
+            try:
+                verify_inputs(gate, repository, base=base)
+            except (OSError, ValueError) as error:
+                if str(error) not in errors:
+                    errors.append(str(error))
             if gate.get("kind") != "browser":
+                program = gate["argv"][0]
+                if program not in executables:
+                    path = Path(program)
+                    if not path.is_absolute() and (path.parent != Path(".") or "/" in program or "\\" in program):
+                        available = "candidate_relative"
+                    elif not path.is_absolute() and (repository / path).is_file():
+                        available = "candidate_relative"
+                    else:
+                        available = "available" if shutil.which(program) else "missing"
+                    executables[program] = available
+                    if available == "missing":
+                        errors.append(f"Missing gate executable: {program}")
                 continue
             config = gate["browser"]
             browsers.add(config.get("channel", "bundled"))
@@ -38,7 +59,6 @@ def preflight(store, spec):
                 if step["action"] == "visual_match":
                     contract = step["value"]
                     baselines.add((artifact(contract["baseline"]), contract["sha256"]))
-    errors = []
     image_reader = None
     if baselines:
         try:
@@ -85,11 +105,17 @@ def preflight(store, spec):
                     browser.close()
         except Exception as error:
             errors.append(f"{channel}: {error}")
-    return {**report, "browser_channels": sorted(browsers), "errors": errors, "model_calls": 0,
+    return {**report, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
 
 def replay_browser(store, run_id, number=None, gate_name=None):
+    return replay_checks(store, run_id, number, gate_name, browser_only=True)
+
+
+def replay_checks(store, run_id, number=None, gate_name=None, repeat=1, *, browser_only=False):
+    if type(repeat) is not int or not 1 <= repeat <= 20:
+        raise ValueError("Replay repetitions must be between 1 and 20")
     row = store.get(run_id)
     accepted = store.accepted_milestones(run_id)
     number = number if number is not None else max((item["step"] for item in accepted), default=0)
@@ -97,9 +123,9 @@ def replay_browser(store, run_id, number=None, gate_name=None):
     if not event:
         raise ValueError("Select a milestone accepted by this run")
     gates = [g for g in row["spec"]["milestones"][number - 1]["gates"]
-             if g.get("kind") == "browser" and (gate_name is None or gate_name == g["name"])]
+             if (not browser_only or g.get("kind") == "browser") and (gate_name is None or gate_name == g["name"])]
     if not gates:
-        raise ValueError("No matching browser gate for that milestone")
+        raise ValueError("No matching gate for that milestone")
     repo = Path(row["spec"]["repository"])
     if common_dir(repo) != Path(row["spec"]["git_common_dir"]):
         raise ValueError("Registered repository identity changed")
@@ -107,19 +133,25 @@ def replay_browser(store, run_id, number=None, gate_name=None):
     evidence.mkdir(parents=True)
     report = {"run_id": run_id, "milestone": number, "commit": event["commit"], "evidence": str(evidence), "gates": []}
     with TemporaryDirectory(prefix="nw-replay-") as temp:
-        for idx, gate in enumerate(gates, 1):
+        for idx, gate in enumerate(gates * repeat, 1):
             # Each server may write into its working directory. Give every gate its own checkout.
             copy = Path(temp) / str(idx)
             git(repo, "clone", "--local", "--no-hardlinks", "--no-checkout", "--", str(repo), str(copy))
             git(copy, "checkout", "--detach", event["commit"])
-            config_path = evidence / f"{idx}.config.json"
-            write_json(config_path, gate["browser"])
-            out = evidence / str(idx)
-            code = execute([sys.executable, str(Path(__file__).with_name("browser.py")), "--config-file",
-                            str(config_path), "--output", str(out)], copy, evidence / f"{idx}.log", gate["timeout"])
-            receipt = out / "browser.json"
-            passed = code == 0 and receipt.is_file() and json.loads(receipt.read_text("utf-8")).get("passed") is True
-            report["gates"].append({"gate": gate["name"], "passed": passed, "exit": code, "receipt": str(receipt)})
+            tree = git(copy, "rev-parse", "HEAD^{tree}")
+            record = run_gate(gate, copy, evidence_folder(evidence, idx), tree,
+                              max_log_bytes=row["spec"].get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024))
+            git(copy, "add", "-A", "--", ".")
+            changed = git(copy, "write-tree") != tree or git(copy, "rev-parse", "HEAD") != event["commit"]
+            report["gates"].append({**record, "gate": gate["name"], "repeat": (idx-1)//len(gates)+1,
+                                    "changed_source": changed, "passed": record["exit"] == 0 and
+                                    not record.get("artifact_error") and not changed})
+    report["stability"] = {}
+    for gate in gates:
+        outcomes = [g["passed"] for g in report["gates"] if g["gate"] == gate["name"]]
+        report["stability"][gate["name"]] = ("mixed" if any(outcomes) and not all(outcomes)
+                                            else "all_passed" if all(outcomes) else "all_failed")
+    report["model_calls"] = 0
     report["passed"] = all(g["passed"] for g in report["gates"])
     write_json(evidence / "replay.json", report)
     return report

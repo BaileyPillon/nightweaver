@@ -201,6 +201,7 @@ def usage(path, kind):
     """Reported usage only. Missing telemetry stays unknown, never zero cost."""
     total = 0
     seen = False
+    channels = {}
     for event in json_events(path):
         values = None
         if kind == "codex" and event.get("type") == "turn.completed":
@@ -213,20 +214,29 @@ def usage(path, kind):
                 values = stats
         if not isinstance(values, dict):
             continue
+        names = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+                 "cached_input_tokens", "cached", "input", "output")
+        reported = {k: values[k] for k in names if type(values.get(k)) is int}
+        if any(n < 0 for n in reported.values()):
+            continue
         if type(values.get("total_tokens")) is int:
             count = values["total_tokens"]
         else:
             keys = ("input_tokens", "output_tokens")
             if kind in ("claude", "deepseek"):
                 keys += ("cache_creation_input_tokens", "cache_read_input_tokens")
-            available = [values[k] for k in keys if type(values.get(k)) is int]
+            if kind == "gemini" and not any(k in reported for k in keys):
+                keys = ("input", "output")
+            available = [reported[k] for k in keys if k in reported]
             if not available:
                 continue
             count = sum(available)
         if count >= 0:
             total += count
             seen = True
-    return {"observed_tokens": total if seen else None, "billing": "not_measured"}
+            for key, value in reported.items():
+                channels[key] = channels.get(key, 0) + value
+    return {"observed_tokens": total if seen else None, "token_channels": channels, "billing": "not_measured"}
 
 
 def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None):

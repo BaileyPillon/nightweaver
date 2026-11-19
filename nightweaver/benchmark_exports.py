@@ -1,6 +1,8 @@
 """Matched benchmark history and CI output built from the same run measurements."""
 
 import re
+import csv
+from io import StringIO
 from collections import Counter
 from statistics import median
 from xml.etree import ElementTree as ET
@@ -26,6 +28,8 @@ def compare_suites(store, before_id, after_id):
             status = "unmatched"
         elif not left.get("contract_sha256") or not right.get("contract_sha256"):
             status = "unknown_contract"
+        elif any(not row.get(k) for row in (left, right) for k in ("baseline", "mode", "route_sha256")):
+            status = "unknown_inputs"
         elif any(
             left.get(field) != right.get(field)
             for field in ("baseline", "contract_sha256", "mode", "route_sha256")
@@ -69,6 +73,21 @@ def compare_suites(store, before_id, after_id):
 
 def xml_text(value):
     return re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "�", str(value))
+
+
+def export_csv(store, suite_id, output):
+    report = suite_report(store, suite_id)
+    keys = ("run_id", "task", "contender", "repeat", "baseline", "contract_sha256", "route_sha256", "mode",
+            "phase", "outcome", "accepted", "provider_calls", "observed_tokens", "usage_unknown_calls", "elapsed_seconds")
+    stream = StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(keys)
+    for trial in report["runs"]:
+        values = [trial.get(k) for k in keys]
+        writer.writerow(["'" + v if isinstance(v, str) and
+                         (v.startswith(("\t", "\r", "\n")) or v.lstrip().startswith(("=", "+", "-", "@"))) else v for v in values])
+    atomic_write(output, stream.getvalue().encode("utf-8-sig"))
+    return {"benchmark_id": suite_id, "file": str(output.resolve()), "trials": len(report["runs"])}
 
 
 def export_junit(store, suite_id, output):

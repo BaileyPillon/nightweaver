@@ -27,9 +27,9 @@ def with_live_status(store, row):
     lock = store.directory(row["id"]) / "runner.lock"
     ref = row["state"].get("result_ref", f"refs/heads/rookline/{row['id']}")
     waiting = pending_dependencies(store, row["state"])
-    return {**row, "runner_active": runner_active(lock), "result_branch": ref.removeprefix("refs/heads/"),
+    return redact({**row, "runner_active": runner_active(lock), "result_branch": ref.removeprefix("refs/heads/"),
             "waiting_for": waiting,
-            "blocked_prerequisites": [item for item in waiting if store.get(item)["state"]["phase"] == "blocked"]}
+            "blocked_prerequisites": [item for item in waiting if store.get(item)["state"]["phase"] == "blocked"]})
 
 
 def dispatch(store, watch):
@@ -184,10 +184,21 @@ def main(argv=None):
             parser.add_argument("--follow", action="store_true", help="Stream new events as JSON lines until the run stops")
     pre = commands.add_parser("preflight", help="Validate committed context, routes, identity and browser runtime")
     pre.add_argument("plan")
-    replay = commands.add_parser("replay-browser", help="Recheck an accepted milestone in a private checkout")
-    replay.add_argument("id")
-    replay.add_argument("--milestone", type=int)
-    replay.add_argument("--gate")
+    for action in ("replay-browser", "replay-checks"):
+        replay = commands.add_parser(action, help="Recheck an accepted milestone in a private checkout")
+        replay.add_argument("id")
+        replay.add_argument("--milestone", type=int)
+        replay.add_argument("--gate")
+        if action == "replay-checks":
+            replay.add_argument("--repeat", type=int, default=1)
+    for action, help_text in (("diagnose-run", "Locate recorded failures and their evidence"),
+                              ("gate-stats", "Measure repeated checks by contract"),
+                              ("budget", "Show remaining time, calls and observed-token allowance"),
+                              ("trace", "Export a metadata-only JSONL trajectory")):
+        inspect = commands.add_parser(action, help=help_text)
+        inspect.add_argument("id")
+        if action == "trace":
+            inspect.add_argument("--output", type=Path, required=True)
     backup = commands.add_parser("db-backup", help="Snapshot the runtime database to a new file")
     backup.add_argument("output", type=Path)
     integrity = commands.add_parser("db-check", help="Verify the live runtime database or a backup")
@@ -229,6 +240,16 @@ def main(argv=None):
         bench_parser.add_argument("id")
         if action == "report":
             bench_parser.add_argument("--output", type=Path)
+        else:
+            bench_parser.add_argument("--task")
+            bench_parser.add_argument("--contender")
+            bench_parser.add_argument("--repeat", type=int)
+    reliability_cmd = bench_sub.add_parser("reliability", help="Estimate any-pass and all-pass rates over k trials")
+    reliability_cmd.add_argument("id")
+    reliability_cmd.add_argument("--k", type=int, default=2)
+    csv_cmd = bench_sub.add_parser("csv", help="Export one spreadsheet row per trial")
+    csv_cmd.add_argument("id")
+    csv_cmd.add_argument("--output", type=Path, required=True)
     compare = bench_sub.add_parser("compare", help="Compare matching trials from two saved suites")
     compare.add_argument("before")
     compare.add_argument("after")
@@ -258,10 +279,11 @@ def main(argv=None):
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
-        if name in ("preflight", "replay-browser"):
-            from .diagnostics import preflight, replay_browser
+        if name in ("preflight", "replay-browser", "replay-checks"):
+            from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
-                      else replay_browser(store, args.id, args.milestone, args.gate))
+                      else replay_checks(store, args.id, args.milestone, args.gate, getattr(args, "repeat", 1),
+                                         browser_only=name == "replay-browser"))
             output(report)
             return 0 if report.get("ready", report.get("passed")) else 3
         if name == "doctor":
@@ -295,6 +317,16 @@ def main(argv=None):
         elif name == "attention":
             from .operations import attention
             output(attention(store))
+        elif name in ("diagnose-run", "gate-stats", "budget", "trace"):
+            from .insights import budget_report, diagnosis, export_trace, gate_stats
+            if name == "diagnose-run":
+                output(diagnosis(store, args.id))
+            elif name == "gate-stats":
+                output(gate_stats(store.events(args.id, limit=None)))
+            elif name == "budget":
+                output(budget_report(store, args.id))
+            else:
+                output(export_trace(store, args.id, args.output))
         elif name == "handoff":
             from .operations import handoff
             output(handoff(store, args.id))
@@ -326,6 +358,12 @@ def main(argv=None):
                 output(create_suite(store, args.suite, preview=args.benchmark_action == "preview"))
             elif args.benchmark_action == "report":
                 output(suite_report(store, args.id, args.output))
+            elif args.benchmark_action == "reliability":
+                from .benchmark import reliability
+                output(reliability(suite_report(store, args.id)["runs"], args.k))
+            elif args.benchmark_action == "csv":
+                from .benchmark_exports import export_csv
+                output(export_csv(store, args.id, args.output))
             elif args.benchmark_action == "compare":
                 from .benchmark_exports import compare_suites
                 output(compare_suites(store, args.before, args.after))
@@ -334,7 +372,8 @@ def main(argv=None):
                 output(export_junit(store, args.id, args.output))
             else:
                 results = []
-                for row in read_suite(store, args.id)["runs"]:
+                from .benchmark import select_trials
+                for row in select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat):
                     try:
                         phase = Run(store, row["run_id"]).run()
                         results.append({"run_id": row["run_id"], "phase": phase})
