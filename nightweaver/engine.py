@@ -86,6 +86,8 @@ def source_info(store, spec):
 
 def create_run(store, spec, *, enqueue=False, after=()):
     source = source_info(store, spec)
+    if spec.get("git_directory_identity"):
+        verify_registered_repository(spec, Path(source["git_common_dir"]))
     if after and not enqueue:
         raise ValueError("Run dependencies require --enqueue")
     for dependency in after:
@@ -94,8 +96,7 @@ def create_run(store, spec, *, enqueue=False, after=()):
     pack = context.capture(spec, source["base"])
     run_id = store.create({**spec, "git_common_dir": source["git_common_dir"],
                            "git_directory_identity": directory_identity(source["git_common_dir"])}, source["base"],
-                          enqueue=enqueue, after=dict.fromkeys(after))
-    context.save(store, run_id, pack)
+                          enqueue=enqueue, after=dict.fromkeys(after), context_pack=pack)
     return run_id
 
 
@@ -117,8 +118,7 @@ def fork_run(store, run_id, milestone, worker=None):
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
     pack = context.capture(spec, base)
-    new_id = store.create(spec, base)
-    context.save(store, new_id, pack)
+    new_id = store.create(spec, base, context_pack=pack)
     store.transition(new_id, "checkpoint_forked", {"source_run": run_id, "milestone": milestone, "base": base})
     return new_id
 
@@ -132,6 +132,7 @@ def tail(path, count=3600):
 
 
 def tree(path, base, allowed, protected):
+    from .contracts import under
     if git(path, "rev-parse", "HEAD") != base:
         raise ValueError("Worktree HEAD changed. Keep agent edits uncommitted.")
     git(path, "add", "-A", "--", ".")
@@ -139,11 +140,11 @@ def tree(path, base, allowed, protected):
     names = [name for name in names if name]
     if not names:
         raise ValueError("The milestone produced no tracked changes")
-    forbidden = [name for name in names if any(name.casefold() == p.casefold() or name.casefold().startswith(p.casefold() + "/") for p in protected)]
+    forbidden = [name for name in names if under(name, protected)]
     if forbidden:
         raise ValueError("Changes to protected verification files: " + ", ".join(forbidden[:16]))
     if allowed:
-        outside = [name for name in names if not any(name.casefold() == p.casefold() or name.casefold().startswith(p.casefold() + "/") for p in allowed)]
+        outside = [name for name in names if not under(name, allowed)]
         if outside:
             raise ValueError("Changes outside the milestone paths: " + ", ".join(outside[:16]))
     return git(path, "write-tree")
@@ -278,7 +279,10 @@ class Run:
 
     def worker_prompt(self, state, step):
         paths = ", ".join(step["paths"]) or "the repository files needed for this milestone"
-        checks = "\n".join("- " + g["name"] + ": " + json.dumps(g.get("argv", g.get("browser"))) for g in step["gates"])
+        checks = "\n".join("- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in step["gates"])
+        following = self.spec["milestones"][state["step"] + 1:state["step"] + 2]
+        next_task = (f"Next milestone after acceptance: {following[0]['title']} — {following[0]['task'][:800]}"
+                     if following else "This is the final milestone.")
         prior = []
         for item in self.store.accepted_milestones(self.id):
             if item["step"] <= state["step"]:
@@ -291,6 +295,7 @@ class Run:
             f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
+            f"{next_task}\n\n"
             f"Work in this supplied Git worktree. Keep edits within {paths}. "
             f"Protected paths: {', '.join(self.spec.get('protected_paths', [])) or 'none declared'}. "
             "Preserve unrelated behavior. Do not commit, push, merge, edit verification rules "
@@ -422,6 +427,7 @@ class Run:
         self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
                  "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
         receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
+                           **({"baseline": state["base"]} if check.get("kind") == "catalog" else {}),
                            max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
                            heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
         receipt.update(location)
@@ -622,6 +628,8 @@ class Run:
                         project_lock.enter_context(run_lock(gitdir / "nightweaver.lock",
                                                             "Another Nightweaver run owns this Git repository"))
                         self.gitdir = gitdir
+                        if self.spec.get("context_sha256"):
+                            context.load_pack(self.store, self.id)
                         if not (self.root / "context.json").is_file() and (self.spec.get("context_files") or self.spec.get("repository_map")):
                             context.save(self.store, self.id, context.capture(self.spec, state["base"]))
                     if phase == "promoting":

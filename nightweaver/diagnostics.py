@@ -22,23 +22,34 @@ def preflight(store, spec):
     report = diagnose(store, spec)
     base = report["source"]["base"]
     repository = Path(spec["repository"])
-    pack = context.capture(spec, base)
-    report["context"] = [{"path": f["path"], "sha256": f["sha256"]} for f in pack["files"]]
     errors = []
+    try:
+        pack = context.capture(spec, base)
+        report["context"] = [{"path": f["path"], "sha256": f["sha256"]} for f in pack["files"]]
+    except (OSError, ValueError) as error:
+        report["context"] = []
+        errors.append(f"Committed context: {error}")
     for identity in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
         try:
             git(repository, "var", identity)
         except ValueError as error:
             errors.append(f"{identity}: {error}")
     executables = {}
-    browsers, baselines = set(), set()
+    browsers, baselines, verified_pins = set(), set(), set()
     for milestone in spec["milestones"]:
         for gate in milestone["gates"]:
             try:
                 verify_inputs(gate, repository, base=base)
+                verified_pins.update((pin["path"],pin["sha256"]) for pin in gate.get("pinned_inputs", []))
             except (OSError, ValueError) as error:
                 if str(error) not in errors:
                     errors.append(str(error))
+            if gate.get("kind") == "catalog":
+                from .catalog import check_catalog
+                result = check_catalog(repository, base, base, gate["catalog"])
+                if result.get("input_error"):
+                    errors.append(f"{gate['name']}: {result['input_error']}")
+                continue
             if gate.get("kind") != "browser":
                 program = gate["argv"][0]
                 if program not in executables:
@@ -93,6 +104,7 @@ def preflight(store, spec):
             errors.append(f"Unreadable baseline {name}: {error}")
     errors.extend(probe_browser_channels(browsers))
     return {**report, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+            "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
 
@@ -145,7 +157,11 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
             git(copy, "checkout", "--detach", event["commit"])
             tree = git(copy, "rev-parse", "HEAD^{tree}")
             record = run_gate(gate, copy, evidence_folder(evidence, idx), tree,
+                              **({"baseline": row["state"]["base"]} if gate.get("kind") == "catalog" else {}),
                               max_log_bytes=row["spec"].get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024))
+            if Path(record["log"]).is_file():
+                with Path(record["log"]).open("rb") as stream:
+                    record["log_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
             git(copy, "add", "-A", "--", ".")
             changed = git(copy, "write-tree") != tree or git(copy, "rev-parse", "HEAD") != event["commit"]
             report["gates"].append({**record, "gate": gate["name"], "repeat": sample,

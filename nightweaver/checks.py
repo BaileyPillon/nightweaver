@@ -142,7 +142,7 @@ def read_browser_evidence(config, out, receipt, max_bytes):
         receipt["browser_failures"] = failures
 
 
-def run_gate(check, path, folder, tree, **process_options):
+def run_gate(check, path, folder, tree, *, baseline=None, **process_options):
     from .engine import artifact_stamp, preserve_artifacts
 
     log = folder / "gate.log"
@@ -167,6 +167,7 @@ def run_gate(check, path, folder, tree, **process_options):
         verify_inputs(check, path)
         before = {name: artifact_stamp(path, name) for name in check["artifacts"]}
         browser = check.get("kind") == "browser"
+        catalog = check.get("kind") == "catalog"
         if browser:
             config = folder / "config.json"
             out = folder / "browser"
@@ -179,6 +180,12 @@ def run_gate(check, path, folder, tree, **process_options):
                 "--output",
                 str(out),
             ]
+        elif catalog:
+            config = folder / "contract.json"
+            catalog_file = folder / "catalog.json"
+            write_json(config, check["catalog"])
+            argv = [sys.executable, str(Path(__file__).with_name("catalog.py")), "--contract", str(config),
+                    "--base", baseline, "--candidate", tree, "--output", str(catalog_file)]
         else:
             argv = check["argv"]
         try:
@@ -188,6 +195,24 @@ def run_gate(check, path, folder, tree, **process_options):
             raise ValueError(f"Cannot start gate executable: {error}") from error
         verify_inputs(check, path)
         receipt["artifacts"] = preserve_artifacts(path, folder, check["artifacts"], before, max_bytes)
+        if catalog:
+            try:
+                data = catalog_file.read_bytes()
+                if len(data) > max_bytes:
+                    raise ValueError("Catalog receipt exceeds the gate artifact limit")
+                report = json.loads(data)
+                if report.get("input_error"):
+                    raise InputDrift(report["input_error"])
+                if (report.get("schema") != "nightweaver.catalog.v1" or report.get("base") != baseline
+                        or report.get("tree") != tree or type(report.get("passed")) is not bool
+                        or receipt["exit"] != int(not report["passed"])):
+                    raise ValueError("Catalog verdict does not match the expected objects and exit status")
+                receipt["catalog"] = report
+                receipt["artifacts"].append({"path": str(catalog_file), "name": catalog_file.name,
+                                             "sha256": sha256(data).hexdigest()})
+            except (ValueError, OSError) as error:
+                receipt["execution_error"] = True
+                raise ValueError(f"Catalog verification unavailable: {error}") from error
         if browser:
             try:
                 read_browser_evidence(check["browser"], out, receipt, max_bytes)

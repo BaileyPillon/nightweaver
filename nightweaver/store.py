@@ -42,6 +42,7 @@ class Store:
                     time TEXT NOT NULL, kind TEXT NOT NULL, details TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS events_for_run ON events(run_id, seq);
+                CREATE INDEX IF NOT EXISTS events_for_kind ON events(run_id, kind, seq);
                 CREATE TABLE IF NOT EXISTS projects (
                     name TEXT PRIMARY KEY COLLATE NOCASE, repository TEXT NOT NULL,
                     git_common_dir TEXT NOT NULL
@@ -95,7 +96,7 @@ class Store:
                        (name, str(repository), str(gitdir)))
         return self.project(name)
 
-    def create(self, spec, base, *, enqueue=False, after=()):
+    def create(self, spec, base, *, enqueue=False, after=(), context_pack=None):
         run_id = uuid4().hex[:12]
         state = {"phase": "queued", "step": 0, "attempt": 0, "base": base, "accepted": base,
                  "candidate": None, "last_error": "", "log": None,
@@ -103,6 +104,10 @@ class Store:
         if enqueue:
             state.update(dispatch=True, after=list(after))
         self.directory(run_id).mkdir(parents=True)
+        if context_pack is not None:
+            from . import context
+            spec = {**spec, "context_sha256": context.digest(context_pack)}
+            context.save(self, run_id, context_pack)
         with self.connect() as db:
             db.execute("INSERT INTO runs(id,spec,state,updated) VALUES(?,?,?,?)",
                        (run_id, json.dumps(spec), json.dumps(state), timestamp()))

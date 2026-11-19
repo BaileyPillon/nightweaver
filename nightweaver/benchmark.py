@@ -18,7 +18,7 @@ from . import __version__
 from .engine import create_run, git, source_info
 from .reports import document, metrics
 from .safety import atomic_write, redact, write_json
-from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan
+from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan, read_json
 
 
 INCONCLUSIVE = {"provider_blocked", "execution_blocked", "interrupted", "verification_inconsistent"}
@@ -31,7 +31,7 @@ def config_digest(config):
 
 def create_suite(store, source, *, preview=False):
     source = Path(source).resolve(strict=True)
-    raw = json.loads(source.read_text(encoding="utf-8-sig"))
+    raw = read_json(source)
     fields(raw, "name tasks contenders repetitions seed", "benchmark")
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -48,7 +48,7 @@ def create_suite(store, source, *, preview=False):
         if not isinstance(contender.get("name"), str) or not contender["name"].strip() or contender["name"] in contender_names:
             raise ValueError("Contender names must be unique nonempty strings")
         contender_names.add(contender["name"])
-        contender["worker"] = provider(contender.get("worker"), IMPLEMENTERS, "benchmark worker")
+        contender["worker"] = provider(contender.get("worker"), IMPLEMENTERS, "benchmark worker", source.parent)
         mode = contender.get("mode", "nightweaver")
         if mode not in ("nightweaver", "external", "standalone"):
             raise ValueError("Contender mode must be nightweaver, standalone or external")
@@ -58,8 +58,8 @@ def create_suite(store, source, *, preview=False):
                                     or contender.get("reviewer") or contender.get("worker_fallbacks")):
             raise ValueError("Standalone contenders require one native model CLI without reviewer or fallback")
         if contender.get("reviewer"):
-            contender["reviewer"] = provider(contender["reviewer"], IMPLEMENTERS, "benchmark reviewer")
-        contender["worker_fallbacks"] = [provider(route, IMPLEMENTERS, "benchmark fallback") for route in
+            contender["reviewer"] = provider(contender["reviewer"], IMPLEMENTERS, "benchmark reviewer", source.parent)
+        contender["worker_fallbacks"] = [provider(route, IMPLEMENTERS, "benchmark fallback", source.parent) for route in
                                           array(contender.get("worker_fallbacks", []), "benchmark fallbacks", 5)]
     for task in tasks:
         fields(task, "name plan", "benchmark task")

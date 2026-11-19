@@ -269,5 +269,14 @@ def ci_summary(store, run_id, output):
                 f"| Browser receipts without measured coverage | {len(coverage['unmeasured_receipts'])} |",
             ]
         )
+    from .contracts import catalog_history
+    samples = catalog_history(store, run_id)["observations"]
+    if samples:
+        lines.append(f"| Catalog observations passed | {sum(s['passed'] is True for s in samples)} / {len(samples)} |")
+        lines.append(f"| Unscored catalog observations | {sum(s['passed'] is None for s in samples)} |")
+        for sample in reversed(samples):
+            if sample["candidate_records"] is not None:
+                lines.append(f"| Last measured catalog, baseline / candidate records | {sample['baseline_records']} / {sample['candidate_records']} |")
+                break
     atomic_write(output, "\n".join(lines) + "\n")
     return {"run_id": run_id, "outcome": m["outcome"], "output": str(output.resolve())}

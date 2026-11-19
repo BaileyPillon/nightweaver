@@ -30,6 +30,12 @@ def capture(spec, base):
         remaining -= size
     names = git(repository, "ls-tree", "-r", "--name-only", "-z", base).rstrip("\0").split("\0") if spec.get("repository_map") else []
     names = [name for name in names if name]
+    scopes = {p.casefold() for step in spec.get("milestones", []) for p in step.get("paths", [])}
+    if scopes and len(names) > 240:
+        def in_scope(name):
+            parts = name.casefold().split("/")
+            return any("/".join(parts[:i]) in scopes for i in range(1, len(parts) + 1))
+        names.sort(key=lambda name: not in_scope(name))
     return {"base": base, "files": files, "repository_map": names[:240], "map_total_files": len(names)}
 
 
@@ -37,11 +43,35 @@ def save(store, run_id, pack):
     write_json(store.directory(run_id) / "context.json", pack)
 
 
-def brief(store, run_id):
+def digest(pack):
+    return hashlib.sha256(json.dumps(pack, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def load_pack(store, run_id):
+    row = store.get(run_id)
+    expected = row["spec"].get("context_sha256")
     path = store.directory(run_id) / "context.json"
     if not path.is_file():
+        if not expected:
+            return None
+        pack = capture(row["spec"], row["state"]["base"])
+        if digest(pack) != expected:
+            raise ValueError("Committed context cannot reproduce the registered context digest")
+        save(store, run_id, pack)
+    else:
+        pack = json.loads(path.read_text(encoding="utf-8"))
+    if expected and digest(pack) != expected:
+        raise ValueError("The saved context differs from the registered context digest")
+    return pack
+
+
+def brief(store, run_id):
+    return format_brief(load_pack(store, run_id))
+
+
+def format_brief(pack):
+    if pack is None:
         return ""
-    pack = json.loads(path.read_text(encoding="utf-8"))
     parts = [f"Pinned project context at {pack['base']}"]
     for file in pack["files"]:
         parts.append(f"File {file['path']} (sha256 {file['sha256']})\n{file['content']}")

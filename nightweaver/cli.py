@@ -10,11 +10,11 @@ import sys
 import time
 from uuid import uuid4
 
-from .engine import Run, checkout, create_run, fork_run, pending_dependencies, source_info
+from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, source_info
 from .process import BusyRun, run_lock, runner_active
 from .providers import configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
-from .spec import array, gate_spec, read_plan, resolve_repository, validate
+from .spec import anchor_provider_paths, fields, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
 from .safety import redact
 
@@ -76,7 +76,8 @@ def background(store, run_id, retry):
 
 def plan_goal(store, args):
     path = Path(args.template).resolve(strict=True)
-    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    raw = read_json(path)
+    anchor_provider_paths(raw, path.parent)
     repository, project = resolve_repository(raw, path.parent, store)
     raw["repository"] = str(repository)
     if project:
@@ -84,8 +85,16 @@ def plan_goal(store, args):
     raw["objective"] = args.objective
     gates = raw.get("gates", [])
     final_gates = raw.get("final_gates", [])
-    if not gates and not final_gates:
+    fixed = scoped_milestones(raw)
+    if not gates and not final_gates and not fixed:
         raise ValueError("A OneShot template needs operator-authored gates")
+    template_steps = raw.get("milestones") or [{"title": "Plan", "task": "Prepare checked milestones"}]
+    prepared = validate({**raw, "milestones": template_steps}, path.parent, store)
+    if fixed and len(template_steps) > 5:
+        raise ValueError("OneShot planning supports up to five fixed milestones")
+    for prerequisite in getattr(args, "after", []):
+        store.directory(prerequisite)
+        store.get(prerequisite)
     prompt = (
         "Break the following software goal into one to five ordered milestones. "
         "The runner executes them in isolated Git worktrees. Give each a short title and a detailed, "
@@ -101,28 +110,63 @@ def plan_goal(store, args):
         + "\nProtected paths: " + json.dumps(raw.get("protected_paths", []))
         + "\n\nGoal:\n" + args.objective
     )
-    pin_source = args.start or args.enqueue or project or "expected_base" in raw
+    prompt += "\nRun limits: " + json.dumps({"budgets":prepared["budgets"], "attempts_per_milestone":prepared["attempts"],
+                                            "agent_timeout_seconds":prepared["agent_timeout"]})
+    if fixed:
+        boundaries = [{k:s[k] for k in ("title","task","paths","gates")} for s in prepared["milestones"]]
+        prompt += ("\nUse exactly one entry per fixed milestone in its original order. Retain its task, "
+                   "allowed paths and checks.\n" + json.dumps(boundaries, ensure_ascii=False))
+    pin_source = args.start or args.enqueue or project or "expected_base" in raw or prepared["context_files"] or prepared["repository_map"]
     if pin_source:
-        raw["expected_base"] = source_info(store, raw)["base"]
+        source = source_info(store, raw)
+        identity = directory_identity(source["git_common_dir"])
+        raw["expected_base"] = source["base"]
+        if prepared["context_files"] or prepared["repository_map"]:
+            from . import context
+            prompt += "\n" + context.format_brief(context.capture(prepared, source["base"]))
+    if getattr(args, "prompt_only", False):
+        return {"prompt": prompt, "baseline": raw.get("expected_base"), "fixed_milestones": fixed, "model_calls": 0}
     if args.start:
         from .diagnostics import probe_browser_channels
-        checks = [gate_spec(item) for item in array(gates, "gates") + array(final_gates, "final_gates")]
+        checks = [g for step in prepared["milestones"] for g in step["gates"]]
         errors = probe_browser_channels(g["browser"].get("channel", "bundled") for g in checks if g.get("kind") == "browser")
         if errors:
             raise ValueError("OneShot browser check failed before planning:\n" + "\n".join(errors))
-    config = planner_route(args)
-    log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
-    code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
-    if code:
-        raise ValueError(f"Planner exited {code}. See {log}")
-    response = json_response(answer)
+    if getattr(args, "plan_from", None):
+        if args.plan_from.stat().st_size > 1000000:
+            raise ValueError("Saved planner response exceeds 1MB")
+        response = read_json(args.plan_from)
+    else:
+        config = planner_route(args)
+        log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
+        code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
+        if code:
+            raise ValueError(f"Planner exited {code}. See {log}")
+        response = json_response(answer)
+    fields(response, "milestones", "planner response")
     milestones = response.get("milestones", [])
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 5:
-        raise ValueError(f"Planner did not return one to five milestones. See {log}")
-    raw["milestones"] = [{"title": item["title"], "task": item["task"]} for item in milestones]
+        raise ValueError("Planner did not return one to five milestones")
+    for item in milestones:
+        fields(item, "title task", "planned milestone")
+        text(item, "title")
+        text(item, "task")
+    if fixed:
+        if len(milestones) != len(template_steps):
+            raise ValueError("Planner response does not cover the fixed milestone count")
+        raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"]}
+                             for original,proposed in zip(template_steps, milestones)]
+    elif not gates and len(milestones) > 1:
+        raw["milestones"] = [{"title": raw["title"], "task": "\n\n".join(
+            f"{s['title']}\n{s['task']}" for s in milestones)}]
+    else:
+        raw["milestones"] = milestones
     spec = validate(raw, store=store)
     if pin_source:
-        source_info(store, spec)
+        current = source_info(store, spec)
+        if current["git_common_dir"] != source["git_common_dir"] or directory_identity(current["git_common_dir"]) != identity:
+            raise ValueError("The Git repository was replaced during planning")
+        spec.update(git_directory_identity=identity, git_common_dir=source["git_common_dir"])
     if args.start or args.enqueue:
         result = register(store, spec, args)
         return {**result, "milestones": raw["milestones"]}
@@ -158,6 +202,9 @@ def main(argv=None):
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
     goal.add_argument("objective")
+    mode = goal.add_mutually_exclusive_group()
+    mode.add_argument("--prompt-only", action="store_true", help="Print the actual planner input without calling a model")
+    mode.add_argument("--plan-from", type=Path, help="Use a saved planner response with the same validation")
     doctor = commands.add_parser("doctor", help="Check repository and provider readiness")
     doctor.add_argument("--plan", help="Check the exact provider routes in a plan")
     doctor.add_argument("--live", action="store_true", help="Make a small model request per distinct provider route")
@@ -204,6 +251,18 @@ def main(argv=None):
     pd = commands.add_parser("plan-diff", help="Compare normalized plan contracts without calling a model")
     pd.add_argument("before")
     pd.add_argument("after")
+    scope = commands.add_parser("scope", help="Explain which milestones may change the named paths")
+    scope.add_argument("plan")
+    scope.add_argument("paths", nargs="+")
+    lint = commands.add_parser("plan-lint", help="Find impossible call budgets, scopes and repeated routes")
+    lint.add_argument("plan")
+    lint.add_argument("--strict", action="store_true", help="Fail on warnings as well as errors")
+    catalog = commands.add_parser("catalog-check", help="Check a committed catalog against the plan baseline")
+    catalog.add_argument("plan")
+    catalog.add_argument("--ref", default="HEAD")
+    catalog.add_argument("--milestone", type=int, default=1)
+    catalog.add_argument("--gate")
+    commands.add_parser("catalog-history", help="Trace catalog losses and repairs across attempts").add_argument("id")
     for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
                               ("timeline","Show milestone attempts, timing and acceptance"),
                               ("call-ledger","Inspect individual provider calls, usage and interruptions"),
@@ -312,6 +371,8 @@ def main(argv=None):
         p.add_argument("--project")
         p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","done","blocked"))
     args = app.parse_args(argv)
+    if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
+        app.error("--prompt-only previews a goal and cannot launch it")
     if args.command in ("add", "goal") and args.after and not args.enqueue:
         app.error("--after requires --enqueue")
     if args.command in ("add", "goal") and args.wait and not args.start:
@@ -371,6 +432,24 @@ def main(argv=None):
         elif name == "plan-diff":
             from .inspection import plan_diff
             output(plan_diff(read_plan(args.before,store), read_plan(args.after,store)))
+        elif name in ("scope", "plan-lint", "catalog-check", "catalog-history"):
+            from .contracts import catalog_history, inspect_catalog, lint_plan, scope_report
+            if name == "catalog-history":
+                output(catalog_history(store, args.id))
+            else:
+                contract = read_plan(args.plan, store)
+                if name == "scope":
+                    output(scope_report(contract,args.paths))
+                elif name == "plan-lint":
+                    report = lint_plan(contract)
+                    output(report)
+                    return 3 if not report["feasible"] or (args.strict and report["findings"]) else 0
+                else:
+                    report = inspect_catalog(contract,args.milestone,args.gate,args.ref)
+                    output(report)
+                    if any(item.get("input_error") for item in report["checks"]):
+                        return 4
+                    return 0 if report["passed"] else 3
         elif name in ("dependencies","timeline","browser-coverage","ci-summary","evidence-manifest"):
             from .inspection import browser_coverage, ci_summary, evidence_manifest, milestone_timeline
             from .operations import dependencies

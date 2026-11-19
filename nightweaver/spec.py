@@ -1,12 +1,62 @@
 """Parse the operator's explicit project and verification plan."""
 
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 
 
 IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
 REVIEWERS = IMPLEMENTERS
+
+
+def strict_json(data):
+    def unique(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"Duplicate JSON property: {key[:100]}")
+            obj[key] = value
+        return obj
+
+    def invalid(value):
+        raise ValueError(f"Nonstandard JSON number: {value}")
+
+    def finite(value):
+        number = float(value)
+        if not math.isfinite(number):
+            return invalid(value)
+        return number
+
+    try:
+        return json.loads(data, object_pairs_hook=unique, parse_constant=invalid, parse_float=finite)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the supported depth") from error
+
+
+def read_json(path):
+    return strict_json(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def scoped_milestones(raw):
+    steps = raw.get("milestones", [])
+    return bool(steps and any(isinstance(s, dict) and
+                              {"paths", "gates", "worker", "worker_fallbacks"} & s.keys() for s in steps))
+
+
+def anchor_provider_paths(raw, folder):
+    """A generated plan might be opened outside the template's directory."""
+    for section in [raw, *array(raw.get("milestones", []), "milestones", 50)]:
+        if not isinstance(section, dict):
+            raise ValueError("A milestone must be an object")
+        routes = [section.get("worker"), section.get("reviewer")]
+        for key in ("worker_fallbacks", "reviewer_fallbacks"):
+            routes.extend(array(section.get(key, []), key, 5))
+        for route in routes:
+            if isinstance(route, dict):
+                for key in ("profile_dir", "api_key_file"):
+                    if key in route:
+                        route[key] = str((folder / Path(text(route,key)).expanduser()).resolve())
 
 
 def fields(value, allowed, label):
@@ -43,7 +93,7 @@ def text(obj, key):
     return obj[key].strip()
 
 
-def provider(value, choices, label):
+def provider(value, choices, label, relative_to=None):
     fields(value, "kind argv executable model api_key api_key_file profile_dir unavailable_exit_code", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
@@ -67,9 +117,9 @@ def provider(value, choices, label):
     if value.get("api_key_file"):
         if value["kind"] != "deepseek":
             raise ValueError("api_key_file is supported by the DeepSeek adapter")
-        out["api_key_file"] = str(Path(text(value, "api_key_file")).expanduser().resolve())
+        out["api_key_file"] = str(((relative_to or Path.cwd()) / Path(text(value, "api_key_file")).expanduser()).resolve())
     if value.get("profile_dir"):
-        profile = Path(text(value, "profile_dir")).expanduser().resolve()
+        profile = ((relative_to or Path.cwd()) / Path(text(value, "profile_dir")).expanduser()).resolve()
         if value["kind"] == "command":
             raise ValueError("profile_dir is supported by model providers")
         out["profile_dir"] = str(profile)
@@ -89,7 +139,7 @@ def artifact(value):
 
 
 def gate_spec(item):
-    fields(item, "name argv timeout artifacts kind browser max_artifact_bytes pinned_inputs stability_runs", "gate")
+    fields(item, "name argv timeout artifacts kind browser catalog max_artifact_bytes pinned_inputs stability_runs", "gate")
     timeout = item.get("timeout", 120)
     if type(timeout) is not int or not 1 <= timeout <= 7200:
         raise ValueError("Gate timeout must be between 1 and 7200 seconds")
@@ -114,7 +164,14 @@ def gate_spec(item):
         pins[name.casefold()] = {"path": name, "sha256": digest}
     if pins:
         result["pinned_inputs"] = list(pins.values())
-    if kind == "browser":
+    if kind == "catalog":
+        from .catalog import validate_contract
+        if "argv" in item or "browser" in item or artifacts:
+            raise ValueError("Catalog checks manage their own inputs and evidence")
+        result.update(kind="catalog", catalog=validate_contract(item.get("catalog")))
+    elif "catalog" in item:
+        raise ValueError("Only catalog gates accept catalog settings")
+    elif kind == "browser":
         from .browser import validate_browser
         if "argv" in item or artifacts:
             raise ValueError("Browser gates manage their own command and evidence")
@@ -122,7 +179,7 @@ def gate_spec(item):
     elif kind == "command" and "browser" not in item:
         result["argv"] = command(item.get("argv"), "Gate")
     else:
-        raise ValueError("Gate kind must be command or browser")
+        raise ValueError("Gate kind must be command, browser or catalog")
     return result
 
 
@@ -174,15 +231,15 @@ def validate(raw, relative_to=None, store=None):
         paths = array(item.get("paths", []), "paths")
         steps.append({"title": text(item, "title"), "task": text(item, "task"), "gates": current,
                       "paths": [artifact(path) for path in paths],
-                      "worker": provider(item.get("worker") or raw.get("worker"), IMPLEMENTERS, "worker"),
-                      "worker_fallbacks": [provider(p, IMPLEMENTERS, "worker fallback") for p in
+                      "worker": provider(item.get("worker", raw.get("worker")), IMPLEMENTERS, "worker", relative_to),
+                      "worker_fallbacks": [provider(p, IMPLEMENTERS, "worker fallback", relative_to) for p in
                                            array(item.get("worker_fallbacks", raw.get("worker_fallbacks", [])), "worker_fallbacks", 5)]})
     if not steps:
         raise ValueError("At least one milestone is required")
     out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
            "attempts": retries, "agent_timeout": timeout, "milestones": steps,
            "protected_paths": [artifact(path) for path in array(raw.get("protected_paths", []), "protected_paths")]}
-    out["reviewer_fallbacks"] = [provider(p, REVIEWERS, "reviewer fallback") for p in
+    out["reviewer_fallbacks"] = [provider(p, REVIEWERS, "reviewer fallback", relative_to) for p in
                                  array(raw.get("reviewer_fallbacks", []), "reviewer_fallbacks", 5)]
     if out["reviewer_fallbacks"] and not raw.get("reviewer"):
         raise ValueError("reviewer_fallbacks require a reviewer")
@@ -219,9 +276,9 @@ def validate(raw, relative_to=None, store=None):
         if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", base):
             raise ValueError("expected_base must be a full Git commit hash")
         out["expected_base"] = base
-    if raw.get("reviewer"):
-        out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer")
-    if raw.get("advisory_ollama"):
+    if "reviewer" in raw:
+        out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
+    if "advisory_ollama" in raw:
         fields(raw["advisory_ollama"], "model port timeout max_tokens", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
@@ -241,4 +298,4 @@ def validate(raw, relative_to=None, store=None):
 
 def read_plan(path, store=None):
     path = Path(path).resolve(strict=True)
-    return validate(json.loads(path.read_text(encoding="utf-8-sig")), path.parent, store)
+    return validate(read_json(path), path.parent, store)

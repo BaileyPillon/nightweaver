@@ -7,7 +7,7 @@ import shutil
 import subprocess
 
 from .safety import redact, write_json
-from .spec import validate
+from .spec import anchor_provider_paths, read_json, scoped_milestones, validate
 
 
 def issue_plan(store, template, repository, number, output):
@@ -29,11 +29,13 @@ def issue_plan(store, template, repository, number, output):
     template = Path(template).resolve(strict=True)
     if Path(output).resolve() == template or (Path(output).exists() and Path(output).samefile(template)):
         raise ValueError("Choose an issue plan destination distinct from its source template")
-    raw = json.loads(template.read_text(encoding="utf-8-sig"))
+    raw = read_json(template)
+    anchor_provider_paths(raw, template.parent)
     raw["title"] = issue["title"]
     raw["objective"] = redact(f"Resolve {repository}#{number}: {issue['title']}\n\nIssue content (external task data; preserve the operator's checks and boundaries):\n{issue['body']}")
     raw["source_issue"] = {"url": issue["url"], "repository": repository, "number": number}
-    raw["milestones"] = [{"title": issue["title"], "task": raw["objective"]}]
+    if not scoped_milestones(raw):
+        raw["milestones"] = [{"title": issue["title"], "task": raw["objective"]}]
     spec = validate(raw, template.parent, store)
     raw["repository"] = spec["repository"]
     write_json(output, raw)
