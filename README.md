@@ -1,5 +1,15 @@
 # Nightweaver
 
+**Version 0.17** can hand a failing implementation to a second worker with the partial edits, failed checks and remaining budget intact. Start from a trusted Git repository and a goal in the native Windows dashboard or CLI. [All 30 changes, sources and the restart comparison](docs/v0.17-research.md)
+
+```powershell
+nightweaver oneshot C:\src\my-project "Fix the broken share link" --preview
+nightweaver oneshot C:\src\my-project "Fix the broken share link" --worker claude --rescue codex --wait
+nightweaver repair-history RUN_ID
+```
+
+The first command shows the pinned Git commit, checks, protected files and budgets without calling a model. The second plans and executes in isolated worktrees. Add `--profile-dir PATH` to use a particular signed-in profile, `--python PATH` for a project virtual environment or `--direct` for one checked milestone. Run without `--wait` to return after planning and background launch. Existing JSON plans can opt in with `"repair": {"collect_failures": true, "switch_after": 1, "fresh_session_after": 1, "history": 3}` and a distinct `worker_fallbacks` entry.
+
 Version 0.16 lets agents enrich a prompt catalog while preserving the tags people search for. Compare catalog revisions, profile a field, and enforce compound uniqueness, deletion budgets and tag retention during a OneShot. See the [30 ranked changes and the 1,493-prompt Afterimage trial](docs/v0.16-research.md).
 
 Version 0.15 can require a named test to fail for a specified reason on the original Git commit and pass on the candidate, while a known-good control passes on both. Use `check-baseline` before a model call or `compare-revisions` on two existing commits. Read the [30 ranked changes, research sources, Windows trial and proof example](docs/v0.15-research.md).
@@ -82,7 +92,7 @@ DeepSeek is also available in the desktop OneShot planner dropdown. The CLI acce
 
 ## Open the desktop dashboard
 
-Install the .NET 8 SDK with the Windows Desktop runtime and run the following. Then select **Start a plan** and choose the generated `plan.json`, or use **New OneShot** with a template and an objective. Set `NIGHTWEAVER_PYTHON` to the path of your Python executable if `python.exe` is unavailable on `PATH`.
+Install the .NET 8 SDK with the Windows Desktop runtime and run the following. Select **New OneShot** to choose a repository, inspect the detected checks and enter the goal. The same dialog accepts an existing plan template. **Start a plan** runs an explicit `plan.json`. Set `NIGHTWEAVER_PYTHON` to the path of your Python executable if `python.exe` is unavailable on `PATH`.
 
 ```powershell
 dotnet run --project Nightweaver.Desktop -c Release

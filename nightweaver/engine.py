@@ -265,25 +265,54 @@ class Run:
     def evidence_dir(self, state):
         return self.root / "evidence" / f"{state['step'] + 1:02d}" / f"{state['attempt']:02d}"
 
-    def reject(self, reason, phase, *, exit_code=None, **state):
+    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, **state):
+        from .repair import describe, next_worker
         current = self.store.get(self.id)["state"]
         reason = redact(reason)
         path = self.root / "worktrees" / f"{current['step'] + 1:02d}"
+        changed = []
         try:
             git(path, "add", "-A", "--", ".")
             signature = git(path, "write-tree")
+            names = git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", current["accepted"], "--")
+            changed = [n for n in names.split("\0") if n]
         except (ValueError, OSError):
             signature = "unknown"
         fingerprint = hashlib.sha256(f"{phase}\n{reason}\n{signature}".encode()).hexdigest()
         count = current.get("failure_count", 0) + 1 if fingerprint == current.get("failure_fingerprint") else 1
         limit = self.spec.get("retry", {}).get("repeated_failure_limit", 3)
-        blocked = bool(limit and count >= limit)
+        step = self.spec["milestones"][current["step"]]
+        active = current.get("worker_route", 0)
+        used = current.get("attempts_used", current["attempt"])
+        repair = self.spec.get("repair", {})
+        eligible = repairable and phase in ("worker", "snapshot", "check", "review")
+        streak = current.get("route_rejections", 0) + int(eligible)
+        target = next_worker(step, active) if eligible and repair.get("switch_after") and streak >= repair["switch_after"] else None
+        handoff = target is not None and used < self.spec["attempts"]
+        repeated = bool(limit and count >= limit and not handoff)
+        exhausted = used >= self.spec["attempts"]
+        blocked = repeated or exhausted
+        location = {"step": current["step"] + 1, "attempt": current["attempt"]}
+        event = None
+        if handoff:
+            routes = [step["worker"], *step["worker_fallbacks"]]
+            event = ("repair_handoff", {**location, "from": describe(routes[active]), "to": describe(routes[target]),
+                     "from_route": active, "to_route": target, "tree": signature, "phase": phase, "failed_gates": list(failed_gates)})
+            state.update(worker_route=target, worker_session=None)
+        elif repeated:
+            event = ("repeated_failure_stopped", {"issue": reason, "count": count})
+        elif exhausted:
+            event = ("blocked", {"issue": reason})
+        elif eligible and repair.get("fresh_session_after") and streak >= repair["fresh_session_after"]:
+            state["worker_session"] = None
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
-        self.set("attempt_rejected", {"phase": phase, "issue": reason, "same_failure_count": count, "exit": exit_code},
-                 following_event=("repeated_failure_stopped", {"issue": reason, "count": count}) if blocked else None,
-                 phase="blocked" if blocked else "ready", last_error=reason, failure_fingerprint=fingerprint,
-                 failure_count=count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
+        self.set("attempt_rejected", {**location, "phase": phase, "issue": reason, "same_failure_count": count, "exit": exit_code,
+                 "tree": signature, "route": active, "failed_gates": list(failed_gates), "worker": describe(self.route(current, step, "worker")),
+                 "changed_paths": changed[:12], "changed_path_count": len(changed), "diagnostic_log": current.get("log")},
+                 following_event=event, phase="blocked" if blocked else "ready", last_error=reason,
+                 failure_fingerprint=None if handoff else fingerprint, route_rejections=0 if handoff else streak,
+                 failure_count=0 if handoff else count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
 
     def worker_prompt(self, state, step):
         paths = ", ".join(step["paths"]) or "the repository files needed for this milestone"
@@ -299,6 +328,8 @@ class Run:
                     line += " · Passed: " + ", ".join(item["verified_checks"])
                 prior.append(line)
         prior_summary = "\n".join(prior) or "None yet"
+        from .repair import failure_brief
+        history = failure_brief(self.store, self.id, state, self.spec.get("repair", {}).get("history", 0))
         return (
             f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
@@ -312,7 +343,7 @@ class Run:
             f"{checks}\n\n{context.brief(self.store, self.id)}\n\n"
             f"Budget remaining before this call: {budget_status(self.spec, state)['remaining']}\n"
             f"Operator updates\n{self.store.feedback_text(self.id) or 'None'}\n\n"
-            f"Last observed failure (if any)\n{state['last_error'] or 'None'}\n"
+            f"{history}Last observed failure (if any)\n{state['last_error'] or 'None'}\n"
             f"Previous diagnostic log: {state.get('log') if state.get('last_error') else 'None'}"
         )
 
@@ -325,6 +356,7 @@ class Run:
         if used >= self.spec["attempts"]:
             self.set("blocked", {"issue": state["last_error"]}, phase="blocked")
             return
+        self.check_budget(call=True)
         next_state = {**state, "attempt": state["attempt"] + 1}
         log = self.evidence_dir(next_state) / "worker.jsonl"
         config = self.route(state, step, "worker")
@@ -356,11 +388,16 @@ class Run:
                 self.set("verification_batch_started", saved, verification_batch=saved)
             batch = saved["id"]
         outputs = []
+        failures = []
         for index, check in enumerate(step["gates"], 1):
-            receipts = self.verify_gate(path, state, step, index, check, snapshot, batch)
+            receipts = self.verify_gate(path, state, step, index, check, snapshot, batch, failures)
             if receipts is None:
                 return
             outputs.extend(receipts)
+        if failures:
+            from .repair import combined_failure
+            self.reject(combined_failure(failures), "check", failed_gates=[f["gate"] for f in failures])
+            return
         if self.snapshot(path, state, step) != snapshot:
             self.reject("A check changed tracked evidence or implementation files after the snapshot was taken.", "snapshot")
             return
@@ -369,7 +406,7 @@ class Run:
         self.set("checks_passed", {"tree": snapshot, "checks": outputs}, phase="reviewing",
                  candidate_tree=snapshot, verification_batch=None, checks_sha256=digest)
 
-    def verify_gate(self, path, state, step, index, check, snapshot, batch):
+    def verify_gate(self, path, state, step, index, check, snapshot, batch, failures=None):
         count = check.get("stability_runs", 1)
         digest = contract_hash(check)
         evidence = self.evidence_dir(state)
@@ -431,7 +468,10 @@ class Run:
                 if count > 1:
                     diagnostic = f"All {count} samples in this round failed.\n{diagnostic}"
                 verdict = f"failed its JUnit policy (command exit {last['exit']})" if last.get("junit", {}).get("passed") is False else f"exited {last['exit']}"
-                self.reject(f"{check['name']} {verdict}\n{diagnostic}", "check")
+                if failures is not None and self.spec.get("repair", {}).get("collect_failures"):
+                    failures.append({"gate": check["name"], "diagnostic": f"{verdict}\n{diagnostic}"})
+                    return []
+                self.reject(f"{check['name']} {verdict}\n{diagnostic}", "check", failed_gates=[check["name"]])
                 return None
         reason = f"{check['name']} produced both passes and failures in two rounds on tree {snapshot[:12]}."
         self.set("verification_inconsistent", {**location, "name": check["name"], "tree": snapshot,
@@ -469,7 +509,7 @@ class Run:
 
     def invalid_gate(self, check, receipt):
         if receipt.get("source_error"):
-            self.reject(receipt["source_error"], "snapshot")
+            self.reject(receipt["source_error"], "snapshot", repairable=False)
         elif receipt.get("input_error") or receipt.get("execution_error"):
             self.set("blocked", {"during": "checking", "issue": receipt["artifact_error"]},
                      phase="blocked", blocked_from="checking", last_error=receipt["artifact_error"])
@@ -602,7 +642,7 @@ class Run:
                  phase="done" if finished else "ready", step=number, accepted=candidate,
                  attempt=0, attempts_used=0, candidate=None, candidate_tree=None,
                  worker_session=None, last_error="", log=None, retry_at=None, failure_count=0,
-                 failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0)
+                 failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0, route_rejections=0)
 
     def run(self, *, retry=False, defer_retries=False, only_operational=False):
         with run_lock(self.root / "runner.lock"), ExitStack() as project_lock:
@@ -621,7 +661,7 @@ class Run:
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
                          attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,
-                         transient_failures=0, failure_count=0, failure_fingerprint=None)
+                         transient_failures=0, failure_count=0, failure_fingerprint=None, route_rejections=0)
             if state.get("pending_call"):
                 self.finish_call(state["pending_call"], recovered=True)
             if not state.get("started_at"):
@@ -660,10 +700,16 @@ class Run:
                     if phase == "working":
                         log = Path(state["log"])
                         session, _ = metadata(log, self.route(state, step, "worker")["kind"])
+                        interrupted = "The prior process stopped before verification. Inspect the existing files and continue."
+                        previous = state.get("last_error") or ""
+                        if previous and not previous.startswith(interrupted):
+                            interrupted += "\nPrevious diagnostic: " + previous
+                        elif previous:
+                            interrupted = previous
                         self.set("interrupted_worker_recovered", {"log": str(log), "session": session},
                                  phase="ready", worker_session=session or state.get("worker_session"),
                                  attempts_used=max(0, state.get("attempts_used", state["attempt"]) - 1),
-                                 last_error="The prior process stopped before verification. Inspect the existing files and continue.")
+                                 last_error=interrupted)
                     elif phase in ("queued", "ready"):
                         self.work(state, step, path)
                     elif phase == "checking":
@@ -691,10 +737,10 @@ class Run:
                     routes = step.get("worker_fallbacks", []) if role == "worker" else self.spec.get("reviewer_fallbacks", [])
                     index = current.get(role + "_route", 0)
                     next_phase = "ready" if actual == "working" else actual
-                    refund = {"attempts_used": max(0, current.get("attempts_used", 1) - 1)} if role == "worker" else {}
+                    refund = {"attempts_used": max(0, current.get("attempts_used", 1) - 1) , "worker_session": None} if role == "worker" else {}
                     if index < len(routes):
                         self.set("provider_fallback", {"from": provider, "to": describe_provider(routes[index])},
-                                 phase=next_phase, **{role + "_route": index + 1}, worker_session=None,
+                                 phase=next_phase, **{role + "_route": index + 1}, **({"route_rejections": 0} if role == "worker" else {}),
                                  last_error=str(error), transient_failures=0, retry_at=None, **refund)
                         continue
                     failures = current.get("transient_failures", 0)
@@ -702,7 +748,7 @@ class Run:
                     if error.kind in ("usage_limit", "transient") and failures < policy.get("transient_attempts", 2):
                         delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** failures)
                         self.set("provider_retry_scheduled", {"issue": str(error), "seconds": delay, **provider},
-                                 phase=next_phase, transient_failures=failures + 1, worker_session=None, **refund,
+                                 phase=next_phase, transient_failures=failures + 1, **refund,
                                  retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat())
                         continue
                     self.set("provider_unavailable", {"issue": str(error), **provider}, phase="blocked",

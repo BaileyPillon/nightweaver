@@ -74,11 +74,14 @@ def background(store, run_id, retry):
     return child.pid
 
 
-def plan_goal(store, args):
-    path = Path(args.template).resolve(strict=True)
-    raw = read_json(path)
-    anchor_provider_paths(raw, path.parent)
-    repository, project = resolve_repository(raw, path.parent, store)
+def plan_goal(store, args, template=None):
+    if template is None:
+        path = Path(args.template).resolve(strict=True)
+        raw, folder = read_json(path), path.parent
+    else:
+        raw, folder = template, Path(template["repository"])
+    anchor_provider_paths(raw, folder)
+    repository, project = resolve_repository(raw, folder, store)
     raw["repository"] = str(repository)
     if project:
         raw["project"] = project["name"]
@@ -89,7 +92,7 @@ def plan_goal(store, args):
     if not gates and not final_gates and not fixed:
         raise ValueError("A OneShot template needs operator-authored gates")
     template_steps = raw.get("milestones") or [{"title": "Plan", "task": "Prepare checked milestones"}]
-    prepared = validate({**raw, "milestones": template_steps}, path.parent, store)
+    prepared = validate({**raw, "milestones": template_steps}, folder, store)
     if fixed and len(template_steps) > 5:
         raise ValueError("OneShot planning supports up to five fixed milestones")
     for prerequisite in getattr(args, "after", []):
@@ -224,6 +227,22 @@ def main(argv=None):
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
     goal.add_argument("objective")
+    one = commands.add_parser("oneshot", help="Build and verify a goal from a repository's committed tests")
+    one.add_argument("repository", type=Path)
+    one.add_argument("objective")
+    one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
+    one.add_argument("--model", help="Model for the primary worker and planner")
+    one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
+    one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
+    one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
+    one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
+    one.add_argument("--rescue-profile", help="Signed-in CLI profile for the alternate")
+    one.add_argument("--direct", action="store_true", help="Use the objective as one milestone and skip the planner call")
+    launch_one = one.add_mutually_exclusive_group()
+    launch_one.add_argument("--preview", action="store_true", help="Print the reusable plan and its checks without calling a model")
+    launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
+    launch_one.add_argument("--enqueue", action="store_true", help="Use the persistent queue for the worker run")
+    commands.add_parser("repair-history", help="Trace failed candidates and functional worker handoffs").add_argument("id")
     mode = goal.add_mutually_exclusive_group()
     mode.add_argument("--prompt-only", action="store_true", help="Print the actual planner input without calling a model")
     mode.add_argument("--plan-from", type=Path, help="Use a saved planner response with the same validation")
@@ -481,6 +500,33 @@ def main(argv=None):
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
+        if name == "repair-history":
+            from .repair import repair_history
+            output(repair_history(store, args.id))
+            return 0
+        if name == "oneshot":
+            from .discovery import discover, verify_tools
+            if args.rescue_profile and not args.rescue:
+                raise ValueError("--rescue-profile requires --rescue")
+            args.planner = args.worker
+            worker = planner_route(args)
+            alternate = {"kind": args.rescue} if args.rescue else None
+            if args.rescue_profile:
+                alternate["profile_dir"] = str(Path(args.rescue_profile).expanduser().resolve())
+            if worker == alternate:
+                raise ValueError("Choose a distinct rescue provider or profile")
+            raw = discover(args.repository, args.objective, worker, alternate, args.python)
+            if args.expected_base and raw["expected_base"] != args.expected_base.lower():
+                raise ValueError("The repository moved since preview. Preview its checks again.")
+            spec = validate(raw, store=store)
+            if args.preview:
+                output(raw)
+                return 0
+            verify_tools(raw["gates"])
+            args.start, args.after = not args.enqueue, []
+            result = register(store, spec, args) if args.direct else plan_goal(store, args, raw)
+            output(result)
+            return {"blocked": 3, "paused": 2, "waiting": 4}.get(result.get("phase"), 0)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"

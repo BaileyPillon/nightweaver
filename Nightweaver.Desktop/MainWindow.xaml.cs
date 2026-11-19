@@ -199,11 +199,11 @@ public partial class MainWindow : Window
 
     private async void OneShot_Click(object sender, RoutedEventArgs e)
     {
-        if (working || PickPlan("Select a OneShot template") is not string path)
+        if (working)
             return;
-        var dialog = new GoalWindow { Owner = this };
+        var dialog = new GoalWindow(path => CallAsync("oneshot", path, "Preview committed checks", "--preview")) { Owner = this };
         if (dialog.ShowDialog() == true)
-            await PerformAsync("Planning milestones…", "goal", path, dialog.Objective, "--planner", dialog.Provider, "--start");
+            await PerformAsync("Planning milestones…", dialog.Arguments());
     }
 
     private async void Pause_Click(object sender, RoutedEventArgs e)

@@ -312,6 +312,8 @@ def ci_summary(store, run_id, output):
         f"| Worker attempts | {m['worker_attempts']} |",
         f"| Provider calls | {m['provider_calls']} |",
         f"| Failed attempts | {m['failed_attempts']} |",
+        f"| Functional worker handoffs | {m['repair_handoffs']} |",
+        f"| Milestones accepted after a handoff | {m['accepted_after_handoff']} |",
     ]
     coverage = browser_coverage(store, run_id)
     views = coverage["viewports"]

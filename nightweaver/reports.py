@@ -121,6 +121,9 @@ def metrics(store, run_id):
         "interventions": interventions, "unassisted_acceptance": row["state"]["phase"] == "done" and interventions == 0,
         "interruptions_recovered": kinds.count("interrupted_worker_recovered"),
         "fallbacks": kinds.count("provider_fallback"), "observed_tokens": recorded if calls and unknown < len(calls) else None,
+        "repair_handoffs": kinds.count("repair_handoff"),
+        "accepted_after_handoff": len({e["details"]["step"] for e in events if e["kind"] == "repair_handoff"} &
+                                      {e["details"]["step"] for e in events if e["kind"] == "milestone_accepted" and "step" in e["details"]}),
         "usage_unknown_calls": unknown, "usage_pending_calls": kinds.count("provider_call_started") - len(calls),
         "billing": "not_measured", "event_count": len(events),
     }

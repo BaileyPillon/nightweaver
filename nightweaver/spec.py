@@ -216,7 +216,7 @@ def resolve_repository(raw, relative_to=None, store=None):
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
-           "reviewer_fallbacks context_files repository_map source_issue", "plan")
+           "reviewer_fallbacks context_files repository_map source_issue repair", "plan")
     if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
         raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
@@ -271,7 +271,7 @@ def validate(raw, relative_to=None, store=None):
         raise ValueError("At least one milestone is required")
     out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
            "attempts": retries, "agent_timeout": timeout, "milestones": steps,
-           "protected_paths": [artifact(path) for path in array(raw.get("protected_paths", []), "protected_paths")]}
+           "protected_paths": [artifact(path) for path in array(raw.get("protected_paths", []), "protected_paths", 4096)]}
     out["reviewer_fallbacks"] = [provider(p, REVIEWERS, "reviewer fallback", relative_to) for p in
                                  array(raw.get("reviewer_fallbacks", []), "reviewer_fallbacks", 5)]
     if out["reviewer_fallbacks"] and not raw.get("reviewer"):
@@ -291,6 +291,9 @@ def validate(raw, relative_to=None, store=None):
     out["retry"] = {key: integer(retry.get(key, value), key, 1 if key in ("initial_seconds", "max_seconds") else 0,
                                   3600 if key in ("initial_seconds", "max_seconds") else 20)
                     for key, value in defaults.items()}
+    if "repair" in raw:
+        from .repair import policy
+        out["repair"] = policy(raw["repair"])
     if out["retry"]["max_seconds"] < out["retry"]["initial_seconds"]:
         raise ValueError("retry max_seconds must be at least initial_seconds")
     if "source_issue" in raw:

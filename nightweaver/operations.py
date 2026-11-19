@@ -110,6 +110,14 @@ def handoff(store, run_id):
     accepted = store.accepted_milestones(run_id)
     recent = store.events(run_id, limit=1, kinds=["gate_finished"])
     gate = recent[0]["details"] if recent else None
+    if gate and step:
+        gate_step = gate.get("step")
+        if gate_step is None and index:
+            last_acceptance = store.events(run_id, limit=1, kinds=["milestone_accepted"])
+            if last_acceptance and recent[0]["seq"] < last_acceptance[0]["seq"]:
+                gate = None
+        elif gate_step is not None and gate_step != index + 1:
+            gate = None
     routes = [step["worker"], *step.get("worker_fallbacks", [])] if step else []
     route = routes[min(state.get("worker_route", 0), len(routes)-1)] if routes else None
     return redact(

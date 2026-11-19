@@ -301,14 +301,22 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
 
 
 def json_response(answer):
+    from .spec import strict_json
+    if len(answer.encode("utf-8")) > 1000000:
+        raise ValueError("Structured response exceeds 1MB")
     stripped = answer.strip()
     fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL)
-    if len(stripped) > 1000000:
-        raise ValueError("Structured response exceeds 1MB")
-    result = json.loads(fence.group(1) if fence else stripped)
+    result = strict_json(fence.group(1) if fence else stripped)
     if not isinstance(result, dict):
         raise ValueError("Structured response must be a JSON object")
-    return result
+    level = [result]
+    for _ in range(64):
+        level = [child for container in level
+                 for child in (container.values() if isinstance(container, dict) else container)
+                 if isinstance(child, (dict, list))]
+        if not level:
+            return result
+    raise ValueError("Structured response nesting exceeds 64 levels")
 
 
 def advisory(config, information):
