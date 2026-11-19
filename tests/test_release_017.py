@@ -117,6 +117,24 @@ class OneShotTests(unittest.TestCase):
     cli = operator.OperatorRelease.cli
     configured = fixtures.WindowsRunTest.configured
 
+    def test_tooling_suite_runs_with_sibling_imports(self):
+        self.commit(
+            {
+                "tools/test_prompt_extraction.py": "import unittest\nfrom extraction import title\nclass T(unittest.TestCase):\n def test_title(self): self.assertEqual(title, 'reel')",
+                "tools/extraction.py": "title = 'reel'",
+                "vendor/lib/tests/test_bundled.py": "raise RuntimeError('not a project suite')",
+            }
+        )
+        raw = self.cli("oneshot", self.repo, "Check tools", "--preview")
+        self.assertEqual(
+            [gate["name"] for gate in raw["gates"]], ["Python unittest tools"]
+        )
+        result = subprocess.run(
+            raw["gates"][0]["argv"], cwd=self.repo, capture_output=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"Ran 1 test", result.stderr)
+
     def test_declared_npm_check_protects_its_script(self):
         self.commit(
             {

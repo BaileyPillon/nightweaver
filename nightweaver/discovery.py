@@ -142,10 +142,25 @@ def discover(repository, objective, worker, rescue=None, python=None):
 
     runner = str(Path(__file__).with_name("suite_runner.py"))
     gates, protected = [], set()
+    excluded = {
+        "node_modules",
+        ".venv",
+        "venv",
+        "vendor",
+        "third_party",
+        "dist",
+        "build",
+        "obj",
+    }
+    sources = [p for p in blobs if excluded.isdisjoint(PurePosixPath(p).parts[:-1])]
     python_tests = [
         p
-        for p in blobs
-        if ("/" not in p or p.startswith("tests/"))
+        for p in sources
+        if (
+            "/" not in p
+            or p.startswith(("tools/", "scripts/"))
+            or not {"test", "tests"}.isdisjoint(PurePosixPath(p).parts[:-1])
+        )
         and (
             fnmatch.fnmatchcase(PurePosixPath(p).name, "test*.py")
             or p.endswith("_test.py")
@@ -174,7 +189,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
         )
         protected.update(python_tests)
         protected.update(markers | manifests)
-        protected.update(p for p in blobs if PurePosixPath(p).name == "conftest.py")
+        protected.update(p for p in sources if PurePosixPath(p).name == "conftest.py")
         if uses_pytest:
             gates.append(
                 {
@@ -203,7 +218,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
     js_ext = (".js", ".mjs", ".cjs")
     js_files = [
         p
-        for p in blobs
+        for p in sources
         if p.endswith(js_ext)
         and (
             "test" in PurePosixPath(p).parts
@@ -268,7 +283,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
                     protected.add(entry)
             protected.update({"package.json", "package-lock.json"} & blobs.keys())
     projects = []
-    all_projects = sorted(p for p in blobs if p.endswith(".csproj"))
+    all_projects = sorted(p for p in sources if p.endswith(".csproj"))
     project_dirs = {PurePosixPath(p).parent for p in all_projects}
     for path in all_projects:
         try:
