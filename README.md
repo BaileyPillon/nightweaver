@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.13 checks a change for new and returning visitors on desktop and phone. A OneShot can now seed an existing collection, close and reopen the app, verify what persisted, and tell a repair worker exactly which visitor failed. [All 30 ranked changes, a working browser contract and the Afterimage experiment](docs/v0.13-research.md)
+
 Version 0.12 measures how consistently coding workflows finish the same tasks. Run a balanced comparison, find mixed results across repeats, measure the size of accepted patches, and set a minimum acceptance rate for CI. [All 30 ranked changes and the eight-trial Afterimage experiment](docs/v0.12-research.md)
 
 Version 0.11 can catch a lost catalog record even when the total stays the same. OneShots retain milestone-specific checks and file scopes, can preview their planner input, and can reuse a saved plan response. [All 30 ranked changes, the Afterimage control experiment and a working catalog gate](docs/v0.11-research.md)

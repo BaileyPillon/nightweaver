@@ -36,7 +36,9 @@ def preflight(store, spec):
             errors.append(f"{identity}: {error}")
     executables = {}
     browsers, baselines, verified_pins = set(), set(), set()
-    for milestone in spec["milestones"]:
+    from .journeys import browser_cases
+    browser_work = []
+    for number,milestone in enumerate(spec["milestones"],1):
         for gate in milestone["gates"]:
             try:
                 verify_inputs(gate, repository, base=base)
@@ -66,7 +68,12 @@ def preflight(store, spec):
                 continue
             config = gate["browser"]
             browsers.add(config.get("channel", "bundled"))
-            for step in config["steps"]:
+            cases = list(browser_cases(config))
+            samples = gate.get("stability_runs",1)
+            browser_work.append({"milestone":number,"gate":gate["name"],"cases_per_sample":len(cases),
+                                 "contexts":len(cases)*samples,"steps":sum(len(steps) for _,_,steps in cases)*samples,
+                                 "samples":samples})
+            for step in [*config["steps"],*(s for scenario in config.get("scenarios",[]) for s in scenario.get("steps",[]))]:
                 if step["action"] == "visual_match":
                     contract = step["value"]
                     baselines.add((artifact(contract["baseline"]), contract["sha256"]))
@@ -103,7 +110,7 @@ def preflight(store, spec):
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
     errors.extend(probe_browser_channels(browsers))
-    return {**report, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+    return {**report, "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
             "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 

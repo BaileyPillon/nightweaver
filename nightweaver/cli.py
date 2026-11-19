@@ -266,6 +266,7 @@ def main(argv=None):
     for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
                               ("timeline","Show milestone attempts, timing and acceptance"),
                               ("call-ledger","Inspect individual provider calls, usage and interruptions"),
+                              ("browser-matrix","Inspect the latest outcome and evidence per scenario and viewport"),
                               ("browser-hotspots","Locate failing or slow actions per browser viewport"),
                               ("browser-coverage","Measure steps completed per gate and viewport"),
                               ("evidence-manifest","Export portable evidence hashes and verification results"),
@@ -481,6 +482,9 @@ def main(argv=None):
                 return 3 if name == "evidence-manifest" and result["status"] != "verified" else 0
             output({"dependencies":dependencies, "timeline":milestone_timeline,
                     "browser-coverage":browser_coverage}[name](store,args.id))
+        elif name == "browser-matrix":
+            from .inspection import browser_matrix
+            output(browser_matrix(store,args.id))
         elif name in ("call-ledger", "browser-hotspots"):
             from .trajectory import call_ledger, browser_hotspots
             output((call_ledger if name == "call-ledger" else browser_hotspots)(store, args.id))

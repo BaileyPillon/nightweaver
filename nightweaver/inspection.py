@@ -136,7 +136,7 @@ def browser_coverage(store, run_id):
             )
             continue
         for view in d["browser_coverage"]:
-            groups[step, d["name"], view["viewport"]].append(view)
+            groups[step, d["name"], view["viewport"], view.get("scenario","")].append(view)
     return {
         "run_id": run_id,
         "unmeasured_receipts": unavailable,
@@ -145,14 +145,67 @@ def browser_coverage(store, run_id):
                 "step": step,
                 "gate": gate,
                 "viewport": name,
+                **({"scenario": scenario} if scenario else {}),
                 "samples": len(views),
                 "passed_samples": sum(v["passed"] for v in views),
                 "completed_steps": sum(v["completed_steps"] for v in views),
                 "planned_steps": sum(v["planned_steps"] for v in views),
             }
-            for (step, gate, name), views in sorted(groups.items())
+            for (step, gate, name, scenario), views in sorted(groups.items())
         ],
     }
+
+
+def browser_matrix(store, run_id):
+    """Track the latest observation even when a later verifier could not score it."""
+    from .journeys import browser_cases
+
+    cells = {}
+    for number, milestone in enumerate(store.get(run_id)["spec"]["milestones"], 1):
+        for index, gate in enumerate(milestone["gates"], 1):
+            if gate.get("kind") != "browser":
+                continue
+            for scenario, viewport, steps in browser_cases(gate["browser"]):
+                key = number, index, scenario.get("name"), viewport["name"]
+                cells[key] = {
+                    "milestone": number,
+                    "gate": gate["name"],
+                    "scenario": scenario.get("name"),
+                    "viewport": viewport["name"],
+                    "planned_steps": len(steps),
+                    "status": "pending",
+                    "samples": 0,
+                    "passed_samples": 0,
+                    "failed_samples": 0,
+                    "unscored_samples": 0,
+                }
+    for event in store.events(run_id, limit=None, kinds=["gate_finished"]):
+        detail = event["details"]
+        lookup = {
+            (v.get("scenario"), v["viewport"]): v
+            for v in detail.get("browser_coverage", [])
+        }
+        for (number, index, scenario, viewport), cell in cells.items():
+            if (number, index) != (detail.get("step"), detail.get("gate_index")):
+                continue
+            row = lookup.get((scenario, viewport))
+            scored = row is not None and observed_pass(detail) is not None
+            status = ("passed" if row["passed"] else "failed") if scored else "unscored"
+            cell.update(
+                status=status,
+                event=event["seq"],
+                attempt=detail.get("attempt"),
+                tree=detail.get("tree"),
+                completed_steps=row.get("completed_steps") if scored else None,
+                runtime=detail.get("browser_runtime"),
+                receipt=detail.get("receipt"),
+                navigation_ms=row.get("navigation_ms") if scored else None,
+                network=row.get("network_summary") if scored else None,
+                checkpoints=row.get("checkpoint_layout") if scored else None,
+            )
+            cell["samples"] += 1
+            cell[status + "_samples"] += 1
+    return {"run_id": run_id, "cases": list(cells.values())}
 
 
 def milestone_timeline(store, run_id):
@@ -269,6 +322,9 @@ def ci_summary(store, run_id, output):
                 f"| Browser receipts without measured coverage | {len(coverage['unmeasured_receipts'])} |",
             ]
         )
+    scenario_views = [v for v in views if v.get("scenario")]
+    if scenario_views:
+        lines.append(f"| Named browser scenario samples passed | {sum(v['passed_samples'] for v in scenario_views)} / {sum(v['samples'] for v in scenario_views)} |")
     from .contracts import catalog_history
     samples = catalog_history(store, run_id)["observations"]
     if samples:

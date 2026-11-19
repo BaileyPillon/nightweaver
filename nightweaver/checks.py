@@ -9,7 +9,9 @@ from tempfile import mkdtemp
 import time
 
 from .process import execute
+from .journeys import browser_cases, case_prefix
 from .safety import redact, write_json
+from .spec import read_json
 
 
 def contract_hash(check):
@@ -83,58 +85,244 @@ def read_browser_evidence(config, out, receipt, max_bytes):
             raise ValueError(f"Invalid or oversized browser evidence: {file.name}")
         with file.open("rb") as stream:
             digest = file_digest(stream, "sha256").hexdigest()
-        receipt["artifacts"].append({"name": file.name, "path": str(file), "sha256": digest})
+        receipt["artifacts"].append(
+            {"name": file.name, "path": str(file), "sha256": digest}
+        )
         if size:
             nonempty_files.add(file.name)
 
-    report = json.loads((out / "browser.json").read_text(encoding="utf-8"))
+    report = read_json(out / "browser.json")
     if not isinstance(report, dict) or type(report.get("passed")) is not bool:
         raise ValueError("Invalid browser verdict")
     if receipt["exit"] not in (0, 1) or report["passed"] != (receipt["exit"] == 0):
-        raise ValueError(f"Browser verdict disagrees with process exit {receipt['exit']}")
+        raise ValueError(
+            f"Browser verdict disagrees with process exit {receipt['exit']}"
+        )
     if "error" in report:
         kind = report.get("failure_kind")
-        if report["passed"] or "viewports" in report or not isinstance(report["error"], str):
+        if (
+            report["passed"]
+            or "viewports" in report
+            or not isinstance(report["error"], str)
+        ):
             raise ValueError("Contradictory browser error receipt")
         issue = redact(report["error"])[:4000]
         if kind == "candidate_startup":
-            receipt["browser_failures"] = [{"stage": {"action": "startup"}, "error": issue}]
+            receipt["browser_failures"] = [
+                {"stage": {"action": "startup"}, "error": issue}
+            ]
             return
-        receipt["browser_issue"] = kind if kind == "browser_environment" else "verification_error"
+        receipt["browser_issue"] = (
+            kind if kind == "browser_environment" else "verification_error"
+        )
         raise ValueError(issue or "Browser verifier returned no diagnosis")
 
     views = report.get("viewports")
-    expected = {v["name"] for v in config["viewports"]}
-    if (not isinstance(views, list) or len(views) != len(expected)
-            or any(not isinstance(v, dict) or not isinstance(v.get("viewport"), str) for v in views)
-            or {v["viewport"] for v in views} != expected):
-        raise ValueError("Browser receipt does not cover each configured viewport exactly once")
-    planned = len(config["steps"])
-    checkpoints = [(i, s["value"]) for i, s in enumerate(config["steps"], 1) if s["action"] == "checkpoint"]
+    expected = {
+        (s.get("name"), v["name"]): steps for s, v, steps in browser_cases(config)
+    }
+    if (
+        not isinstance(views, list)
+        or len(views) != len(expected)
+        or any(
+            not isinstance(v, dict)
+            or not isinstance(v.get("viewport"), str)
+            or not isinstance(v.get("scenario", ""), str)
+            for v in views
+        )
+        or {(v.get("scenario"), v["viewport"]) for v in views} != expected.keys()
+    ):
+        raise ValueError(
+            "Browser receipt does not cover each configured viewport exactly once"
+        )
+    schema = report.get("schema")
+    modern = schema == "nightweaver.browser.v2"
+    if (schema is not None and not modern) or ("scenarios" in config and not modern):
+        raise ValueError("Unsupported browser evidence schema for this plan")
+    if modern:
+        runtime = report.get("runtime")
+        if not isinstance(runtime, dict) or not all(
+            isinstance(runtime.get(k), str) and runtime[k]
+            for k in ("chromium", "playwright", "channel")
+        ):
+            raise ValueError("Invalid browser runtime receipt")
+        receipt["browser_runtime"] = runtime
     coverage, failures = [], []
     for view in views:
-        passed, completed, name = view.get("passed"), view.get("completed_steps"), view["viewport"]
-        if (type(passed) is not bool or type(completed) is not int or not 0 <= completed <= planned
-                or (passed and completed != planned)):
-            raise ValueError(f"Invalid browser step coverage for {name}: {completed}/{planned}")
+        passed, completed, name = (
+            view.get("passed"),
+            view.get("completed_steps"),
+            view["viewport"],
+        )
+        scenario = view.get("scenario")
+        prefix = case_prefix(scenario, name)
+        steps = expected[scenario, name]
+        planned = len(steps)
+        if (
+            type(passed) is not bool
+            or type(completed) is not int
+            or not 0 <= completed <= planned
+            or (passed and completed != planned)
+        ):
+            raise ValueError(
+                f"Invalid browser step coverage for {name}: {completed}/{planned}"
+            )
         if not isinstance(view.get("errors"), list) or (passed and view["errors"]):
             raise ValueError(f"Invalid browser errors for {name}")
-        required = {f"{name}.png", f"{name}.trace.zip"}
-        required.update(f"checkpoint.{name}.{label}.png" for i, label in checkpoints if i <= completed)
+        required = {f"{prefix}.png", f"{prefix}.trace.zip"}
+        finished = list(enumerate(steps[:completed], 1))
+        required.update(
+            f"checkpoint.{prefix}.{s['value']}.png"
+            for i, s in finished
+            if s["action"] == "checkpoint"
+        )
+        required.update(
+            f"{prefix}.{i:02d}.actual.png"
+            for i, s in finished
+            if s["action"] == "visual_match"
+        )
         if missing := required - nonempty_files:
-            raise ValueError(f"Missing or empty browser evidence for {name}: {', '.join(sorted(missing))}")
-        coverage_row = {"viewport": name, "passed": passed, "completed_steps": completed, "planned_steps": planned}
+            raise ValueError(
+                f"Missing or empty browser evidence for {name}: {', '.join(sorted(missing))}"
+            )
+        coverage_row = {
+            "viewport": name,
+            "passed": passed,
+            "completed_steps": completed,
+            "planned_steps": planned,
+        }
+        if scenario is not None:
+            coverage_row["scenario"] = scenario
+        overflow = view.get("overflow_px")
+        if "overflow_px" in view or (modern and passed):
+            if type(overflow) is not int or overflow < 0 or (passed and overflow > 1):
+                raise ValueError(f"Invalid browser layout observation for {prefix}")
+            coverage_row["overflow_px"] = overflow
+        if "network" in config:
+            count = view.get("http_requests")
+            if (
+                type(count) is not int
+                or count < 0
+                or (passed and count > config["network"].get("max_requests", count))
+            ):
+                raise ValueError(f"Invalid browser HTTP request count for {prefix}")
+            coverage_row["http_requests"] = count
+        expected_responses = [
+            {"index": i, **s["value"]} for i, s in finished if s["action"] == "response"
+        ]
+        if view.get("response_matches", []) != expected_responses:
+            raise ValueError(
+                f"Browser HTTP observations differ from completed steps for {prefix}"
+            )
+        if expected_responses:
+            coverage_row["response_matches"] = expected_responses
+        if modern:
+            for key in ("navigation_ms", "duration_ms"):
+                if key == "navigation_ms" and key not in view and not passed:
+                    continue
+                if type(view.get(key)) is not int or view[key] < 0:
+                    raise ValueError(f"Invalid {key} for {prefix}")
+                coverage_row[key] = view[key]
+            summary = view.get("network_summary")
+            if not isinstance(summary, dict) or any(
+                type(summary.get(k)) is not int or summary[k] < 0
+                for k in ("requests", "failed_requests")
+            ):
+                raise ValueError(f"Invalid network summary for {prefix}")
+            for key in ("by_type", "response_classes"):
+                if not isinstance(summary.get(key), dict) or any(
+                    type(n) is not int or n < 0 for n in summary[key].values()
+                ):
+                    raise ValueError(f"Invalid network counts for {prefix}")
+            if (
+                sum(summary["by_type"].values()) != summary["requests"]
+                or (
+                    "network" in config and view["http_requests"] != summary["requests"]
+                )
+                or (
+                    passed
+                    and config.get("network", {}).get("require_success")
+                    and (
+                        summary["failed_requests"]
+                        or summary["response_classes"].get("4xx")
+                        or summary["response_classes"].get("5xx")
+                    )
+                )
+            ):
+                raise ValueError(f"Inconsistent network summary for {prefix}")
+            coverage_row["network_summary"] = summary
+            checkpoints = view.get("checkpoints", [])
+            expected_checkpoints = [
+                (i, s["value"], f"checkpoint.{prefix}.{s['value']}.png")
+                for i, s in finished
+                if s["action"] == "checkpoint"
+            ]
+            if (
+                not isinstance(checkpoints, list)
+                or any(
+                    not isinstance(c, dict)
+                    or type(c.get("overflow_px")) is not int
+                    or c["overflow_px"] < 0
+                    for c in checkpoints
+                )
+                or [(c.get("step"), c.get("name"), c.get("file")) for c in checkpoints]
+                != expected_checkpoints
+            ):
+                raise ValueError(f"Inconsistent checkpoint layout for {prefix}")
+            coverage_row["checkpoint_layout"] = [
+                {k: c[k] for k in ("step", "name", "overflow_px")} for c in checkpoints
+            ]
+        visuals = view.get("visual_matches", [])
+        if not isinstance(visuals, list) or any(
+            not isinstance(v, dict) for v in visuals
+        ):
+            raise ValueError(f"Invalid visual measurements for {prefix}")
+        for i, s in finished:
+            if s["action"] != "visual_match":
+                continue
+            matches = [v for v in visuals if v.get("step") == f"{prefix}.{i:02d}"]
+            contract = s["value"]
+            if len(matches) != 1:
+                raise ValueError(f"Missing visual measurement for {prefix} step {i}")
+            v = matches[0]
+            total, changed = v.get("total_pixels"), v.get("changed_pixels")
+            if (
+                v.get("baseline_sha256") != contract["sha256"]
+                or type(total) is not int
+                or not 0 < total <= 16000000
+                or type(changed) is not int
+                or not 0 <= changed <= total
+                or changed * 1000000 > total * contract.get("max_changed_ppm", 0)
+            ):
+                raise ValueError(
+                    f"Visual measurement outside contract for {prefix} step {i}"
+                )
+        if visuals:
+            coverage_row["visual_matches"] = visuals
         timings = view.get("step_durations_ms")
         if timings is not None:
-            if (not isinstance(timings, list) or not completed <= len(timings) <= min(completed + 1, planned)
-                    or any(type(v) is not int or v < 0 for v in timings)):
+            if (
+                not isinstance(timings, list)
+                or not completed <= len(timings) <= min(completed + 1, planned)
+                or any(type(v) is not int or v < 0 for v in timings)
+            ):
                 raise ValueError(f"Invalid browser step durations for {name}")
             coverage_row["step_durations_ms"] = timings
         coverage.append(coverage_row)
         if not passed:
-            failures.append({"viewport": name, "stage": view.get("failed_at"),
-                             "error": str(next(iter(view["errors"]), ""))[:600],
-                             "errors": [str(error)[:240] for error in dict.fromkeys(map(str, view["errors"]))][:4]})
+            failures.append(
+                {
+                    "viewport": name,
+                    **({"scenario": scenario} if scenario is not None else {}),
+                    "stage": view.get("failed_at"),
+                    "error_counts": view.get("error_counts", {}),
+                    "error": str(next(iter(view["errors"]), ""))[:600],
+                    "errors": [
+                        str(error)[:240]
+                        for error in dict.fromkeys(map(str, view["errors"]))
+                    ][:4],
+                }
+            )
     if report["passed"] == bool(failures):
         raise ValueError("Browser verdict disagrees with viewport results")
     receipt["browser_coverage"] = coverage

@@ -66,23 +66,32 @@ def browser_hotspots(store, run_id):
         check = gates[gate - 1]
         if check.get("kind") != "browser":
             continue
-        actions = check["browser"]["steps"]
+        config = check["browser"]
+        actions_by_case = {scenario.get("name",""):config["steps"] + scenario.get("steps",[])
+                           for scenario in config.get("scenarios",[{}])}
         if observed_pass(d) is None or not d.get("browser_coverage"):
             unmeasured += 1
             unlocated += len(d.get("browser_failures", []))
             continue
         for view in d["browser_coverage"]:
+            scenario = view.get("scenario","")
+            actions = actions_by_case.get(scenario,[])
             durations = view.get("step_durations_ms")
             if durations is None:
                 unmeasured += 1
             else:
                 for index, duration in enumerate(durations, 1):
-                    key = (step, check["name"], view["viewport"], index, actions[index - 1]["action"])
+                    if index > len(actions):
+                        unmeasured += 1
+                        continue
+                    key = (step, check["name"], view["viewport"], index, actions[index - 1]["action"], scenario)
                     groups[key].append(duration)
         for fail in d.get("browser_failures", []):
+            scenario = fail.get("scenario","")
+            actions = actions_by_case.get(scenario,[])
             index = (fail.get("stage") or {}).get("index")
             if type(index) is int and 1 <= index <= len(actions) and fail.get("viewport"):
-                key = (step, check["name"], fail["viewport"], index, actions[index - 1]["action"])
+                key = (step, check["name"], fail["viewport"], index, actions[index - 1]["action"], scenario)
                 failures[key] += 1
             else:
                 unlocated += 1
@@ -96,6 +105,7 @@ def browser_hotspots(store, run_id):
                 "viewport": key[2],
                 "action_index": key[3],
                 "action": key[4],
+                **({"scenario":key[5]} if key[5] else {}),
                 "timed_observations": len(durations),
                 "median_ms": median(durations) if durations else None,
                 "total_ms": sum(durations) if durations else None,
