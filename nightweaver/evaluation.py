@@ -135,7 +135,7 @@ def call_frontier(runs):
 def failure_groups(runs):
     groups = defaultdict(list)
     for row in runs:
-        if row["accepted"]:
+        if row["accepted"] or row["phase"] not in ("done", "blocked"):
             continue
         stage = row.get("last_rejection_stage") if row["outcome"] == "rejected" else None
         groups[row["outcome"], stage or ""].append(row)

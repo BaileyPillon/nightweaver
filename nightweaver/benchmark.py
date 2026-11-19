@@ -15,7 +15,7 @@ import platform
 
 from . import __version__
 
-from .engine import create_run, git, source_info
+from .engine import create_run, directory_identity, git, source_info
 from .reports import document, metrics
 from .safety import atomic_write, redact, write_json
 from .spec import array, fields, integer, provider, IMPLEMENTERS, read_plan, read_json
@@ -32,7 +32,10 @@ def config_digest(config):
 def create_suite(store, source, *, preview=False):
     source = Path(source).resolve(strict=True)
     raw = read_json(source)
-    fields(raw, "name tasks contenders repetitions seed", "benchmark")
+    fields(raw, "name tasks contenders repetitions seed schedule", "benchmark")
+    schedule = raw.get("schedule", "shuffle")
+    if schedule not in ("shuffle", "balanced"):
+        raise ValueError("Benchmark schedule must be shuffle or balanced")
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Benchmark needs a name")
@@ -57,12 +60,15 @@ def create_suite(store, source, *, preview=False):
         if mode == "standalone" and (contender["worker"]["kind"] not in {"codex", "claude", "gemini", "deepseek"}
                                     or contender.get("reviewer") or contender.get("worker_fallbacks")):
             raise ValueError("Standalone contenders require one native model CLI without reviewer or fallback")
-        if contender.get("reviewer"):
+        if "reviewer" in contender:
             contender["reviewer"] = provider(contender["reviewer"], IMPLEMENTERS, "benchmark reviewer", source.parent)
         contender["worker_fallbacks"] = [provider(route, IMPLEMENTERS, "benchmark fallback", source.parent) for route in
                                           array(contender.get("worker_fallbacks", []), "benchmark fallbacks", 5)]
     for task in tasks:
-        fields(task, "name plan", "benchmark task")
+        fields(task, "name plan tags", "benchmark task")
+        tags = array(task.get("tags", []), "task tags", 32)
+        if any(not isinstance(tag, str) or not tag.strip() or tag != tag.strip() for tag in tags) or len(set(tags)) != len(tags):
+            raise ValueError("Task tags must be distinct nonempty strings without surrounding spaces")
         if not isinstance(task.get("name"), str) or not task["name"].strip() or task["name"] in task_names:
             raise ValueError("Task names must be unique nonempty strings")
         task_names.add(task["name"])
@@ -77,10 +83,12 @@ def create_suite(store, source, *, preview=False):
         spec["expected_base"] = source_data["base"]
         # Match the operator's full brief and checks before adapting it to each contender.
         contract = {k: v for k, v in spec.items() if k not in
-                    {"repository", "project", "expected_base", "reviewer", "reviewer_fallbacks", "milestones"}}
+                    {"repository", "project", "git_common_dir", "expected_base", "reviewer", "reviewer_fallbacks", "milestones"}}
         contract["milestones"] = [{k: v for k, v in step.items() if k not in {"worker", "worker_fallbacks"}}
                                   for step in spec["milestones"]]
         digest = config_digest(contract)
+        spec["git_common_dir"] = source_data["git_common_dir"]
+        spec["git_directory_identity"] = directory_identity(source_data["git_common_dir"])
         if not spec.get("budgets", {}).get("max_seconds"):
             raise ValueError("Benchmark task plans require a max_seconds budget")
         for contender in contenders:
@@ -117,8 +125,28 @@ def create_suite(store, source, *, preview=False):
                     plan.pop("advisory_ollama", None)
                 prepared.append({"task": task["name"], "contract_sha256": digest, "route_sha256": route_hash,
                                  "contender": contender["name"], "repeat": repeat + 1,
-                                 "mode": contender.get("mode", "nightweaver"), "plan": plan})
-    random.Random(seed).shuffle(prepared)
+                                 "mode": contender.get("mode", "nightweaver"), "tags": tags, "plan": plan})
+    rng = random.Random(seed)
+    if schedule == "shuffle":
+        rng.shuffle(prepared)
+    else:
+        # Each task has a seeded first order. Rotate it each repetition so every
+        # contender takes every position once per full cycle.
+        orders = {}
+        for task_name in sorted(task_names):
+            order = sorted(contender_names)
+            rng.shuffle(order)
+            orders[task_name] = order
+        blocks = sorted({(r["task"], r["repeat"]) for r in prepared})
+        rng.shuffle(blocks)
+        slot = {key: i for i, key in enumerate(blocks)}
+        def position(row):
+            order = orders[row["task"]]
+            return slot[row["task"], row["repeat"]], (order.index(row["contender"]) - row["repeat"] + 1) % len(order)
+        prepared.sort(key=position)
+    coordinates = [{k: r[k] for k in ("task", "contender", "repeat", "mode", "tags", "contract_sha256", "route_sha256")}
+                   | {"baseline": r["plan"]["expected_base"]} for r in prepared]
+    matrix_digest = config_digest(redact(coordinates))
     if preview:
         rows = [{**{k: v for k, v in row.items() if k != "plan"}, "baseline": row["plan"]["expected_base"],
                  "max_seconds": row["plan"]["budgets"]["max_seconds"],
@@ -130,13 +158,19 @@ def create_suite(store, source, *, preview=False):
             budgets.append({"contender": label, "trials": len(trials), "capped_call_trials": len(caps),
                             "max_calls": sum(caps) if len(caps) == len(trials) else None,
                             "max_seconds": sum(r["max_seconds"] for r in trials)})
-        return {"name": name, "seed": seed, "trials": len(rows), "runs": rows, "contender_budgets": budgets,
+        task_budgets = []
+        for label in sorted(task_names):
+            trials = [r for r in rows if r["task"] == label]
+            task_budgets.append({"task": label, "trials": len(trials), "max_seconds": sum(r["max_seconds"] for r in trials),
+                                 "max_calls": sum(r["max_calls"] for r in trials) if all(r["max_calls"] is not None for r in trials) else None})
+        return {"name": name, "seed": seed, "schedule": schedule, "matrix_sha256": matrix_digest,
+                "trials": len(rows), "runs": rows, "contender_budgets": budgets, "task_budgets": task_budgets,
                 "configured_seconds_total": sum(row["max_seconds"] for row in rows),
                 "configured_call_cap_total": (sum(row["max_calls"] for row in rows)
                                               if all(row["max_calls"] is not None for row in rows) else None)}
     suite_id = uuid4().hex[:12]
     manifest = {"id": suite_id, "name": name, "seed": seed, "repetitions": repetitions, "runs": [],
-                "planned_trials": len(prepared),
+                "planned_trials": len(prepared), "matrix_sha256": matrix_digest, "schedule": schedule,
                 "runtime": {"nightweaver": __version__, "python": platform.python_version(), "platform": platform.platform()},
                 "contenders": contenders}
     target = store.root / "benchmarks" / f"{suite_id}.json"
@@ -144,7 +178,8 @@ def create_suite(store, source, *, preview=False):
     for row in prepared:
         plan = row.pop("plan")
         run_id = create_run(store, plan)
-        store.transition(run_id, "benchmark_registered", {"suite": suite_id, **row})
+        store.transition(run_id, "benchmark_registered", {"suite": suite_id, "matrix_sha256": matrix_digest,
+                                                         "schedule": schedule, "seed": seed, **row})
         manifest["runs"].append({**row, "run_id": run_id, "baseline": plan["expected_base"]})
         write_json(target, manifest)
     return {"benchmark_id": suite_id, "runs": len(prepared), "manifest": str(target), "started": False}
@@ -152,7 +187,9 @@ def create_suite(store, source, *, preview=False):
 
 def read_suite(store, suite_id):
     store.directory(suite_id)  # validate identifier without accepting arbitrary paths
-    suite = json.loads((store.root / "benchmarks" / f"{suite_id}.json").read_text(encoding="utf-8"))
+    suite = read_json(store.root / "benchmarks" / f"{suite_id}.json")
+    if suite.get("id") != suite_id:
+        raise ValueError("Benchmark manifest ID differs from the selected suite")
     registered = len(suite["runs"])
     if registered != suite.get("planned_trials", registered):
         raise ValueError(f"Incomplete benchmark registration: {registered}/{suite['planned_trials']} trials")
@@ -163,6 +200,36 @@ def read_suite(store, suite_id):
             raise ValueError("Duplicate trial coordinate or run ID in benchmark manifest")
         coordinates.add(key)
         ids.add(row["run_id"])
+    if not ids or len(ids) > 500:
+        raise ValueError("Benchmark manifest must contain between 1 and 500 trials")
+    # All historical suite registrations wrote this event, including suites
+    # created before contract and route digests were introduced.
+    with store.connect() as db:
+        placeholders = ",".join("?" for _ in ids)
+        registrations = db.execute(
+            f"SELECT e.run_id,e.details,json_extract(r.state,'$.base') AS base FROM events e "
+            f"JOIN runs r ON e.run_id=r.id WHERE e.kind='benchmark_registered' AND e.run_id IN ({placeholders})",
+            tuple(ids)).fetchall()
+    receipts = {r["run_id"]: (json.loads(r["details"]), r["base"]) for r in registrations}
+    if len(registrations) != len(ids) or receipts.keys() != ids:
+        raise ValueError("Benchmark trials lack unique registration receipts")
+    for row in suite["runs"]:
+        receipt, base = receipts[row["run_id"]]
+        if (receipt.get("suite") != suite_id or type(row["repeat"]) is not int
+                or any(redact(row[k]) != receipt.get(k) for k in ("task", "contender", "repeat"))
+                or any(redact(row[k]) != receipt.get(k) for k in ("contract_sha256", "route_sha256", "mode") if k in row)
+                or redact(row.get("tags")) != receipt.get("tags")
+                or any(suite.get(k) != receipt[k] for k in ("schedule", "seed") if k in receipt)
+                or row.get("baseline", base) != base or suite.get("matrix_sha256") != receipt.get("matrix_sha256")):
+            raise ValueError("Benchmark trial differs from its registration receipt")
+    if suite.get("matrix_sha256"):
+        # Legacy exports can omit optional hashes. Use the original registration
+        # to validate membership/order without granting missing fields a score.
+        frozen = [{k: receipts[r["run_id"]][0].get(k) for k in
+                   ("task", "contender", "repeat", "mode", "tags", "contract_sha256", "route_sha256")}
+                  | {"baseline": receipts[r["run_id"]][1]} for r in suite["runs"]]
+        if config_digest(frozen) != suite["matrix_sha256"]:
+            raise ValueError("Benchmark matrix differs from its registered order or membership")
     return suite
 
 
@@ -195,6 +262,7 @@ def reliability(runs, k):
         den = comb(n, k) if n >= k and base and contract and route and mode else 0
         results.append({"contender":name, "task":task, "base":base, "contract_sha256":contract, "route_sha256":route, "mode":mode,
                         "scored":n, "accepted":c, "excluded":len(rows)-n, "k":k,
+                        "unavailable_reason": (None if den else "missing_identity" if not (base and contract and route and mode) else "insufficient_scored_repeats"),
                         "pass_at_k":1 - comb(n-c,k)/den if den else None, "pass_all_k":comb(c,k)/den if den else None})
     return results
 
@@ -205,6 +273,15 @@ def select_trials(rows, task=None, contender=None, repeat=None):
                 and (repeat is None or r["repeat"] == repeat)]
     if not selected:
         raise ValueError("No registered benchmark trials match the selection")
+    return selected
+
+
+def filter_tag(rows, tag):
+    if tag is None:
+        return rows
+    selected = [row for row in rows if tag in row.get("tags", [])]
+    if not selected:
+        raise ValueError(f"No registered tasks have tag {tag!r}")
     return selected
 
 
@@ -221,6 +298,11 @@ def summarize(runs):
         for r in valid:
             by_task.setdefault(r["task"], []).append(r["accepted"])
         scored_passes = sum(r["accepted"] for r in valid)
+        started_calls = sum(r["provider_calls"] for r in rows)
+        unknown_calls = sum(r["usage_unknown_calls"] + r["usage_pending_calls"] for r in rows)
+        first_pass = sum(r["accepted"] and r.get("total_milestones", 0) > 0
+                         and r.get("first_pass_milestones") == r["total_milestones"] for r in rows)
+        repaired = sum(r["accepted"] and r.get("repaired_milestones", 0) > 0 for r in rows)
         summaries.append({"contender": name, "planned": len(rows), "finished": len(completed), "accepted": successes,
                           "scored_trials": len(valid), "scored_tasks": len(by_task),
                           "macro_task_acceptance": (sum(sum(v)/len(v) for v in by_task.values())/len(by_task) if by_task else None),
@@ -229,8 +311,12 @@ def summarize(runs):
                           "blocked": sum(row["phase"] == "blocked" for row in rows),
                           "unfinished": len(rows) - len(completed),
                           "acceptance_rate": successes / len(rows), "unassisted": sum(row["unassisted_acceptance"] for row in rows),
+                          "first_pass_acceptances": first_pass, "accepted_after_repair": repaired,
+                          "unclassified_acceptances": successes - first_pass - repaired,
                           "finished_acceptance_rate": successes / len(completed) if completed else None,
-                          "calls_all_attempts": sum(row["provider_calls"] for row in rows),
+                          "calls_all_attempts": started_calls,
+                          "calls_with_token_usage": started_calls - unknown_calls,
+                          "token_coverage_fraction": (started_calls - unknown_calls) / started_calls if started_calls else None,
                           "observed_tokens": sum(row["observed_tokens"] or 0 for row in rows) if any(
                               row["observed_tokens"] is not None for row in rows) else None,
                           "usage_unknown_calls": sum(row["usage_unknown_calls"] for row in rows),
@@ -244,18 +330,26 @@ def summarize(runs):
 def paired_outcomes(runs):
     pairs = []
     for left, right in combinations(sorted({row["contender"] for row in runs}), 2):
-        sides = [{(row["task"], row["repeat"], row.get("baseline")): row for row in runs if row["contender"] == name}
+        sides = [{(row["task"], row["repeat"]): row for row in runs if row["contender"] == name}
                  for name in (left, right)]
         counts = dict(both_accepted=0, left_only_accepted=0, right_only_accepted=0, neither_accepted=0,
                       unfinished_pairs=0, inconclusive_pairs=0)
         time_ratios = []
+        exclusions = Counter()
         for key in sides[0].keys() | sides[1].keys():
             a, b = sides[0].get(key), sides[1].get(key)
             if not a or not b or any(row["phase"] not in ("done", "blocked") for row in (a, b)):
                 counts["unfinished_pairs"] += 1
-            elif (not a.get("baseline") or not a.get("contract_sha256") or a["contract_sha256"] != b.get("contract_sha256")
-                  or any(row.get("outcome") in INCONCLUSIVE for row in (a, b))):
+                exclusions["missing_side" if not a or not b else "unfinished"] += 1
+            elif (not a.get("baseline") or a["baseline"] != b.get("baseline") or not a.get("contract_sha256")
+                  or a["contract_sha256"] != b.get("contract_sha256") or any(row.get("outcome") in INCONCLUSIVE for row in (a, b))):
                 counts["inconclusive_pairs"] += 1
+                if not all(row.get("baseline") and row.get("contract_sha256") for row in (a,b)):
+                    exclusions["unknown_inputs"] += 1
+                elif a["baseline"] != b["baseline"] or a["contract_sha256"] != b["contract_sha256"]:
+                    exclusions["changed_inputs"] += 1
+                else:
+                    exclusions["operational_outcome"] += 1
             else:
                 label = ("both_accepted" if b["accepted"] else "left_only_accepted") if a["accepted"] else (
                     "right_only_accepted" if b["accepted"] else "neither_accepted")
@@ -268,7 +362,7 @@ def paired_outcomes(runs):
         discordant = wins + losses
         p_value = min(1.0, 2 * sum(comb(discordant, k) for k in range(min(wins, losses) + 1))
                       / 2 ** discordant) if discordant else None
-        pairs.append({"left": left, "right": right, **counts, "scored_pairs": scored,
+        pairs.append({"left": left, "right": right, **counts, "scored_pairs": scored, "exclusion_reasons": dict(exclusions),
                       "discordant_pairs": discordant, "exact_two_sided_p": p_value,
                       "acceptance_gap_left_minus_right_pp": round(100 * difference / scored, 2) if scored else None,
                       "timed_success_pairs": len(time_ratios),
@@ -276,16 +370,18 @@ def paired_outcomes(runs):
     return pairs
 
 
-def suite_report(store, suite_id, output=None):
+def suite_report(store, suite_id, output=None, *, tag=None):
     suite = read_suite(store, suite_id)
-    runs = [{**item, **metrics(store, item["run_id"])} for item in suite["runs"]]
+    items = filter_tag(suite["runs"], tag)
+    runs = [{**item, **metrics(store, item["run_id"]), "baseline": item.get("baseline")} for item in items]
     summaries = summarize(runs)
     per_task = []
     for task in sorted({r["task"] for r in runs}):
         group = [r for r in runs if r["task"] == task]
         per_task.append({"task": task, "summaries": summarize(group), "paired_outcomes": paired_outcomes(group)})
     result = {"benchmark_id": suite_id, "name": suite["name"], "summaries": summaries, "runs": runs,
-              "per_task": per_task,
+              "per_task": per_task, "seed": suite.get("seed"), "schedule": suite.get("schedule", "shuffle"),
+              "matrix_sha256": suite.get("matrix_sha256"), "tag": tag,
               "paired_outcomes": paired_outcomes(runs), "runtime": suite.get("runtime", {}),
               "interpretation": "Exploratory paired task runs; no automatic winner or statistical significance claim. "
               "Unfinished runs are not failures. acceptance_rate uses all planned runs; finished_acceptance_rate uses only done/blocked runs. "
@@ -295,9 +391,9 @@ def suite_report(store, suite_id, output=None):
               "Calls count CLI invocations, not equal model compute. Inspect modes, model versions and usage coverage."}
     result = redact(result)
     if output:
-        body = f'<header><h1>{escape(result["name"])}</h1><p>{escape(result["interpretation"])}</p></header><h2>Contenders</h2><div class="table"><table><thead><tr><th>Setup</th><th>Finished / planned</th><th>Accepted / finished</th><th>Outcomes</th><th>No intervention</th><th>Total calls</th><th>Seconds / acceptance</th></tr></thead><tbody>'
+        body = f'<header><h1>{escape(result["name"])}</h1><p>{escape(result["interpretation"])}</p></header><h2>Contenders</h2><div class="table"><table><thead><tr><th>Setup</th><th>Finished / planned</th><th>Accepted / finished</th><th>Scored / planned</th><th>Outcomes</th><th>No intervention</th><th>Total calls</th><th>Seconds / acceptance</th></tr></thead><tbody>'
         for row in result["summaries"]:
-            body += '<tr>' + ''.join(f'<td>{escape(str(value))}</td>' for value in [row["contender"], f'{row["finished"]}/{row["planned"]}', f'{row["accepted"]}/{row["finished"]}', ", ".join(f"{key.replace('_', ' ')}: {count}" for key, count in row["outcomes"].items()), row["unassisted"], row["calls_all_attempts"], row["seconds_per_acceptance"] if row["seconds_per_acceptance"] is not None else "Unavailable"]) + '</tr>'
+            body += '<tr>' + ''.join(f'<td>{escape(str(value))}</td>' for value in [row["contender"], f'{row["finished"]}/{row["planned"]}', f'{row["accepted"]}/{row["finished"]}', f'{row["scored_trials"]}/{row["planned"]}', ", ".join(f"{key.replace('_', ' ')}: {count}" for key, count in row["outcomes"].items()), row["unassisted"], row["calls_all_attempts"], row["seconds_per_acceptance"] if row["seconds_per_acceptance"] is not None else "Unavailable"]) + '</tr>'
         body += ('</tbody></table></div><h2>Matched outcomes</h2><p>Acceptance gap is left minus right in percentage points. '
                  'Time ratio divides right elapsed time by left elapsed time on pairs where both passed. '
                  'A ratio above 1 means the left workflow was faster.</p><div class="table"><table><thead><tr>'

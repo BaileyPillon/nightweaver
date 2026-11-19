@@ -116,7 +116,8 @@ def metrics(store, run_id):
         "queue_seconds": interval(queued, start), "seconds_to_first_acceptance": interval(start, first_acceptance),
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
         "failed_attempts": kinds.count("attempt_rejected"), "gate_failures": sum(
-            event["kind"] == "gate_finished" and observed_pass(event["details"]) is not True for event in events),
+            event["kind"] == "gate_finished" and observed_pass(event["details"]) is False for event in events),
+        "gate_unscored": sum(event["kind"] == "gate_finished" and observed_pass(event["details"]) is None for event in events),
         "interventions": interventions, "unassisted_acceptance": row["state"]["phase"] == "done" and interventions == 0,
         "interruptions_recovered": kinds.count("interrupted_worker_recovered"),
         "fallbacks": kinds.count("provider_fallback"), "observed_tokens": recorded if calls and unknown < len(calls) else None,

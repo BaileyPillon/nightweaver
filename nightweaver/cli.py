@@ -332,6 +332,7 @@ def main(argv=None):
     for action in ("run", "report", "retry-blocked", "shard"):
         bench_parser = bench_sub.add_parser(action)
         bench_parser.add_argument("id")
+        bench_parser.add_argument("--tag", help="Select tasks with this exact suite tag")
         if action == "report":
             bench_parser.add_argument("--output", type=Path)
         else:
@@ -354,6 +355,27 @@ def main(argv=None):
     csv_cmd = bench_sub.add_parser("csv", help="Export one spreadsheet row per trial")
     csv_cmd.add_argument("id")
     csv_cmd.add_argument("--output", type=Path, required=True)
+    for action, description in (
+        ("interval", "Bootstrap a task-weighted difference on fully comparable tasks"),
+        ("instability", "Find repeated tasks with both passes and failures"),
+        ("efficiency", "Count all attempts per accepted trial and report token coverage"),
+        ("latency", "Measure elapsed, queue and first-acceptance latency distributions"),
+        ("footprint", "Measure accepted Git changes, including text and binary files"),
+        ("audit", "Verify registered checkout, baseline and saved context for every trial"),
+        ("qualify", "Check a contender against a minimum task-weighted acceptance rate"),
+        ("jsonl", "Export nested evidence as one JSON object per trial"),
+    ):
+        analysis = bench_sub.add_parser(action, help=description)
+        analysis.add_argument("id")
+        if action == "interval":
+            analysis.add_argument("--samples", type=int, default=2000)
+            analysis.add_argument("--seed", type=int, default=42)
+        elif action == "qualify":
+            analysis.add_argument("--contender", required=True)
+            analysis.add_argument("--minimum-percent", type=float, required=True)
+            analysis.add_argument("--minimum-tasks", type=int, default=1)
+        elif action == "jsonl":
+            analysis.add_argument("--output", required=True, type=Path)
     compare = bench_sub.add_parser("compare", help="Compare matching trials from two saved suites")
     compare.add_argument("before")
     compare.add_argument("after")
@@ -514,7 +536,28 @@ def main(argv=None):
             if args.benchmark_action in ("preview", "create"):
                 output(create_suite(store, args.suite, preview=args.benchmark_action == "preview"))
             elif args.benchmark_action == "report":
-                output(suite_report(store, args.id, args.output))
+                output(suite_report(store, args.id, args.output, tag=args.tag))
+            elif args.benchmark_action == "audit":
+                from .benchmark_analysis import audit_inputs
+                result = audit_inputs(store, args.id)
+                output(result)
+                return {"pass": 0, "failed": 3, "inconclusive": 4}[result["verdict"]]
+            elif args.benchmark_action in ("interval", "instability", "efficiency", "latency", "qualify", "footprint"):
+                from .benchmark_analysis import task_intervals, instability, efficiency, latency, qualify, footprint
+                rows = suite_report(store, args.id)["runs"]
+                if args.benchmark_action == "qualify":
+                    result = qualify(rows, args.contender, args.minimum_percent, args.minimum_tasks)
+                    output(result)
+                    return {"pass": 0, "below_floor": 3, "inconclusive": 4}[result["verdict"]]
+                if args.benchmark_action == "interval":
+                    output(task_intervals(rows, args.seed, args.samples))
+                elif args.benchmark_action == "footprint":
+                    output(footprint(store, rows))
+                else:
+                    output({"instability": instability, "efficiency": efficiency, "latency": latency}[args.benchmark_action](rows))
+            elif args.benchmark_action == "jsonl":
+                from .benchmark_exports import export_jsonl
+                output(export_jsonl(store, args.id, args.output))
             elif args.benchmark_action == "reliability":
                 from .benchmark import reliability
                 output(reliability(suite_report(store, args.id)["runs"], args.k))
@@ -546,13 +589,15 @@ def main(argv=None):
                 output(export_junit(store, args.id, args.output))
             else:
                 results = []
-                from .benchmark import select_trials
+                from .benchmark import filter_tag, select_trials
                 from .evaluation import shard_trials
-                rows = select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat)
+                rows = filter_tag(select_trials(read_suite(store, args.id)["runs"], args.task, args.contender, args.repeat), args.tag)
                 rows = shard_trials(rows, args.shard)
                 if args.benchmark_action == "shard":
                     output({"shard": args.shard, "trials": len(rows), "runs": rows})
                     return 0
+                if not rows:
+                    raise ValueError("Selected benchmark shard contains no trials to execute")
                 for row in rows:
                     try:
                         retry = args.benchmark_action == "retry-blocked"

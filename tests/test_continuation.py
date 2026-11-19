@@ -184,7 +184,8 @@ class ComparisonTest(unittest.TestCase):
         self.assertEqual(paired_outcomes(rows)[0]["inconclusive_pairs"], 1)
         self.assertEqual(paired_outcomes(rows)[0]["left_only_accepted"], 0)
         rows[1]["baseline"] = "different"
-        self.assertEqual(paired_outcomes(rows)[0]["unfinished_pairs"], 2)
+        self.assertEqual(paired_outcomes(rows)[0]["inconclusive_pairs"], 1)
+        self.assertEqual(paired_outcomes(rows)[0]["unfinished_pairs"], 0)
 
     def test_account_blockers_are_not_presented_as_model_rejections(self):
         suite_id = self.make_suite()

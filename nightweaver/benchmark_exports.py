@@ -2,6 +2,7 @@
 
 import re
 import csv
+import json
 from io import StringIO
 from collections import Counter
 from statistics import median
@@ -66,6 +67,8 @@ def compare_suites(store, before_id, after_id):
                 "status": status,
                 "before": left["run_id"] if left else None,
                 "after": right["run_id"] if right else None,
+                "before_outcome": left.get("outcome") if left else None,
+                "after_outcome": right.get("outcome") if right else None,
                 "elapsed_delta_seconds": delta,
                 "changed_fields": changed, "provider_call_delta": calls, "observed_token_delta": tokens,
             }
@@ -115,7 +118,8 @@ def export_csv(store, suite_id, output):
     report = suite_report(store, suite_id)
     keys = ("run_id", "task", "contender", "repeat", "baseline", "contract_sha256", "route_sha256", "mode",
             "phase", "outcome", "accepted", "provider_calls", "observed_tokens", "usage_unknown_calls", "elapsed_seconds",
-            "usage_pending_calls", "interventions", "worker_attempts", "queue_seconds", "seconds_to_first_acceptance")
+            "usage_pending_calls", "interventions", "worker_attempts", "queue_seconds", "seconds_to_first_acceptance",
+            "last_rejection_stage", "failed_attempts", "gate_failures", "gate_unscored", "repaired_milestones", "fallbacks")
     stream = StringIO(newline="")
     writer = csv.writer(stream)
     writer.writerow(keys)
@@ -124,6 +128,14 @@ def export_csv(store, suite_id, output):
         writer.writerow(["'" + v if isinstance(v, str) and
                          (v.startswith(("\t", "\r", "\n")) or v.lstrip().startswith(("=", "+", "-", "@"))) else v for v in values])
     atomic_write(output, stream.getvalue().encode("utf-8-sig"))
+    return {"benchmark_id": suite_id, "file": str(output.resolve()), "trials": len(report["runs"])}
+
+
+def export_jsonl(store, suite_id, output):
+    report = suite_report(store, suite_id)
+    rows = (json.dumps({"benchmark_id": suite_id, "matrix_sha256": report["matrix_sha256"], "trial": row},
+                       ensure_ascii=False, allow_nan=False) for row in report["runs"])
+    atomic_write(output, "".join(line + "\n" for line in rows))
     return {"benchmark_id": suite_id, "file": str(output.resolve()), "trials": len(report["runs"])}
 
 
@@ -141,6 +153,10 @@ def export_junit(store, suite_id, output):
         )
         if row["elapsed_seconds"] is not None:
             case.set("time", str(row["elapsed_seconds"]))
+        properties = ET.SubElement(case, "properties")
+        for key in ("run_id", "baseline", "contract_sha256", "route_sha256", "mode"):
+            if row.get(key) is not None:
+                ET.SubElement(properties, "property", name=key, value=xml_text(row[key]))
         if row["accepted"]:
             continue
         if row["outcome"] in INCONCLUSIVE:
