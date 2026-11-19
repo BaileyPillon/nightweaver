@@ -41,7 +41,7 @@ def read_json(path):
 def scoped_milestones(raw):
     steps = raw.get("milestones", [])
     return bool(steps and any(isinstance(s, dict) and
-                              {"paths", "gates", "worker", "worker_fallbacks"} & s.keys() for s in steps))
+                              {"paths", "gates", "worker", "worker_fallbacks", "retain_gates"} & s.keys() for s in steps))
 
 
 def anchor_provider_paths(raw, folder):
@@ -139,7 +139,7 @@ def artifact(value):
 
 
 def gate_spec(item):
-    fields(item, "name argv timeout artifacts kind browser catalog max_artifact_bytes pinned_inputs stability_runs", "gate")
+    fields(item, "name argv timeout artifacts kind browser catalog junit max_artifact_bytes pinned_inputs stability_runs", "gate")
     timeout = item.get("timeout", 120)
     if type(timeout) is not int or not 1 <= timeout <= 7200:
         raise ValueError("Gate timeout must be between 1 and 7200 seconds")
@@ -149,6 +149,11 @@ def gate_spec(item):
     result = {"name": text(item, "name"), "timeout": timeout, "artifacts": artifacts,
               "max_artifact_bytes": integer(item.get("max_artifact_bytes", 32 * 1024 * 1024), "max_artifact_bytes", 1, 256 * 1024 * 1024)}
     kind = item.get("kind", "command")
+    if "junit" in item:
+        from .junit import contract
+        if kind != "command":
+            raise ValueError("JUnit settings require a command gate")
+        result["junit"] = contract(item["junit"])
     samples = integer(item.get("stability_runs", 1), "stability_runs", 1, 5)
     if samples > 1:
         result["stability_runs"] = samples
@@ -220,13 +225,32 @@ def validate(raw, relative_to=None, store=None):
     final_gates = [gate_spec(item) for item in array(raw.get("final_gates", []), "final_gates")]
     milestones = array(raw.get("milestones", []), "milestones", 50)
     steps = []
+    retained = []
     for index, item in enumerate(milestones):
-        fields(item, "title task gates paths worker worker_fallbacks", "milestone")
-        current = gates + [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
+        fields(item, "title task gates paths worker worker_fallbacks retain_gates", "milestone")
+        own = [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
+        retention = item.get("retain_gates", "local")
+        if retention not in ("local", "final", "subsequent") or (retention != "local" and not own):
+            raise ValueError("retain_gates must be local, final or subsequent and retention needs milestone gates")
+        current = gates + own
         if index == len(milestones) - 1:
             current += final_gates
         names = [g["name"] for g in current]
-        if not names or len(names) != len(set(names)):
+        if len(names) != len(set(names)):
+            raise ValueError("Each milestone needs uniquely named checks")
+        by_name = {g["name"]: g for g in current}
+        inherited = {}
+        for gate, policy, source in retained:
+            if policy == "final" and index != len(milestones) - 1:
+                continue
+            name = gate["name"]
+            if name in by_name and gate != by_name[name]:
+                raise ValueError(f"Conflicting retained gate {name!r} at milestone {index + 1}")
+            if name not in by_name:
+                current.append(gate)
+                by_name[name] = gate
+            inherited.setdefault(name, []).append(source)
+        if not current:
             raise ValueError("Each milestone needs uniquely named checks")
         paths = array(item.get("paths", []), "paths")
         steps.append({"title": text(item, "title"), "task": text(item, "task"), "gates": current,
@@ -234,6 +258,10 @@ def validate(raw, relative_to=None, store=None):
                       "worker": provider(item.get("worker", raw.get("worker")), IMPLEMENTERS, "worker", relative_to),
                       "worker_fallbacks": [provider(p, IMPLEMENTERS, "worker fallback", relative_to) for p in
                                            array(item.get("worker_fallbacks", raw.get("worker_fallbacks", [])), "worker_fallbacks", 5)]})
+        if inherited:
+            steps[-1]["retained_from"] = inherited
+        if retention != "local":
+            retained.extend((g, retention, steps[-1]["title"]) for g in own)
     if not steps:
         raise ValueError("At least one milestone is required")
     out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),

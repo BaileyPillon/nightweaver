@@ -110,8 +110,12 @@ class WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
 
 
+class ProcessLimit(RuntimeError):
+    """The controller stopped the process before it could deliver a verdict."""
+
+
 def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: False,
-            idle_timeout=None, max_log_bytes=16 * 1024 * 1024, heartbeat=None):
+            idle_timeout=None, max_log_bytes=16 * 1024 * 1024, heartbeat=None, raise_on_limit=False):
     """Run an operator-approved program using files for I/O and a native Job for ownership."""
     log.parent.mkdir(parents=True, exist_ok=True)
     prompt_path = log.with_suffix(".input.txt")
@@ -121,6 +125,12 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
     deadline = time.monotonic() + timeout
     changed_at = beat_at = time.monotonic()
     last_size = 0
+
+    def limit(code, reason):
+        if raise_on_limit:
+            raise ProcessLimit(reason)
+        return code
+
     shim = [sys.executable, str(Path(__file__).with_name("_child.py")), json.dumps(argv), str(source)]
     with TemporaryDirectory(prefix="nw-launch-") as temp, log.open("wb") as out, WindowsJob() as job:
         error_file = Path(temp) / "launch-error"
@@ -137,15 +147,15 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
                 if paused():
                     raise PausedRun
                 if time.monotonic() >= deadline:
-                    return 124
+                    return limit(124, "Gate exceeded its wall-clock timeout")
                 now = time.monotonic()
                 size = log.stat().st_size
                 if size != last_size:
                     changed_at, last_size = now, size
                 if size > max_log_bytes:
-                    return 126
+                    return limit(126, "Gate exceeded its log-size limit")
                 if idle_timeout is not None and now - changed_at >= idle_timeout:
-                    return 125
+                    return limit(125, "Gate exceeded its idle timeout")
                 if heartbeat and now - beat_at >= 10:
                     heartbeat({"pid": child.pid, "log_bytes": size})
                     beat_at = now
@@ -153,7 +163,7 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
             if error_file.is_file():
                 raise OSError(error_file.read_text(encoding="utf-8"))
             if log.stat().st_size > max_log_bytes:
-                return 126
+                return limit(126, "Gate exceeded its log-size limit")
             return child.returncode
         finally:
             if child.poll() is None:

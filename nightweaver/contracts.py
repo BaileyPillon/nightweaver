@@ -56,6 +56,10 @@ def lint_plan(spec):
                     "run_seconds": wall,
                 }
             )
+    total_timeout = check_schedule(spec)["timeout_seconds"]
+    if len(steps) > 1 and (wall := spec["budgets"].get("max_seconds")) and total_timeout > wall:
+        findings.append({"severity": "warning", "code": "combined_gate_timeouts_exceed_run_budget",
+                         "configured_seconds": total_timeout, "run_seconds": wall})
     return {
         "minimum_calls_for_acceptance": minimum_calls,
         "milestones": len(steps),
@@ -63,6 +67,22 @@ def lint_plan(spec):
         "feasible": not any(f["severity"] == "error" for f in findings),
         "model_calls": 0,
     }
+
+
+def check_schedule(spec):
+    from .checks import contract_hash
+    rows = []
+    for number, step in enumerate(spec["milestones"], 1):
+        for gate in step["gates"]:
+            samples = gate.get("stability_runs", 1)
+            rows.append({"milestone": number, "title": step["title"], "gate": gate["name"],
+                         "kind": "junit" if "junit" in gate else gate.get("kind", "command"),
+                         "samples": samples, "timeout_seconds": samples * gate["timeout"],
+                         "retained_from": step.get("retained_from", {}).get(gate["name"], []),
+                         "contract_sha256": contract_hash(gate)})
+    return {"checks": rows, "samples": sum(row["samples"] for row in rows),
+            "timeout_seconds": sum(row["timeout_seconds"] for row in rows),
+            "retained_samples": sum(row["samples"] for row in rows if row["retained_from"]), "model_calls": 0}
 
 
 def catalog_history(store, run_id):

@@ -11,7 +11,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from uuid import uuid4
 
 from . import context
-from .checks import evidence_folder, run_gate, verify_inputs
+from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs
 from .engine import common_dir, git, git_bytes, verify_registered_repository
 from .readiness import diagnose
 from .safety import write_json
@@ -110,7 +110,8 @@ def preflight(store, spec):
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
     errors.extend(probe_browser_channels(browsers))
-    return {**report, "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+    from .contracts import check_schedule
+    return {**report, "check_schedule": check_schedule(spec), "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
             "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
@@ -135,7 +136,7 @@ def replay_browser(store, run_id, number=None, gate_name=None):
     return replay_checks(store, run_id, number, gate_name, browser_only=True)
 
 
-def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, browser_only=False):
+def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, browser_only=False, through=False):
     if repeat is not None and (type(repeat) is not int or not 1 <= repeat <= 20):
         raise ValueError("Replay repetitions must be between 1 and 20")
     row = store.get(run_id)
@@ -144,15 +145,24 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
     event = next((item for item in accepted if item["step"] == number), None)
     if not event:
         raise ValueError("Select a milestone accepted by this run")
-    gates = [g for g in row["spec"]["milestones"][number - 1]["gates"]
-             if (not browser_only or g.get("kind") == "browser") and (gate_name is None or gate_name == g["name"])]
+    contracts = {}
+    origins = {}
+    for stage in range(1 if through else number, number + 1):
+        for gate in row["spec"]["milestones"][stage - 1]["gates"]:
+            if (browser_only and gate.get("kind") != "browser") or (gate_name is not None and gate_name != gate["name"]):
+                continue
+            digest = contract_hash(gate)
+            contracts[digest] = gate
+            origins.setdefault(digest, []).append(stage)
+    gates = list(contracts.values())
     if not gates:
         raise ValueError("No matching gate for that milestone")
     repo = Path(row["spec"]["repository"])
     verify_registered_repository(row["spec"], common_dir(repo))
     evidence = store.directory(run_id) / "replays" / uuid4().hex
     evidence.mkdir(parents=True)
-    report = {"run_id": run_id, "milestone": number, "commit": event["commit"], "evidence": str(evidence), "gates": []}
+    report = {"run_id": run_id, "milestone": number, "commit": event["commit"], "evidence": str(evidence),
+              "scope": "through" if through else "milestone", "gates": []}
     with TemporaryDirectory(prefix="nw-replay-") as temp:
         repetitions = [repeat or gate.get("stability_runs", 1) for gate in gates]
         schedule = ((gate, sample) for sample in range(1, max(repetitions) + 1)
@@ -172,11 +182,12 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
             git(copy, "add", "-A", "--", ".")
             changed = git(copy, "write-tree") != tree or git(copy, "rev-parse", "HEAD") != event["commit"]
             report["gates"].append({**record, "gate": gate["name"], "repeat": sample,
-                                    "changed_source": changed, "passed": record["exit"] == 0 and
-                                    not record.get("artifact_error") and not changed})
+                                    "scheduled_milestones": origins[contract_hash(gate)],
+                                    "changed_source": changed, "passed": observed_pass(record) is True and not changed})
     report["stability"] = {}
     for gate in gates:
-        observations = [g for g in report["gates"] if g["gate"] == gate["name"]]
+        digest = contract_hash(gate)
+        observations = [g for g in report["gates"] if g["contract_sha256"] == digest]
         outcomes = {g["passed"] for g in observations}
         if any(g.get("artifact_error") or g["changed_source"] for g in observations):
             status = "inconclusive"
@@ -184,7 +195,8 @@ def replay_checks(store, run_id, number=None, gate_name=None, repeat=None, *, br
             status = "mixed"
         else:
             status = "all_passed" if True in outcomes else "all_failed"
-        report["stability"][gate["name"]] = status
+        key = f"M{origins[digest][0]} / {gate['name']}" if through else gate["name"]
+        report["stability"][key] = status
     report["model_calls"] = 0
     report["passed"] = all(g["passed"] for g in report["gates"])
     write_json(evidence / "replay.json", report)

@@ -326,6 +326,13 @@ def ci_summary(store, run_id, output):
     if scenario_views:
         lines.append(f"| Named browser scenario samples passed | {sum(v['passed_samples'] for v in scenario_views)} / {sum(v['samples'] for v in scenario_views)} |")
     from .contracts import catalog_history
+    from .junit import history
+    tests = history(store, run_id)["observations"]
+    if tests:
+        counts = [t["report"]["counts"] for t in tests if t["report"] and t["passed"] is not None]
+        lines.append(f"| JUnit test executions passed / measured across attempts | {sum(c['passed'] for c in counts)} / {sum(c['tests'] for c in counts)} |")
+        lines.append(f"| JUnit test executions skipped | {sum(c['skipped'] for c in counts)} |")
+        lines.append(f"| Unscored JUnit observations | {sum(t['passed'] is None for t in tests)} |")
     samples = catalog_history(store, run_id)["observations"]
     if samples:
         lines.append(f"| Catalog observations passed | {sum(s['passed'] is True for s in samples)} / {len(samples)} |")

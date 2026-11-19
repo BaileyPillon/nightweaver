@@ -164,6 +164,18 @@ def run_report(store, run_id, output, include_images=False):
                                f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
         body += f'<tr><th scope="row">{escape(key.replace("_", " ").capitalize())}</th><td>{escape(str(value) if value is not None else "Unavailable")}</td></tr>'
     body += '</tbody></table></div>'
+    from .junit import history
+    observations = history(store, run_id)["observations"]
+    if observations:
+        body += '<h2>Test results by attempt</h2><div class="table"><table><thead><tr><th>Milestone / attempt / sample</th><th>Check</th><th>Verdict</th><th>Passed / total</th><th>Failures / errors / skips</th></tr></thead><tbody>'
+        for obs in observations:
+            counts = (obs["report"] or {}).get("counts")
+            verdict = "Unscored" if obs["passed"] is None else "Passed" if obs["passed"] else "Failed"
+            coverage = f'{counts["passed"]} / {counts["tests"]}' if counts else "Unavailable"
+            outcomes = f'{counts["failed"]} / {counts["errors"]} / {counts["skipped"]}' if counts else "Unavailable"
+            body += (f'<tr><td>{obs["step"]} / {obs["attempt"]} / {obs["sample"]}</td>'
+                     f'<td>{escape(obs["name"])}</td><td>{verdict}</td><td>{coverage}</td><td>{outcomes}</td></tr>')
+        body += '</tbody></table></div>'
     if include_images:
         body += '<h2>Verified screenshots</h2>'
         seen, total = set(), 0

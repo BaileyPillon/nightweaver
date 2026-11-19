@@ -263,6 +263,8 @@ def main(argv=None):
     catalog.add_argument("--milestone", type=int, default=1)
     catalog.add_argument("--gate")
     commands.add_parser("catalog-history", help="Trace catalog losses and repairs across attempts").add_argument("id")
+    commands.add_parser("check-schedule", help="Preview effective checks, retention and nominal timeouts").add_argument("plan")
+    commands.add_parser("test-history", help="Inspect measured JUnit results across attempts").add_argument("id")
     for name, description in (("dependencies","Show upstream and downstream prerequisite edges"),
                               ("timeline","Show milestone attempts, timing and acceptance"),
                               ("call-ledger","Inspect individual provider calls, usage and interruptions"),
@@ -283,6 +285,7 @@ def main(argv=None):
         replay.add_argument("--milestone", type=int)
         replay.add_argument("--gate")
         if action == "replay-checks":
+            replay.add_argument("--through", action="store_true", help="Run distinct checks from all milestones up to this one on its accepted commit")
             replay.add_argument("--repeat", type=int, help="Override the gate's configured sample count")
     for action, help_text in (("diagnose-run", "Locate recorded failures and their evidence"),
                               ("gate-stats", "Measure repeated checks by contract"),
@@ -423,7 +426,7 @@ def main(argv=None):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
                       else replay_checks(store, args.id, args.milestone, args.gate, getattr(args, "repeat", None),
-                                         browser_only=name == "replay-browser"))
+                                         browser_only=name == "replay-browser", through=getattr(args, "through", False)))
             output(report)
             return 0 if report.get("ready", report.get("passed")) else 3
         if name == "doctor":
@@ -455,6 +458,12 @@ def main(argv=None):
         elif name == "plan-diff":
             from .inspection import plan_diff
             output(plan_diff(read_plan(args.before,store), read_plan(args.after,store)))
+        elif name == "check-schedule":
+            from .contracts import check_schedule
+            output(check_schedule(read_plan(args.plan, store)))
+        elif name == "test-history":
+            from .junit import history
+            output(history(store, args.id))
         elif name in ("scope", "plan-lint", "catalog-check", "catalog-history"):
             from .contracts import catalog_history, inspect_catalog, lint_plan, scope_report
             if name == "catalog-history":

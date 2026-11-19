@@ -8,7 +8,7 @@ import sys
 from tempfile import mkdtemp
 import time
 
-from .process import execute
+from .process import ProcessLimit, execute
 from .journeys import browser_cases, case_prefix
 from .safety import redact, write_json
 from .spec import read_json
@@ -37,7 +37,7 @@ def observed_pass(receipt):
     """Only a completed, evidenced check on the named source can score a sample."""
     if type(receipt.get("exit")) is not int or receipt.get("artifact_error") or receipt.get("source_error"):
         return None
-    return receipt["exit"] == 0
+    return receipt["exit"] == 0 and receipt.get("junit", {}).get("passed", True)
 
 
 def verify_saved_sample(receipt, evidence):
@@ -353,7 +353,7 @@ def run_gate(check, path, folder, tree, *, baseline=None, **process_options):
     }
     try:
         verify_inputs(check, path)
-        before = {name: artifact_stamp(path, name) for name in check["artifacts"]}
+        before = {name: artifact_stamp(path, name, max_bytes) for name in check["artifacts"]}
         browser = check.get("kind") == "browser"
         catalog = check.get("kind") == "catalog"
         if browser:
@@ -376,19 +376,40 @@ def run_gate(check, path, folder, tree, *, baseline=None, **process_options):
                     "--base", baseline, "--candidate", tree, "--output", str(catalog_file)]
         else:
             argv = check["argv"]
+            if "junit" in check:
+                report_path = (folder / "junit.xml").absolute()
+                if report_path.exists() or report_path.is_symlink():
+                    raise ValueError("JUnit evidence path is already occupied")
+                env["NIGHTWEAVER_JUNIT"] = str(report_path)
+                argv = [arg.replace("{junit}", str(report_path)) for arg in argv]
         try:
-            receipt["exit"] = execute(argv, path, log, check["timeout"], env=env, **process_options)
+            receipt["exit"] = execute(argv, path, log, check["timeout"], env=env, raise_on_limit=True, **process_options)
+        except ProcessLimit as error:
+            receipt["execution_error"] = True
+            raise ValueError(str(error)) from error
         except OSError as error:
             receipt["execution_error"] = True
             raise ValueError(f"Cannot start gate executable: {error}") from error
         verify_inputs(check, path)
         receipt["artifacts"] = preserve_artifacts(path, folder, check["artifacts"], before, max_bytes)
+        if "junit" in check:
+            from .junit import read_report
+            try:
+                read_report(report_path, receipt, max_bytes, check["junit"])
+            except (OSError, ValueError) as error:
+                receipt["execution_error"] = True
+                raise ValueError(f"JUnit verification unavailable: {error}") from error
         if catalog:
             try:
+                if catalog_file.stat().st_size > max_bytes:
+                    raise ValueError("Catalog receipt exceeds the gate artifact limit")
                 data = catalog_file.read_bytes()
                 if len(data) > max_bytes:
                     raise ValueError("Catalog receipt exceeds the gate artifact limit")
-                report = json.loads(data)
+                from .spec import strict_json
+                report = strict_json(data)
+                if not isinstance(report, dict):
+                    raise ValueError("Expected a catalog receipt object")
                 if report.get("input_error"):
                     raise InputDrift(report["input_error"])
                 if (report.get("schema") != "nightweaver.catalog.v1" or report.get("base") != baseline

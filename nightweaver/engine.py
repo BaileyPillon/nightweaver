@@ -150,14 +150,20 @@ def tree(path, base, allowed, protected):
     return git(path, "write-tree")
 
 
-def artifact_stamp(path, name):
+def artifact_stamp(path, name, max_bytes=32 * 1024 * 1024):
     file = (path / name).resolve()
     if not file.is_relative_to(path.resolve()):
         raise ValueError(f"Artifact escapes the worktree: {name}")
     if not file.exists():
         return None
     stat = file.stat()
-    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+    digest = None
+    if file.is_file() and stat.st_size <= max_bytes:
+        with file.open("rb") as stream:
+            content = stream.read(max_bytes + 1)
+        if len(content) <= max_bytes:
+            digest = hashlib.sha256(content).hexdigest()
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino, digest
 
 
 def preserve_artifacts(path, output, names, before, max_bytes=32 * 1024 * 1024):
@@ -166,9 +172,8 @@ def preserve_artifacts(path, output, names, before, max_bytes=32 * 1024 * 1024):
         original = (path / name).resolve(strict=True)
         if not original.is_relative_to(path.resolve()) or not original.is_file():
             raise ValueError(f"Invalid verification artifact: {name}")
-        if artifact_stamp(path, name) == before[name]:
-            raise ValueError(f"Verification did not write fresh evidence: {name}")
-        if original.stat().st_size > max_bytes:
+        stat = original.stat()
+        if stat.st_size > max_bytes:
             raise ValueError(f"Verification artifact exceeds {max_bytes} bytes: {name}")
         target = output / "artifacts" / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -176,9 +181,10 @@ def preserve_artifacts(path, output, names, before, max_bytes=32 * 1024 * 1024):
             content = stream.read(max_bytes + 1)
         if len(content) > max_bytes:
             raise ValueError(f"Verification artifact grew beyond {max_bytes} bytes: {name}")
+        digest = hashlib.sha256(content).hexdigest()
+        if (stat.st_mtime_ns, stat.st_size, stat.st_ino, digest) == before[name]:
+            raise ValueError(f"Verification did not write fresh evidence: {name}")
         atomic_write(target, content)
-        with target.open("rb") as file:
-            digest = hashlib.file_digest(file, "sha256").hexdigest()
         recorded.append({"name": name, "path": str(target), "sha256": digest})
     return recorded
 
@@ -406,14 +412,19 @@ class Run:
                 last = failed[-1]
                 messages = []
                 for observation in failed:
-                    message = (json.dumps(observation["browser_failures"], ensure_ascii=False)
-                               if observation.get("browser_failures") else failure_excerpt(observation["log"]))
+                    if observation.get("junit", {}).get("issues"):
+                        message = "\n".join(observation["junit"]["issues"])
+                    elif observation.get("browser_failures"):
+                        message = json.dumps(observation["browser_failures"], ensure_ascii=False)
+                    else:
+                        message = failure_excerpt(observation["log"])
                     if message not in messages:
                         messages.append(message)
                 diagnostic = "\n".join(m[:3600 // len(messages)] for m in messages)
                 if count > 1:
                     diagnostic = f"All {count} samples in this round failed.\n{diagnostic}"
-                self.reject(f"{check['name']} exited {last['exit']}\n{diagnostic}", "check")
+                verdict = f"failed its JUnit policy (command exit {last['exit']})" if last.get("junit", {}).get("passed") is False else f"exited {last['exit']}"
+                self.reject(f"{check['name']} {verdict}\n{diagnostic}", "check")
                 return None
         reason = f"{check['name']} produced both passes and failures in two rounds on tree {snapshot[:12]}."
         self.set("verification_inconsistent", {**location, "name": check["name"], "tree": snapshot,

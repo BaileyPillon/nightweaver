@@ -1,5 +1,7 @@
 # Nightweaver
 
+Version 0.14 lets a OneShot carry earlier checks into later milestones and grade individual JUnit test results. On a Windows watchlist fixture, it caught a later change that broke an accepted feature even though the test command exited zero. See the [30 ranked changes, research sources, Windows trials and plan example](docs/v0.14-research.md).
+
 Version 0.13 checks a change for new and returning visitors on desktop and phone. A OneShot can now seed an existing collection, close and reopen the app, verify what persisted, and tell a repair worker exactly which visitor failed. [All 30 ranked changes, a working browser contract and the Afterimage experiment](docs/v0.13-research.md)
 
 Version 0.12 measures how consistently coding workflows finish the same tasks. Run a balanced comparison, find mixed results across repeats, measure the size of accepted patches, and set a minimum acceptance rate for CI. [All 30 ranked changes and the eight-trial Afterimage experiment](docs/v0.12-research.md)
