@@ -91,22 +91,25 @@ def preflight(store, spec):
                     errors.append(f"Invalid PNG baseline {name}: {error}")
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
-    for channel in sorted(browsers):
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as driver:
-                browser = driver.chromium.launch(channel=None if channel == "bundled" else channel, timeout=10000)
-                try:
-                    page = browser.new_page()
-                    page.set_content("<title>Nightweaver preflight</title>")
-                    if page.title() != "Nightweaver preflight":
-                        errors.append(f"Browser probe failed: {channel}")
-                finally:
-                    browser.close()
-        except Exception as error:
-            errors.append(f"{channel}: {error}")
+    errors.extend(probe_browser_channels(browsers))
     return {**report, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
+
+
+def probe_browser_channels(channels):
+    """Open an in-memory test page once per requested browser, independently of the project."""
+    errors = []
+    for channel in sorted(set(channels)):
+        try:
+            from .browser import browser_runtime
+            with browser_runtime(None if channel == "bundled" else channel, timeout=10000) as browser:
+                page = browser.new_page()
+                page.set_content("<title>Nightweaver preflight</title>")
+                if page.title() != "Nightweaver preflight":
+                    errors.append(f"Browser probe failed: {channel}")
+        except Exception as error:
+            errors.append(f"{channel}: {error}")
+    return errors
 
 
 def replay_browser(store, run_id, number=None, gate_name=None):

@@ -1,7 +1,7 @@
 """Declarative local browser acceptance checks. Playwright is an optional dependency."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
@@ -17,7 +17,8 @@ from urllib.parse import quote, urlparse
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nightweaver.safety import write_json
+from nightweaver.safety import redact, write_json
+from nightweaver.server import CandidateStartupFailure
 
 
 def validate_browser(raw):
@@ -133,9 +134,9 @@ def local_page(config, root, output):
     if "url" in config:
         yield config["url"], lambda: None
         return
-    page = (root / config["page"]).resolve(strict=True)
+    page = (root / config["page"]).resolve()
     if not page.is_relative_to(root) or not page.is_file():
-        raise ValueError("Browser page must be a file inside the candidate checkout")
+        raise CandidateStartupFailure(f"Expected a page inside the candidate checkout: {config['page']}")
     if config.get("offline"):
         yield page.as_uri(), lambda: None
         return
@@ -161,7 +162,10 @@ def semantic_locator(page, step):
 
 
 def visual_match(locator, contract, root, output, prefix, result):
-    from PIL import Image, ImageChops
+    try:
+        from PIL import Image, ImageChops
+    except ImportError as error:
+        raise BrowserRuntimeUnavailable("Visual comparisons require Pillow in the Nightweaver browser environment") from error
     baseline = (root / contract["baseline"]).resolve(strict=True)
     if not baseline.is_relative_to(root) or not baseline.is_file() or baseline.stat().st_size > 32 * 1024 * 1024:
         raise ValueError("Invalid visual baseline file")
@@ -218,15 +222,31 @@ def run_step(page, step, index, result, output, timeout, root):
         getattr(locator, action)()
 
 
+class BrowserRuntimeUnavailable(RuntimeError):
+    """The verification browser could not start."""
+
+
+@contextmanager
+def browser_runtime(channel, *, timeout=None):
+    with ExitStack() as stack:
+        try:
+            from playwright.sync_api import sync_playwright
+            driver = stack.enter_context(sync_playwright())
+            browser = driver.chromium.launch(channel=channel, timeout=timeout)
+            stack.callback(browser.close)
+        except Exception as error:
+            raise BrowserRuntimeUnavailable(f"Cannot start {channel or 'bundled Chromium'}: {error}") from error
+        yield browser
+
+
 def run_browser(config, root, output):
-    from playwright.sync_api import sync_playwright, expect
     config = validate_browser(config)
     root, output = Path(root).resolve(), Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     results = []
-    with local_page(config, root, output) as (url, server_check), sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel=config.get("channel"))
-        try:
+    with browser_runtime(config.get("channel")) as browser:
+        from playwright.sync_api import expect
+        with local_page(config, root, output) as (url, server_check):
             for viewport in config["viewports"]:
                 name = viewport["name"]
                 errors = []
@@ -289,6 +309,8 @@ def run_browser(config, root, output):
                         raise ValueError(f"Horizontal overflow: {result['overflow_px']}px")
                     server_check()
                     result["passed"] = not errors
+                except BrowserRuntimeUnavailable:
+                    raise
                 except Exception as error:
                     result["failed_at"] = stage
                     errors.append(str(error)[:4000])
@@ -314,8 +336,6 @@ def run_browser(config, root, output):
                     result["duration_ms"] = round((monotonic() - started) * 1000)
                     result["passed"] = result["passed"] and not errors
                     results.append(result)
-        finally:
-            browser.close()
     receipt = {"passed": bool(results) and all(row["passed"] for row in results), "viewports": results}
     write_json(output / "browser.json", receipt)
     return receipt
@@ -332,7 +352,12 @@ def main():
         raw = args.config_file.read_text(encoding="utf-8") if args.config_file else args.config
         result = run_browser(json.loads(raw), Path.cwd(), args.output)
     except Exception as error:
-        result = {"passed": False, "error": str(error)}
+        kind = "verification_error"
+        if isinstance(error, BrowserRuntimeUnavailable):
+            kind = "browser_environment"
+        elif isinstance(error, CandidateStartupFailure):
+            kind = "candidate_startup"
+        result = {"passed": False, "failure_kind": kind, "error": redact(str(error))[:4000]}
         write_json(args.output / "browser.json", result)
     print(json.dumps(result))
     return 0 if result["passed"] else 1

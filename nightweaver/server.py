@@ -14,6 +14,10 @@ from .process import execute, PausedRun
 from .safety import redact
 
 
+class CandidateStartupFailure(ValueError):
+    """The configured application failed to provide its test page."""
+
+
 def local_path(value, label):
     if not isinstance(value, str) or not value.startswith("/") or value.startswith("//") or "\\" in value:
         raise ValueError(f"{label} must be an absolute URL path on the owned loopback server")
@@ -74,7 +78,8 @@ def managed_server(config, root, output):
             with log.open("rb") as stream:
                 stream.seek(max(0, log.stat().st_size - 3000))
                 detail = stream.read().decode("utf-8", "replace")
-        return ValueError(redact(f"{reason}; {outcome}\n{detail}"))
+        error_type = RuntimeError if "error" in outcome else CandidateStartupFailure
+        return error_type(redact(f"{reason}; {outcome}\n{detail}"))
 
     def check():
         if finished.is_set():

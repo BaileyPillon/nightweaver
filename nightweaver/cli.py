@@ -14,7 +14,7 @@ from .engine import Run, checkout, create_run, fork_run, pending_dependencies, s
 from .process import BusyRun, run_lock, runner_active
 from .providers import configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
-from .spec import read_plan, resolve_repository, validate
+from .spec import array, gate_spec, read_plan, resolve_repository, validate
 from .store import Store, default_home, timestamp
 from .safety import redact
 
@@ -103,6 +103,12 @@ def plan_goal(store, args):
     )
     if project or "expected_base" in raw:
         source_info(store, raw)
+    if args.start:
+        from .diagnostics import probe_browser_channels
+        checks = [gate_spec(item) for item in array(gates, "gates") + array(final_gates, "final_gates")]
+        errors = probe_browser_channels(g["browser"].get("channel", "bundled") for g in checks if g.get("kind") == "browser")
+        if errors:
+            raise ValueError("OneShot browser check failed before planning:\n" + "\n".join(errors))
     config = planner_route(args)
     log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
     code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)

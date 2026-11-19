@@ -31,6 +31,18 @@ If two rounds disagree, inspect the check with `nightweaver diagnose-run RUN`. O
 
 ## Reading the evidence
 
+### Browser outages and incomplete results
+
+Starting with 0.8.1, `goal --start` opens an in-memory page in each required browser channel before invoking the planner. This includes channels used only by final checks. The probe works even when the project's own page still needs repair. Draft planning and queued work keep their existing timing.
+
+If the browser becomes unavailable during a run, Nightweaver preserves the candidate and records `execution_blocked`. Restore the browser and run `nightweaver resume RUN --retry` to verify the same work. This command starts a background runner. Use `nightweaver metrics RUN` to see when it finishes. An outage uses no repair attempt and is inconclusive in a matched benchmark. A missing application page, an owned app server that exits unsuccessfully, or a selector assertion still produces repair feedback.
+
+New browser observations include the completed and planned step counts for each viewport. A passing report requires every configured viewport exactly once, all steps complete, and the screenshots, traces and named checkpoints produced by the journey. A missing capture or contradictory receipt holds the candidate for fresh verification. Earlier run records remain readable.
+
+Playwright installs browser binaries separately and describes their version coupling. A practitioner reported a populated cache with a missing executable. The distinction informed the launch probe. SWE-Cycle evaluates environment reconstruction and implementation as separate tasks, a distinction we use when scoring a blocked verification. [Playwright browser documentation](https://playwright.dev/python/docs/browsers) · [Playwright documentation on GitHub](https://github.com/microsoft/playwright.dev/blob/main/python/docs/browsers.mdx) · [Practitioner report](https://www.reddit.com/r/Playwright/comments/1via8d3/playwright_reached_100_but_the_browser_executable/) · [SWE-Cycle paper](https://arxiv.org/abs/2605.13139)
+
+### Commands and metrics
+
 - `nightweaver metrics RUN` reports confirmation rounds and recoveries. `gate-stats RUN` distinguishes unusable receipts with the `unscored` count.
 - `nightweaver trace RUN --output trace.jsonl` includes sample numbers and verification batch IDs.
 - `nightweaver replay-checks RUN` uses each accepted gate’s configured sample count. `--repeat N` overrides that count for a diagnostic replay. Replay uses independent checkouts and reports the observed distribution directly. It does not make a live promotion decision.

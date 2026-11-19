@@ -9,7 +9,7 @@ from tempfile import mkdtemp
 import time
 
 from .process import execute
-from .safety import write_json
+from .safety import redact, write_json
 
 
 def contract_hash(check):
@@ -72,6 +72,68 @@ def verify_inputs(check, cwd, base=None):
             raise InputDrift(f"Digest mismatch for pinned check input: {name}")
 
 
+def read_browser_evidence(config, out, receipt, max_bytes):
+    receipt["receipt"] = str(out / "browser.json")
+    nonempty_files = set()
+    for file in sorted(out.iterdir()):
+        if not file.is_file() or file.is_symlink():
+            raise ValueError(f"Invalid browser evidence: {file.name}")
+        size = file.stat().st_size
+        if size > max_bytes:
+            raise ValueError(f"Invalid or oversized browser evidence: {file.name}")
+        with file.open("rb") as stream:
+            digest = file_digest(stream, "sha256").hexdigest()
+        receipt["artifacts"].append({"name": file.name, "path": str(file), "sha256": digest})
+        if size:
+            nonempty_files.add(file.name)
+
+    report = json.loads((out / "browser.json").read_text(encoding="utf-8"))
+    if not isinstance(report, dict) or type(report.get("passed")) is not bool:
+        raise ValueError("Invalid browser verdict")
+    if receipt["exit"] not in (0, 1) or report["passed"] != (receipt["exit"] == 0):
+        raise ValueError(f"Browser verdict disagrees with process exit {receipt['exit']}")
+    if "error" in report:
+        kind = report.get("failure_kind")
+        if report["passed"] or "viewports" in report or not isinstance(report["error"], str):
+            raise ValueError("Contradictory browser error receipt")
+        issue = redact(report["error"])[:4000]
+        if kind == "candidate_startup":
+            receipt["browser_failures"] = [{"stage": {"action": "startup"}, "error": issue}]
+            return
+        receipt["browser_issue"] = kind if kind == "browser_environment" else "verification_error"
+        raise ValueError(issue or "Browser verifier returned no diagnosis")
+
+    views = report.get("viewports")
+    expected = {v["name"] for v in config["viewports"]}
+    if (not isinstance(views, list) or len(views) != len(expected)
+            or any(not isinstance(v, dict) or not isinstance(v.get("viewport"), str) for v in views)
+            or {v["viewport"] for v in views} != expected):
+        raise ValueError("Browser receipt does not cover each configured viewport exactly once")
+    planned = len(config["steps"])
+    checkpoints = [(i, s["value"]) for i, s in enumerate(config["steps"], 1) if s["action"] == "checkpoint"]
+    coverage, failures = [], []
+    for view in views:
+        passed, completed, name = view.get("passed"), view.get("completed_steps"), view["viewport"]
+        if (type(passed) is not bool or type(completed) is not int or not 0 <= completed <= planned
+                or (passed and completed != planned)):
+            raise ValueError(f"Invalid browser step coverage for {name}: {completed}/{planned}")
+        if not isinstance(view.get("errors"), list) or (passed and view["errors"]):
+            raise ValueError(f"Invalid browser errors for {name}")
+        required = {f"{name}.png", f"{name}.trace.zip"}
+        required.update(f"checkpoint.{name}.{label}.png" for i, label in checkpoints if i <= completed)
+        if missing := required - nonempty_files:
+            raise ValueError(f"Missing or empty browser evidence for {name}: {', '.join(sorted(missing))}")
+        coverage.append({"viewport": name, "passed": passed, "completed_steps": completed, "planned_steps": planned})
+        if not passed:
+            failures.append({"viewport": name, "stage": view.get("failed_at"),
+                             "error": str(next(iter(view["errors"]), ""))[:600]})
+    if report["passed"] == bool(failures):
+        raise ValueError("Browser verdict disagrees with viewport results")
+    receipt["browser_coverage"] = coverage
+    if failures:
+        receipt["browser_failures"] = failures
+
+
 def run_gate(check, path, folder, tree, **process_options):
     from .engine import artifact_stamp, preserve_artifacts
 
@@ -119,40 +181,12 @@ def run_gate(check, path, folder, tree, **process_options):
         verify_inputs(check, path)
         receipt["artifacts"] = preserve_artifacts(path, folder, check["artifacts"], before, max_bytes)
         if browser:
-            receipt["receipt"] = str(out / "browser.json")
-            for file in sorted(out.iterdir()):
-                if not file.is_file() or file.is_symlink() or file.stat().st_size > max_bytes:
-                    raise ValueError(f"Invalid or oversized browser evidence: {file.name}")
-                with file.open("rb") as stream:
-                    receipt["artifacts"].append(
-                        {
-                            "name": file.name,
-                            "path": str(file),
-                            "sha256": file_digest(stream, "sha256").hexdigest(),
-                        }
-                    )
-            report = json.loads((out / "browser.json").read_text(encoding="utf-8"))
-            if not isinstance(report, dict) or not isinstance(report.get("viewports"), list):
-                raise ValueError("Browser returned an invalid receipt")
-            if any(
-                not isinstance(v, dict) or type(v.get("passed")) is not bool for v in report["viewports"]
-            ):
-                raise ValueError("Browser returned an invalid viewport receipt")
-            failures = [
-                {
-                    "viewport": view.get("viewport"),
-                    "stage": view.get("failed_at"),
-                    "error": str(next(iter(view.get("errors") or []), ""))[:600],
-                }
-                for view in report["viewports"]
-                if isinstance(view, dict) and not view.get("passed")
-            ]
-            if failures:
-                receipt["browser_failures"] = failures
-            if receipt["exit"] == 0 and (
-                report.get("passed") is not True or failures or not report["viewports"]
-            ):
-                raise ValueError("Browser returned no passing receipt")
+            try:
+                read_browser_evidence(check["browser"], out, receipt, max_bytes)
+            except (OSError, ValueError) as error:
+                receipt["execution_error"] = True
+                receipt.setdefault("browser_issue", "verification_error")
+                raise ValueError(f"{check['name']} browser verification: {error}") from error
     except InputDrift as error:
         receipt.update(input_error=True, artifact_error=str(error))
     except (OSError, ValueError) as error:
