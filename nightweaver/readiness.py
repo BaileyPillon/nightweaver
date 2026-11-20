@@ -8,7 +8,7 @@ from urllib.request import urlopen
 from uuid import uuid4
 
 from .engine import source_info
-from .providers import ProviderUnavailable, check_provider, describe_provider, invoke
+from .providers import ProviderUnavailable, advisory, check_provider, describe_provider, invoke
 
 
 def check_route(store, config, cwd, live):
@@ -40,18 +40,28 @@ def check_route(store, config, cwd, live):
             "action": "Inspect the local probe log and check the selected CLI profile.", "log": str(log)}
 
 
-def ollama_readiness(config):
+def ollama_readiness(config, live=False):
     endpoint = f"http://127.0.0.1:{config['port']}"
     result = {"provider": "ollama", "model": config["model"], "endpoint": endpoint, "roles": ["local advice"]}
+    if "think" in config:
+        result["think"] = config["think"]
     try:
         with urlopen(endpoint + "/api/tags", timeout=3) as response:
             models = [item["name"] for item in json.load(response)["models"]]
     except (OSError, ValueError, KeyError, TypeError):
-        return {**result, "status": "unavailable", "action": "Start Ollama on the configured loopback port."}
+        return {**result, "status": "unverified" if live else "unavailable", "action": "Start Ollama on the configured loopback port."}
     name = config["model"]
     if name in models or f"{name}:latest" in models:
+        if live:
+            receipt = {}
+            try:
+                answer = advisory(config, "Reply with the single word READY.", receipt=receipt)
+            except (OSError, ValueError) as error:
+                return {**result, "status": "unverified", "action": str(error), "inference": receipt}
+            passed = answer.strip().casefold().rstrip(".") == "ready" and receipt["model"] in (name, name + ":latest")
+            return {**result, "status": "ready" if passed else "unverified", "inference": receipt}
         return {**result, "status": "available", "action": "The server lists this model. Inference is checked during the run."}
-    return {**result, "status": "unavailable", "action": "Install the selected model or change advisory_ollama.model."}
+    return {**result, "status": "unverified" if live else "unavailable", "action": "Install the selected model or change advisory_ollama.model."}
 
 
 def diagnose(store, spec=None, planner=None, live=False):
@@ -82,5 +92,5 @@ def diagnose(store, spec=None, planner=None, live=False):
         routes[key]["roles"].append(role)
     report["providers"] = list(routes.values())
     if spec and "advisory_ollama" in spec:
-        report["providers"].append(ollama_readiness(spec["advisory_ollama"]))
+        report["providers"].append(ollama_readiness(spec["advisory_ollama"], live))
     return report

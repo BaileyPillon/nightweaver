@@ -26,7 +26,7 @@ def call_ledger(store, run_id):
                 "observed_tokens": None,
             },
         )
-        for key in ("step", "attempt", "role", "provider", "model"):
+        for key in ("step", "attempt", "role", "provider", "model", "effort", "think"):
             if key in data:
                 row[key] = data[key]
         if event["kind"] == "provider_call_started":

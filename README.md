@@ -128,7 +128,9 @@ python -m nightweaver doctor --plan plan.json --planner deepseek --live
 python -m nightweaver doctor --planner claude --profile-dir 'C:\Profiles\claude-work' --live
 ```
 
-The report resolves the plan's checkout and identifies which executable, profile and model each role will use. A non-live report checks local configuration. With `--live`, Nightweaver sends a small test prompt per distinct model route from an empty directory. A successful model reply confirms access at the time of the check. Live requests use your normal subscription limits or API balance. Ollama is checked by listing local models. Custom commands are checked for executable availability and run only as part of the plan.
+The report resolves the plan's checkout and identifies the executable, profile, model and configured reasoning effort for each role. A non-live report checks local configuration. With `--live`, Nightweaver sends a small test prompt per distinct model route. Live requests use your normal subscription limits or API balance. For Ollama, the live report also records the responding model and whether it returned thinking. Custom commands are checked for executable availability and run only as part of the plan.
+
+Set `effort` on a Claude, Codex or DeepSeek worker or reviewer. Use `--effort` for a CLI planner. For example, Opus 5.5 and Astra 6.2 accept `xhigh`. DeepSeek's highest native level is `max`. Explicit settings apply to the child process, including resumed calls.
 
 The command exits with status 3 if a required model route is blocked or a live request could not be verified. On a run, a missing CLI, missing selected profile, or recognized account, model, or usage-limit error blocks with the affected role and profile. Correct that route and retry the existing run. [Claude profile settings](https://code.claude.com/docs/en/settings) · [Ollama model listing](https://docs.ollama.com/api/tags)
 
@@ -169,7 +171,7 @@ Run data, model output, and evidence live under `%LOCALAPPDATA%\Nightweaver` or 
 
 Upgrading from the original Rookline release preserves its existing runtime directory, run history, evidence, provider configuration, and result branches. New runs use `nightweaver/<run-id>`. The old `python -m rookline` command and `ROOKLINE_HOME` remain supported for existing scripts. No history or worktrees are moved automatically.
 
-For a slow local model, set `timeout` and `max_tokens` inside `advisory_ollama`. Defaults are 90 seconds and 100 tokens. Model timeouts are recorded in the activity log and independent verification continues.
+For local advice, set `think` to a value supported by the installed Ollama model and allow room for both thinking and its final answer with `max_tokens`. Defaults are thinking off, 100 output tokens and a 90-second timeout. Set `required` to `true` when every accepted milestone needs a local response. A failed required call blocks at review and can be retried with `resume --retry`.
 
 [Design rationale and current limits](docs/design-rationale.md)
 

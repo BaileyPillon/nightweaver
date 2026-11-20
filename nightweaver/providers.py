@@ -53,6 +53,7 @@ def describe_provider(config):
                    Path.home() if kind == "gemini" else Path.home() / f".{kind}")
     return {"provider": kind, "executable": provider_executable(config),
             "profile_dir": str(Path(profile).expanduser().resolve()),
+            **({"effort": config["effort"]} if "effort" in config else {}),
             "model": config.get("model") or ("deepseek-flash" if kind == "deepseek" else "CLI default")}
 
 
@@ -141,7 +142,10 @@ def adapter(config, mode, session=None):
         return argv, env
     if kind == "codex":
         sandbox = "workspace-write" if mode == "worker" else "read-only"
-        argv = [exe, "--sandbox", sandbox, "--ask-for-approval", "never", "exec"]
+        argv = [exe, "--sandbox", sandbox, "--ask-for-approval", "never"]
+        if "effort" in config:
+            argv += ["-c", "model_reasoning_effort=" + json.dumps(config["effort"])]
+        argv.append("exec")
         if session:
             argv += ["resume", session]
         argv += ["--json"]
@@ -152,8 +156,15 @@ def adapter(config, mode, session=None):
         return argv + ["-"], env
     argv = [exe, "--print", "--output-format", "stream-json", "--verbose",
             "--permission-mode", "acceptEdits" if mode == "worker" else "dontAsk"]
+    if "effort" in config:
+        argv += ["--effort", config["effort"]]
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = config["effort"]
     if mode != "worker":
         argv += ["--tools", "Read,Grep,Glob" if mode == "reviewer" else ""]
+    if mode == "reviewer":
+        schema = {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
+                  "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}}
+        argv += ["--json-schema", json.dumps(schema)]
     if mode == "probe":
         argv += ["--no-session-persistence", "--strict-mcp-config",
                  "--system-prompt", "This is a connection test. Reply READY and use no tools."]
@@ -168,7 +179,7 @@ def adapter(config, mode, session=None):
     return argv, env
 
 
-def metadata(path, kind):
+def metadata(path, kind, mode=None):
     session, last = None, ""
     if not path.exists():
         return session, last
@@ -191,6 +202,8 @@ def metadata(path, kind):
                 session = event.get("session_id") or session
             if event.get("type") == "result" and isinstance(event.get("result"), str):
                 last = event["result"] or last
+            if mode == "reviewer" and event.get("type") == "result" and isinstance(event.get("structured_output"), dict):
+                last = json.dumps(event["structured_output"])
             item = event.get("item", {})
             if isinstance(item, dict) and event.get("type") == "item.completed" and item.get("type") == "agent_message":
                 last = item.get("text") or last
@@ -258,7 +271,7 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         elif config["kind"] == "gemini":
             argv += ["--include-directories", str(evidence)]
     code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
-    current, answer = metadata(log, config["kind"])
+    current, answer = metadata(log, config["kind"], mode)
     if config["kind"] == "command" and code == config.get("unavailable_exit_code"):
         raise ProviderUnavailable(answer.strip()[-1500:] or "External workflow unavailable", "external_environment")
     if code == 0 and config["kind"] != "command":
@@ -319,11 +332,28 @@ def json_response(answer):
     raise ValueError("Structured response nesting exceeds 64 levels")
 
 
-def advisory(config, information):
-    body = {"model": config["model"], "stream": False, "think": False,
+def advisory(config, information, *, receipt=None):
+    output_limit = config.get("max_tokens", 100)
+    endpoint = f"http://127.0.0.1:{config['port']}"
+    headers = {"Content-Type": "application/json"}
+    if "think" in config:
+        show = Request(endpoint + "/api/show", data=json.dumps({"model": config["model"]}).encode(), headers=headers)
+        with urlopen(show, timeout=min(15, config.get("timeout", 90))) as response:
+            supported = (json.load(response).get("thinking") or {}).get("values")
+        if supported is not None and config["think"] not in supported:
+            raise ValueError(f"Ollama model {config['model']} supports thinking settings {supported}, requested {config['think']}")
+    body = {"model": config["model"], "stream": False, "think": config.get("think", False),
             "messages": [{"role": "user", "content": information[:3000]}],
-            "options": {"num_predict": config.get("max_tokens", 100), "num_ctx": 2048}}
-    request = Request(f"http://127.0.0.1:{config['port']}/api/chat", data=json.dumps(body).encode(),
-                      headers={"Content-Type": "application/json"})
+            "options": {"num_predict": output_limit, "num_ctx": max(2048, output_limit + 1024)}}
+    request = Request(endpoint + "/api/chat", data=json.dumps(body).encode(), headers=headers)
     with urlopen(request, timeout=config.get("timeout", 90)) as response:
-        return json.load(response).get("message", {}).get("content", "")[:1500]
+        result = json.load(response)
+        if result.get("model") not in (config["model"], config["model"] + ":latest"):
+            raise ValueError("Ollama returned a different model than requested")
+        if receipt is not None:
+            receipt.update({key: result.get(key) for key in ("model", "done_reason", "eval_count", "total_duration")})
+            receipt["thinking_observed"] = bool(result.get("message", {}).get("thinking"))
+        note = result.get("message", {}).get("content", "").strip()
+        if not note:
+            raise ValueError("Ollama returned no final answer")
+        return note[:1500]

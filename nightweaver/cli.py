@@ -14,7 +14,7 @@ from .engine import Run, checkout, create_run, directory_identity, fork_run, pen
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
-from .spec import anchor_provider_paths, fields, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
+from .spec import IMPLEMENTERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
 from .safety import redact
 
@@ -204,6 +204,9 @@ def planner_route(args):
         config["profile_dir"] = str(Path(args.profile_dir).expanduser().resolve())
     if args.model:
         config["model"] = args.model
+    if getattr(args, "effort", None):
+        config["effort"] = args.effort
+        return provider(config, IMPLEMENTERS, "planner")
     return config
 
 
@@ -232,6 +235,7 @@ def main(argv=None):
     one.add_argument("objective")
     one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
     one.add_argument("--model", help="Model for the primary worker and planner")
+    one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
     one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
     one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
     one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
@@ -253,6 +257,7 @@ def main(argv=None):
         parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini"), default="claude" if parser is goal else None)
         parser.add_argument("--profile-dir")
         parser.add_argument("--model", help="Model used by the planner")
+        parser.add_argument("--effort", help="Reasoning effort used by the planner")
     project = commands.add_parser("project", help="Manage canonical project checkouts")
     project_commands = project.add_subparsers(dest="project_action", required=True)
     project_commands.add_parser("list")
@@ -484,8 +489,8 @@ def main(argv=None):
     if args.command == "doctor":
         if args.live and not (args.plan or args.planner):
             app.error("--live requires --plan or --planner")
-        if (args.profile_dir or args.model) and not args.planner:
-            app.error("--profile-dir and --model require --planner")
+        if (args.profile_dir or args.model or args.effort) and not args.planner:
+            app.error("--profile-dir, --model and --effort require --planner")
     if os.name != "nt":
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1

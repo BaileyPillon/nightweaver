@@ -94,7 +94,7 @@ def text(obj, key):
 
 
 def provider(value, choices, label, relative_to=None):
-    fields(value, "kind argv executable model api_key api_key_file profile_dir unavailable_exit_code", label)
+    fields(value, "kind argv executable model effort api_key api_key_file profile_dir unavailable_exit_code", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
@@ -112,6 +112,13 @@ def provider(value, choices, label, relative_to=None):
         out["executable"] = text(value, "executable")
     if value.get("model"):
         out["model"] = text(value, "model")
+    if "effort" in value:
+        levels = {"claude": ("low", "medium", "high", "xhigh", "max"),
+                  "codex": ("low", "medium", "high", "xhigh", "max", "ultra"),
+                  "deepseek": ("low", "high", "max")}
+        if value["effort"] not in levels.get(value["kind"], ()):
+            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}")
+        out["effort"] = value["effort"]
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
     if value.get("api_key_file"):
@@ -315,7 +322,7 @@ def validate(raw, relative_to=None, store=None):
     if "reviewer" in raw:
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
     if "advisory_ollama" in raw:
-        fields(raw["advisory_ollama"], "model port timeout max_tokens", "advisory_ollama")
+        fields(raw["advisory_ollama"], "model port timeout max_tokens think required", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
             raise ValueError("Invalid Ollama model name")
@@ -326,9 +333,19 @@ def validate(raw, relative_to=None, store=None):
         max_tokens = raw["advisory_ollama"].get("max_tokens", 100)
         if type(local_timeout) is not int or not 1 <= local_timeout <= 600:
             raise ValueError("Ollama timeout must be between 1 and 600 seconds")
-        if type(max_tokens) is not int or not 1 <= max_tokens <= 1024:
-            raise ValueError("Ollama max_tokens must be between 1 and 1024")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 16384:
+            raise ValueError("Ollama max_tokens must be between 1 and 16384")
         out["advisory_ollama"] = {"model": model, "port": port, "timeout": local_timeout, "max_tokens": max_tokens}
+        if "required" in raw["advisory_ollama"]:
+            required = raw["advisory_ollama"]["required"]
+            if type(required) is not bool:
+                raise ValueError("Ollama required must be true or false")
+            out["advisory_ollama"]["required"] = required
+        if "think" in raw["advisory_ollama"]:
+            think = raw["advisory_ollama"]["think"]
+            if type(think) is not bool and think not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError("Invalid Ollama thinking setting")
+            out["advisory_ollama"]["think"] = think
     return out
 
 

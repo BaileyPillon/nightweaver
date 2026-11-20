@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from nightweaver.cli import plan_goal
-from nightweaver.providers import ProviderUnavailable, adapter, configure_deepseek_key, deepseek_key, invoke
+from nightweaver.providers import ProviderUnavailable, adapter, advisory, configure_deepseek_key, deepseek_key, invoke, metadata
 from nightweaver.readiness import check_route
 from nightweaver.spec import IMPLEMENTERS, provider
 from nightweaver.store import Store
@@ -31,6 +32,47 @@ class DeepSeekTest(unittest.TestCase):
         self.assertNotIn("test-credential-value", settings.read_text(encoding="utf-8"))
         self.assertEqual(result["api_key_file"], str(self.key_file.resolve()))
         self.assertEqual(deepseek_key({}), "test-credential-value")
+
+    def test_explicit_effort_on_new_and_resumed_model_routes(self):
+        for kind, effort in (("claude", "xhigh"), ("codex", "xhigh"), ("deepseek", "max")):
+            with self.subTest(kind=kind):
+                route = {"kind": kind, "effort": effort}
+                if kind == "deepseek":
+                    route["api_key_file"] = str(self.key_file)
+                validated = provider(route, IMPLEMENTERS, "worker")
+                for session in (None, "prior-session"):
+                    argv, env = adapter(validated, "worker", session)
+                    if kind == "codex":
+                        self.assertIn('model_reasoning_effort="xhigh"', argv)
+                    else:
+                        self.assertEqual(argv[argv.index("--effort") + 1], effort)
+                        self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], effort)
+        with self.assertRaisesRegex(ValueError, "Unsupported effort"):
+            provider({"kind": "deepseek", "effort": "xhigh"}, IMPLEMENTERS, "reviewer")
+
+    def test_reviewer_reads_structured_verdict_with_prose_summary(self):
+        path = self.root / "review.jsonl"
+        verdict = {"verdict": "REVISE", "reason": "Phone screenshot is missing"}
+        path.write_text(json.dumps({"type": "result", "result": "Review complete.", "structured_output": verdict}),
+                        encoding="utf-8")
+        self.assertEqual(json.loads(metadata(path, "deepseek", "reviewer")[1]), verdict)
+        self.assertEqual(metadata(path, "deepseek", "worker")[1], "Review complete.")
+
+    def test_local_thinking_settings_and_inference_receipt(self):
+        cfg = {"model": "test-model", "port": 11435, "think": "xhigh", "max_tokens": 4096}
+        result = {"model": "test-model:latest", "done_reason": "stop", "eval_count": 8,
+                  "message": {"content": "READY", "thinking": "synthetic trace"}}
+        receipt = {}
+        show = b'{"thinking":{"values":[false,"low","medium","xhigh"]}}'
+        with patch("nightweaver.providers.urlopen", side_effect=[io.BytesIO(show), io.BytesIO(json.dumps(result).encode())]) as post:
+            self.assertEqual(advisory(cfg, "test", receipt=receipt), "READY")
+        payload = json.loads(post.call_args.args[0].data)
+        self.assertEqual(payload["think"], "xhigh")
+        self.assertGreater(payload["options"]["num_ctx"], payload["options"]["num_predict"])
+        self.assertTrue(receipt["thinking_observed"])
+        self.assertNotIn("synthetic trace", json.dumps(receipt))
+        with patch("nightweaver.providers.urlopen", return_value=io.BytesIO(show)), self.assertRaisesRegex(ValueError, "supports thinking"):
+            advisory({**cfg, "think": True}, "test")
 
     def test_adapter_keeps_routing_credentials_and_profile_process_local(self):
         os.environ.update({"ANTHROPIC_BASE_URL": "https://existing.invalid", "ANTHROPIC_API_KEY": "existing-key",

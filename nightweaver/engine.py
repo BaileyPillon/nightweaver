@@ -238,6 +238,8 @@ class Run:
         pending = {"call": state.get("provider_calls", 0) + 1, "role": role, "provider": config["kind"],
                    "model": config.get("model"), "started": timestamp(), "log": str(log),
                    "step": state["step"] + 1, "attempt": state["attempt"]}
+        if "effort" in config:
+            pending["effort"] = config["effort"]
         self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
         limits = self.spec.get("budgets", {})
         health = {"max_log_bytes": limits.get("max_log_bytes", 16 * 1024 * 1024),
@@ -585,6 +587,8 @@ class Run:
                        "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
                        "step": state["step"] + 1, "attempt": state["attempt"],
                        "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
+            if "think" in self.spec["advisory_ollama"]:
+                pending["think"] = self.spec["advisory_ollama"]["think"]
             self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
             try:
                 config = dict(self.spec["advisory_ollama"])
@@ -592,13 +596,18 @@ class Run:
                     elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
                     config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
                 summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
+                inference = {}
                 note = advisory(config,
                                 f"In one sentence, suggest any missing validation.\n"
-                                f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}")
-                self.set("local_advice", {"note": note, "tree": snapshot})
-                write_json(Path(pending["log"]), {"note": redact(note)})
+                                f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}", receipt=inference)
+                self.set("local_advice", {"note": note, "tree": snapshot, "inference": inference})
+                write_json(Path(pending["log"]), {"note": redact(note), "inference": inference})
             except (OSError, ValueError) as error:
                 self.set("local_advice_unavailable", {"reason": str(error)})
+                if self.spec["advisory_ollama"].get("required"):
+                    self.set("local_advice_required", {"model": self.spec["advisory_ollama"]["model"]},
+                             phase="blocked", blocked_from="reviewing", last_error=f"Required local review failed: {error}")
+                    return
             finally:
                 self.finish_call(pending)
             self.check_budget()
