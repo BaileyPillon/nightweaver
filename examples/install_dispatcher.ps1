@@ -1,9 +1,11 @@
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$Runtime,
     [string]$Python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source,
     [string]$TaskName = 'Nightweaver Dispatcher',
     [string]$ToolPath,
-    [switch]$RecoverGuards
+    [switch]$RecoverGuards,
+    [switch]$Preview
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,6 +31,12 @@ if ($RecoverGuards) { $arguments += ' --recover-guards' }
 if ($ToolPath) { $arguments += ' --tool-path "{0}"' -f $ToolPath.TrimEnd('\') }
 $windowless = Join-Path (Split-Path -Parent $Python) 'pythonw.exe'
 if (Test-Path -LiteralPath $windowless) { $Python = $windowless }
+if ($Preview) {
+    [pscustomobject]@{ TaskName=$TaskName; User=$user; Execute=$Python; Arguments=$arguments;
+        WorkingDirectory=$sourceRoot; Trigger='AtLogOn'; RecoverGuards=[bool]$RecoverGuards }
+    return
+}
+if (-not $PSCmdlet.ShouldProcess($TaskName, 'Register the Nightweaver sign-in dispatcher')) { return }
 $action = New-ScheduledTaskAction -Execute $Python -Argument $arguments -WorkingDirectory $sourceRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
