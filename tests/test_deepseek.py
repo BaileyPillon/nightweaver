@@ -58,6 +58,23 @@ class DeepSeekTest(unittest.TestCase):
         self.assertEqual(json.loads(metadata(path, "deepseek", "reviewer")[1]), verdict)
         self.assertEqual(metadata(path, "deepseek", "worker")[1], "Review complete.")
 
+    @unittest.skipUnless(os.name == "nt", "Windows temp roots")
+    def test_codex_worker_uses_a_private_temp_inside_its_normal_sandbox(self):
+        scratch = []
+        def finish(argv, cwd, log, timeout, **kwargs):
+            self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
+            env = kwargs["env"]
+            self.assertEqual(env["TMP"], env["TEMP"])
+            self.assertEqual(env["TMPDIR"], env["TEMP"])
+            scratch.append(Path(env["TEMP"]))
+            self.assertTrue(scratch[0].is_dir())
+            log.write_text('{"type":"turn.completed"}', encoding="utf-8")
+            return 0
+        with patch("nightweaver.providers.execute", side_effect=finish):
+            invoke({"kind": "codex", "executable": sys.executable}, "worker", self.root, self.root/"work.jsonl",
+                   "verify", 30, lambda: False)
+        self.assertFalse(scratch[0].exists())
+
     def test_local_thinking_settings_and_inference_receipt(self):
         cfg = {"model": "test-model", "port": 11435, "think": "xhigh", "max_tokens": 4096}
         result = {"model": "test-model:latest", "done_reason": "stop", "eval_count": 8,

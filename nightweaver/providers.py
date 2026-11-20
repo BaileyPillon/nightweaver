@@ -1,5 +1,6 @@
 """Use native authenticated CLIs and an optional loopback model."""
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -270,7 +271,16 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
             argv += ["--add-dir", str(evidence)]
         elif config["kind"] == "gemini":
             argv += ["--include-directories", str(evidence)]
-    code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
+    with ExitStack() as resources:
+        if os.name == "nt" and config["kind"] == "codex" and mode == "worker":
+            # Windows sandbox setup grants write access to the child process's temp root.
+            # Keep that operation off the user's shared Temp directory.
+            scratch_root = default_home() / "provider-temp"
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            scratch = resources.enter_context(tempfile.TemporaryDirectory(dir=scratch_root, prefix="codex-",
+                                                                         ignore_cleanup_errors=True))
+            env.update(TEMP=scratch, TMP=scratch, TMPDIR=scratch)
+        code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
     current, answer = metadata(log, config["kind"], mode)
     if config["kind"] == "command" and code == config.get("unavailable_exit_code"):
         raise ProviderUnavailable(answer.strip()[-1500:] or "External workflow unavailable", "external_environment")
