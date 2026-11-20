@@ -25,6 +25,10 @@ def wait_for_run(store, run_id, timeout=None):
             return {"run_id": run_id, "phase": phase}, 0 if phase == "done" else 3
         if row["pause"]:
             return {"run_id": run_id, "phase": "paused"}, 2
+        state = row["state"]
+        if (state.get("guard_crashed") or state.get("guard_launch")) and state.get("guard_restarts", 0) >= state.get("guard_limit", 2):
+            if not runner_active(store.directory(run_id) / "guard.lock") and not runner_active(store.directory(run_id) / "runner.lock"):
+                return {"run_id": run_id, "phase": phase, "disposition": "limit_reached"}, 5
         if deadline is not None and time.monotonic() >= deadline:
             return {"run_id": run_id, "phase": phase, "timed_out": True}, 4
         time.sleep(
@@ -34,10 +38,10 @@ def wait_for_run(store, run_id, timeout=None):
         )
 
 
-def matching_runs(store, project=None, phase=None):
+def matching_runs(store, project=None, phase=None, *, compact=False):
     return [
         r
-        for r in store.runs()
+        for r in (store.run_summaries() if compact else store.runs())
         if (
             project is None
             or str(r["spec"].get("project", "")).casefold() == project.casefold()
@@ -312,6 +316,9 @@ def ci_summary(store, run_id, output):
         f"| Worker attempts | {m['worker_attempts']} |",
         f"| Provider calls | {m['provider_calls']} |",
         f"| Failed attempts | {m['failed_attempts']} |",
+        f"| Unexpected runner exits | {m['unexpected_runner_exits']} |",
+        f"| Unsettled launches found on recovery | {m['unobserved_runner_exits']} |",
+        f"| Supervised restarts admitted | {m['supervised_restarts']} |",
         f"| Functional worker handoffs | {m['repair_handoffs']} |",
         f"| Milestones accepted after a handoff | {m['accepted_after_handoff']} |",
     ]

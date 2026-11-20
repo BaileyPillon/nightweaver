@@ -2,7 +2,8 @@ param(
     [string]$Runtime,
     [string]$Python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source,
     [string]$TaskName = 'Nightweaver Dispatcher',
-    [string]$ToolPath
+    [string]$ToolPath,
+    [switch]$RecoverGuards
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,7 @@ if (!$ToolPath) {
 
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = '-m nightweaver --home "{0}" dispatch --watch' -f $Runtime.TrimEnd('\')
+if ($RecoverGuards) { $arguments += ' --recover-guards' }
 if ($ToolPath) { $arguments += ' --tool-path "{0}"' -f $ToolPath.TrimEnd('\') }
 $windowless = Join-Path (Split-Path -Parent $Python) 'pythonw.exe'
 if (Test-Path -LiteralPath $windowless) { $Python = $windowless }

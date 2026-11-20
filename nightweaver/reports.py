@@ -1,6 +1,7 @@
 """Complete-run measurements and portable reports; never infer unreported billing."""
 
 import base64
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 from html import escape
@@ -34,7 +35,7 @@ def recovery_metrics(events):
             if passed is not None and detail.get("tree") and detail.get("contract_sha256"):
                 key = detail["name"], detail["tree"], detail["contract_sha256"]
                 observed.setdefault(key, set()).add(passed)
-                if detail.get("verification_batch"):
+                if detail.get("verification_batch") and all(type(detail.get(key)) is int for key in ("gate_index", "stability_runs", "sample")):
                     group = (detail["verification_batch"], detail["gate_index"], detail["stability_runs"])
                     stability.setdefault(group, {})[detail["sample"]] = passed
     confirmations = recovered = 0
@@ -51,6 +52,11 @@ def recovery_metrics(events):
 
 
 def metrics(store, run_id):
+    with store.snapshot() as reader:
+        return _metrics(reader, run_id)
+
+
+def _metrics(store, run_id):
     row = store.get(run_id)
     events = store.events(run_id, limit=None)
     kinds = [event["kind"] for event in events]
@@ -120,6 +126,9 @@ def metrics(store, run_id):
         "gate_unscored": sum(event["kind"] == "gate_finished" and observed_pass(event["details"]) is None for event in events),
         "interventions": interventions, "unassisted_acceptance": row["state"]["phase"] == "done" and interventions == 0,
         "interruptions_recovered": kinds.count("interrupted_worker_recovered"),
+        "supervised_restarts": kinds.count("guard_restart_scheduled"),
+        "unobserved_runner_exits": kinds.count("guard_unobserved_exit"),
+        "unexpected_runner_exits": sum(e["kind"] == "guard_child_exited" and e["details"].get("unexpected") is True for e in events),
         "fallbacks": kinds.count("provider_fallback"), "observed_tokens": recorded if calls and unknown < len(calls) else None,
         "repair_handoffs": kinds.count("repair_handoff"),
         "accepted_after_handoff": len({e["details"]["step"] for e in events if e["kind"] == "repair_handoff"} &
@@ -151,12 +160,19 @@ def document(title, body):
 
 
 def run_report(store, run_id, output, include_images=False):
+    with store.snapshot() as reader:
+        return _run_report(reader, run_id, output, include_images)
+
+
+def _run_report(store, run_id, output, include_images):
+    from .report_activity import activity, checkpoint_header
     row = store.get(run_id)
     measured = redact(metrics(store, run_id))
     events = redact(store.events(run_id, limit=None))
     title = redact(row["spec"]["title"])
     body = f'<header><h1>{escape(title)}</h1><p class="state">{escape(measured["phase"].capitalize())} · {measured["accepted_milestones"]}/{measured["total_milestones"]} milestones accepted</p><p>{escape(redact(row["spec"]["objective"]))}</p></header>'
-    body += '<h2>Run measurements</h2><div class="table"><table><tbody>'
+    body += checkpoint_header(row, events)
+    body += '<h2 id="measurements">Run measurements</h2><div class="table"><table><tbody>'
     for key, value in measured.items():
         if key == "slowest_gate" and value:
             value = f"{value['name']} ({value['duration_ms']:,} ms)"
@@ -211,22 +227,41 @@ def run_report(store, run_id, output, include_images=False):
     if include_images:
         body += '<h2>Verified screenshots</h2>'
         seen, total = set(), 0
+        unavailable = Counter()
+        evidence_root = (store.directory(run_id) / "evidence").resolve()
         for event in events:
+            if event["kind"] != "gate_finished":
+                continue
             for artifact in event["details"].get("artifacts", []):
-                path = Path(artifact["path"]).resolve()
-                if path in seen or path.suffix.lower() != ".png" or not path.is_relative_to(store.directory(run_id).resolve()):
+                if not isinstance(artifact, dict) or not str(artifact.get("path", "")).lower().endswith(".png"):
                     continue
-                seen.add(path)
-                if not path.is_file() or path.stat().st_size > 5 * 1024 * 1024 or total + path.stat().st_size > 20 * 1024 * 1024:
+                try:
+                    path = Path(artifact["path"]).resolve(strict=True)
+                    if not path.is_relative_to(evidence_root) or not path.is_file():
+                        unavailable["outside the evidence folder"] += 1
+                        continue
+                    if (path, artifact.get("sha256")) in seen:
+                        continue
+                    budget = min(5 * 1024 * 1024, 20 * 1024 * 1024 - total)
+                    if path.stat().st_size > budget:
+                        unavailable["size limit"] += 1
+                        continue
+                    with path.open("rb") as stream:
+                        data = stream.read(budget + 1)
+                except (OSError, RuntimeError, ValueError):
+                    unavailable["unreadable"] += 1
                     continue
-                data = path.read_bytes()
-                if not data.startswith(b"\x89PNG\r\n\x1a\n") or hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+                if len(data) > budget or not data.startswith(b"\x89PNG\r\n\x1a\n") or hashlib.sha256(data).hexdigest() != artifact.get("sha256"):
+                    unavailable["content mismatch"] += 1
                     continue
+                seen.add((path, artifact["sha256"]))
                 total += len(data)
-                caption = escape(f"{event['details'].get('name', 'Browser')} · {artifact['name']} · exit {event['details'].get('exit')}")
-                body += f'<figure><img alt="{caption}" src="data:image/png;base64,{base64.b64encode(data).decode()}"><figcaption>{caption}</figcaption></figure>'
-    body += '<h2>Complete activity</h2>'
-    for event in events:
-        body += f'<details><summary><time>{escape(event["time"])}</time>{escape(event["kind"].replace("_", " ").capitalize())}</summary><pre>{escape(json.dumps(event["details"], indent=2))}</pre></details>'
+                caption = escape(f"{event['details'].get('name', 'Browser')} · {artifact.get('name', path.name)} · exit {event['details'].get('exit')}")
+                body += f'<figure><img loading="lazy" alt="{caption}" src="data:image/png;base64,{base64.b64encode(data).decode()}"><figcaption>{caption}</figcaption></figure>'
+        if not seen:
+            body += '<p>No verified screenshots to display.</p>'
+        if unavailable:
+            body += '<p>Omitted screenshot receipts · ' + ', '.join(f'{count} {reason}' for reason, count in unavailable.items()) + '.</p>'
+    body += activity(events)
     atomic_write(output, document(title, body))
     return {"run_id": run_id, "report": str(Path(output).resolve()), "metrics": measured}
