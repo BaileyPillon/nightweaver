@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Text.Json;
 using System.Windows;
@@ -17,15 +18,19 @@ public partial class MainWindow : Window
     private readonly string dataRoot = FindDataRoot();
     private string? visibleRun;
     private long lastEvent;
-    private readonly List<Activity> history = [];
+    private readonly ObservableCollection<Activity> history = [];
     private bool refreshing;
     private bool updatingList;
     private bool working;
     private bool rendering;
+    private bool selectionPending;
+    private readonly Dictionary<string, string> guidanceDrafts = [];
+    private RunRow[] knownRuns = [];
 
     public MainWindow()
     {
         InitializeComponent();
+        Timeline.ItemsSource = history;
         refreshTimer.Tick += async (_, _) => await RefreshAsync();
         Loaded += async (_, _) =>
         {
@@ -97,20 +102,8 @@ public partial class MainWindow : Window
         refreshing = true;
         try
         {
-            string? selected = select ?? (RunList.SelectedItem as RunRow)?.Id;
-            var runs = (await CallAsync("list")).EnumerateArray().Select(RunRow.Parse).ToArray();
-            updatingList = true;
-            try
-            {
-                if (RunList.ItemsSource is not RunRow[] old || !old.SequenceEqual(runs))
-                    RunList.ItemsSource = runs;
-                RunList.SelectedItem = ((RunRow[])RunList.ItemsSource).FirstOrDefault(row => row.Id == selected)
-                    ?? ((RunRow[])RunList.ItemsSource).FirstOrDefault();
-            }
-            finally
-            {
-                updatingList = false;
-            }
+            knownRuns = (await CallAsync("list", "--compact")).EnumerateArray().Select(RunRow.Parse).ToArray();
+            FilterRuns(select ?? (RunList.SelectedItem as RunRow)?.Id);
             await RenderSelectionAsync();
             if (!working)
                 Status.Text = dataRoot;
@@ -125,15 +118,67 @@ public partial class MainWindow : Window
         }
     }
 
+    private void FilterRuns(string? selected)
+    {
+        string term = RunSearch.Text.Trim();
+        var rows = knownRuns.Where(r => string.Join(" ", r.Id, r.Title, r.Subtitle)
+            .Contains(term, StringComparison.OrdinalIgnoreCase)).ToArray();
+        updatingList = true;
+        try
+        {
+            if (RunList.ItemsSource is not RunRow[] old || !old.SequenceEqual(rows))
+                RunList.ItemsSource = rows;
+            RunList.SelectedItem = rows.FirstOrDefault(r => r.Id == selected) ?? rows.FirstOrDefault();
+            RunCount.Text = term.Length == 0 ? $"{rows.Length} runs" : $"{rows.Length} of {knownRuns.Length} runs";
+        }
+        finally { updatingList = false; }
+    }
+
+    private async void SearchChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        FilterRuns((RunList.SelectedItem as RunRow)?.Id);
+        try { await RenderSelectionAsync(); }
+        catch (Exception error) { Status.Text = error.Message; }
+    }
+
+    private void SearchKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Escape) { RunSearch.Clear(); e.Handled = true; }
+    }
+
     private async Task RenderSelectionAsync()
     {
         if (rendering)
+        {
+            selectionPending = true;
             return;
+        }
         rendering = true;
         try
         {
         if (RunList.SelectedItem is not RunRow row)
+        {
+            if (visibleRun is not null) guidanceDrafts[visibleRun] = FeedbackText.Text;
+            visibleRun = null;
+            lastEvent = 0;
+            history.Clear();
+            FeedbackText.Clear();
+            RunTitle.Text = knownRuns.Length == 0 ? "No runs yet" : "No matching runs";
+            RunSummary.Text = knownRuns.Length == 0 ? "Start a OneShot or open a plan." : "Change your search or press Escape in the search field.";
+            Branch.Visibility = HandoffButton.Visibility = Visibility.Collapsed;
+            FeedbackText.IsEnabled = FeedbackButton.IsEnabled = EvidenceButton.IsEnabled = ReportButton.IsEnabled =
+                PauseButton.IsEnabled = ResumeButton.IsEnabled = false;
             return;
+        }
+        if (visibleRun != row.Id)
+        {
+            if (visibleRun is not null) guidanceDrafts[visibleRun] = FeedbackText.Text;
+            FeedbackText.Text = guidanceDrafts.GetValueOrDefault(row.Id, "");
+            visibleRun = row.Id;
+            lastEvent = 0;
+            history.Clear();
+        }
         RunTitle.Text = row.Title;
         RunSummary.Text = $"{row.Subtitle}\n{row.Current}".TrimEnd();
         Branch.Text = $"{row.ResultBranch}    {row.Accepted}";
@@ -146,12 +191,6 @@ public partial class MainWindow : Window
         ResumeButton.IsEnabled = !working && !row.Active && row.Phase != "done" && (!row.Waiting || row.Pause);
         ResumeButton.Content = row.Phase == "blocked" ? "Retry" : "Resume";
 
-        if (visibleRun != row.Id)
-        {
-            visibleRun = row.Id;
-            lastEvent = 0;
-            history.Clear();
-        }
         bool changed = false;
         while (true)
         {
@@ -159,21 +198,25 @@ public partial class MainWindow : Window
                 .EnumerateArray().Select(Activity.Parse).ToArray();
             if ((RunList.SelectedItem as RunRow)?.Id != row.Id)
                 return;
-            history.AddRange(page);
+            foreach (var item in page) history.Add(item);
             changed |= page.Length > 0;
             if (page.Length > 0)
                 lastEvent = page[^1].Seq;
             if (page.Length < 500)
                 break;
         }
-        if (changed || history.Count == 0)
+        if (changed && history.Count > 0 && FollowActivity.IsChecked == true)
+            Timeline.ScrollIntoView(history[^1]);
+        }
+        finally
         {
-            Timeline.ItemsSource = history.ToArray();
-            if (history.Count > 0)
-                Timeline.ScrollIntoView(history[^1]);
+            rendering = false;
+            if (selectionPending)
+            {
+                selectionPending = false;
+                await RenderSelectionAsync();
+            }
         }
-        }
-        finally { rendering = false; }
     }
 
     private async void Run_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -256,13 +299,15 @@ public partial class MainWindow : Window
 
     private async void Feedback_Click(object sender, RoutedEventArgs e)
     {
-        if (working || RunList.SelectedItem is not RunRow row || string.IsNullOrWhiteSpace(FeedbackText.Text))
+        if (working || RunList.SelectedItem is not RunRow row || visibleRun != row.Id || string.IsNullOrWhiteSpace(FeedbackText.Text))
             return;
         working = true;
         try
         {
-            await CallAsync("feedback", row.Id, FeedbackText.Text);
-            FeedbackText.Clear();
+            string submitted = FeedbackText.Text;
+            await CallAsync("feedback", row.Id, submitted);
+            if (visibleRun == row.Id && FeedbackText.Text == submitted) FeedbackText.Clear();
+            if (guidanceDrafts.GetValueOrDefault(row.Id) == submitted) guidanceDrafts.Remove(row.Id);
             Status.Text = "Guidance saved for the next attempt. Paused runs remain paused.";
         }
         catch (Exception error) { Status.Text = error.Message; }
@@ -297,11 +342,11 @@ public partial class MainWindow : Window
         {
             var spec = data.GetProperty("spec");
             var state = data.GetProperty("state");
-            var milestones = spec.GetProperty("milestones");
             int step = state.GetProperty("step").GetInt32();
-            int count = milestones.GetArrayLength();
+            int count = data.GetProperty("total_milestones").GetInt32();
             string phase = Get(state, "phase");
             bool pause = data.GetProperty("pause").GetBoolean();
+            bool supervised = data.TryGetProperty("guard_active", out var guard) && guard.GetBoolean();
             bool active = data.GetProperty("runner_active").GetBoolean();
             bool queued = state.TryGetProperty("dispatch", out var dispatch) && dispatch.GetBoolean();
             var prerequisites = data.GetProperty("waiting_for").EnumerateArray().Select(id => id.GetString()).ToArray();
@@ -310,6 +355,7 @@ public partial class MainWindow : Window
                 (true, true, _) => "Pausing",
                 (_, true, _) => "Paused",
                 (false, false, _) when prerequisites.Length > 0 => "Waiting for prerequisites",
+                (false, false, _) when supervised => "Supervised recovery",
                 (false, false, _) when queued => "Queued",
                 (false, false, "queued") => "Queued",
                 (false, false, _) => "Interrupted",
@@ -319,7 +365,7 @@ public partial class MainWindow : Window
             if (state.TryGetProperty("retry_at", out var retryAt) && retryAt.ValueKind == JsonValueKind.String &&
                 DateTimeOffset.TryParse(retryAt.GetString(), out var retryTime) && retryTime > DateTimeOffset.Now && !pause)
                 subtitle = $"Retry at {retryTime.ToLocalTime():HH:mm:ss} · {step}/{count} accepted";
-            string current = step < count ? Get(milestones[step], "title") : "All milestones accepted";
+            string current = step < count ? Get(data, "current_milestone") : "All milestones accepted";
             if (prerequisites.Length > 0)
                 current += $"\nWaiting for {string.Join(", ", prerequisites)}";
             string error = Get(state, "last_error");
@@ -339,9 +385,9 @@ public partial class MainWindow : Window
             string title = Get(spec, "title");
             if (spec.TryGetProperty("project", out var project))
                 title = $"{project.GetString()} · {title}";
-            return new(Get(data, "id"), title, phase, pause, active, queued, prerequisites.Length > 0,
+            return new(Get(data, "id"), title, phase, pause, active || supervised, queued, prerequisites.Length > 0,
                 subtitle, current,
-                Get(state, "accepted")[..12], Get(data, "result_branch"));
+                ShortCommit(Get(state, "accepted")), Get(data, "result_branch"));
         }
     }
 
@@ -354,7 +400,7 @@ public partial class MainWindow : Window
             string Read(string key) => details.TryGetProperty(key, out var value) ? value.ToString() : "";
             string detail = kind switch
             {
-                "queued" => $"Starting from {Read("base")[..12]}",
+                "queued" => $"Starting from {ShortCommit(Read("base"))}",
                 "worktree_ready" => "Milestone workspace prepared",
                 "worker_started" => $"{Display(Read("adapter"))} · Attempt {Read("attempt")}",
                 "worker_finished" => $"Worker returned exit code {Read("exit")}",
@@ -365,8 +411,12 @@ public partial class MainWindow : Window
                 "review_passed" => Read("reason"),
                 "local_advice" => Read("note"),
                 "local_advice_unavailable" => Read("reason"),
-                "promotion_prepared" => $"Verified commit {Read("commit")[..12]}",
-                "milestone_accepted" => $"Milestone {Read("step")} accepted · {Read("commit")[..12]}",
+                "promotion_prepared" => $"Verified commit {ShortCommit(Read("commit"))}",
+                "milestone_accepted" => $"Milestone {Read("step")} accepted · {ShortCommit(Read("commit"))}",
+                "guard_child_started" => $"Runner {Read("pid")} · {Display(Read("phase"))}",
+                "guard_child_exited" => $"Runner {Read("pid")} exited with {Read("exit")} · {ShortCommit(Read("accepted"))}",
+                "guard_restart_scheduled" => $"Restart {Read("restart")} of {Read("limit")} · {Read("completed")} milestones accepted",
+                "guard_stopped" => Display(Read("reason")),
                 "run_completed" => Read("branch").Replace("refs/heads/", ""),
                 "attempt_rejected" or "blocked" or "provider_unavailable" or "budget_exhausted" or "repeated_failure_stopped" => Brief(Read("issue")),
                 "operator_feedback" => Brief(Read("message")),
@@ -390,5 +440,6 @@ public partial class MainWindow : Window
     }
 
     private static string Get(JsonElement data, string key) => data.GetProperty(key).GetString() ?? "";
+    private static string ShortCommit(string hash) => hash.Length == 0 ? "unavailable" : hash[..Math.Min(12, hash.Length)];
     private static string Display(string value) => value.Length == 0 ? value : char.ToUpperInvariant(value[0]) + value[1..].Replace('_', ' ');
 }

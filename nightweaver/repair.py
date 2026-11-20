@@ -84,7 +84,7 @@ def failure_brief(store, run_id, state, limit):
         gates = ", ".join(row.get("failed_gates", []))
         paths = ", ".join(row.get("changed_paths", [])[:6])
         lines.append(
-            f"Attempt {row['attempt']} · {row['phase']} · tree {row.get('tree', 'unknown')[:12]}: "
+            f"Attempt {row['attempt']} · {row['phase']} · tree {(row.get('tree') or 'unknown')[:12]}: "
             f"{gates[:180]} {row['issue'][:480]}"
             + (f" · Changed files: {paths[:220]}" if paths else "")
         )

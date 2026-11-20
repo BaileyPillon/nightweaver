@@ -42,6 +42,8 @@
             </StackPanel>
         </StackPanel>
         <StackPanel Grid.Row="6" Margin="0,10,0,0">
+            <CheckBox x:Name="GuardRestarts" Foreground="#ECF1EB" Margin="0,0,0,8"
+                      Content="Restart a crashed runner up to twice" AutomationProperties.Name="Restart a crashed runner up to twice"/>
             <Label Content="Primary CLI profile directory (optional)" Target="{Binding ElementName=ProfilePath}" Foreground="#ECF1EB" Padding="0,0,0,4"/>
             <TextBox x:Name="ProfilePath" AutomationProperties.Name="Primary CLI profile directory" Padding="6" Background="#161D19" Foreground="#ECF1EB" CaretBrush="#D4EDAD" BorderBrush="#59685E"/>
         </StackPanel>

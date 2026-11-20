@@ -63,17 +63,17 @@ def attention(store):
         missing = [rid for rid in ancestors if rid not in runs]
         failed = [rid for rid in ancestors if rid in runs and runs[rid]["state"]["phase"] == "blocked"]
         paused = [rid for rid in ancestors if rid in runs and runs[rid]["pause"]]
-        if row["pause"]:
-            reason, action = "paused", ["resume", run_id]
-        elif phase == "blocked":
+        if phase == "blocked":
             reason, action = "blocked", ["handoff", run_id]
+        elif row["pause"]:
+            reason, action = "paused", ["resume", run_id]
         elif missing:
             reason, action = "missing_prerequisite", ["db-check"]
         elif failed:
             reason, action = "blocked_prerequisite", ["handoff", failed[0]]
         elif paused:
             reason, action = "paused_prerequisite", ["resume", paused[0]]
-        elif runner_active(store.directory(run_id) / "runner.lock"):
+        elif any(runner_active(store.directory(run_id) / name) for name in ("runner.lock", "guard.lock")):
             continue
         elif state.get("dispatch") and not dispatcher_running:
             reason, action = "dispatcher_stopped", ["dispatch", "--watch"]
@@ -82,8 +82,12 @@ def attention(store):
         elif state.get("dispatch"):
             # An eligible queued run or a retry backoff belongs to the dispatcher.
             continue
+        elif state.get("guard_crashed") and state.get("guard_restarts", 0) >= state.get("guard_limit", 2):
+            reason, action = "restart_limit_reached", ["recovery", run_id]
         elif phase == "queued":
             reason, action = "awaiting_start", ["start", run_id]
+        elif "guard_limit" in state:
+            reason, action = "supervisor_stopped", ["guard", run_id]
         else:
             reason, action = "runner_stopped", ["resume", run_id]
         result.append(
@@ -158,6 +162,31 @@ def handoff(store, run_id):
     )
 
 
+def handoff_markdown(data):
+    lines = [f"# {data['objective']}", "", f"Run: {data['run_id']}",
+             f"Phase: {data['phase']}" + (" (paused)" if data["paused"] else ""),
+             f"Accepted commit: {data['accepted_commit']}"]
+    if data["completed"]:
+        lines += ["", "## Accepted milestones", ""]
+        lines += [f"- {m['title']} ({m['commit']})" for m in data["completed"]]
+    if step := data["current"]:
+        lines += ["", f"## Next milestone · {step['title']}", "", step["task"]]
+        for label, items in (("Allowed paths", step["paths"]), ("Checks", step["checks"])):
+            if items:
+                lines += ["", label, *[f"- {item}" for item in items]]
+    if data["acceptance"]:
+        lines += ["", "## Acceptance requirements", "", *[f"- {item}" for item in data["acceptance"]]]
+    if data["waiting_for"]:
+        lines += ["", "Waiting for " + ", ".join(data["waiting_for"])]
+    if worker := data["next_worker"]:
+        lines += ["", "Next worker: " + " / ".join(str(v) for v in worker.values() if v)]
+    for title, value in (("Last diagnostic", data["last_error"]),
+                         ("Operator guidance", data["operator_feedback"])):
+        if value:
+            lines += ["", f"## {title}", "", value]
+    return "\n".join(lines) + "\n"
+
+
 def changes(store, run_id, milestone=None, include_patch=False):
     row = store.get(run_id)
     state, spec = row["state"], row["spec"]
@@ -188,9 +217,7 @@ def audit_evidence(store, run_id):
     store.get(run_id)
     root = (store.directory(run_id) / "evidence").resolve()
     files = []
-    for event in store.events(run_id, limit=None):
-        if event["kind"] != "gate_finished":
-            continue
+    for event in store.events(run_id, limit=None, kinds=["gate_finished"]):
         detail = event["details"]
         artifacts = [(a, "artifact") for a in detail.get("artifacts", [])]
         if detail.get("log_sha256"):

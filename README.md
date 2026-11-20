@@ -1,6 +1,16 @@
 # Nightweaver
 
-**Version 0.17** can hand a failing implementation to a second worker with the partial edits, failed checks and remaining budget intact. Start from a trusted Git repository and a goal in the native Windows dashboard or CLI. [All 30 changes, sources and the restart comparison](docs/v0.17-research.md)
+**Version 0.18** can restart a crashed Windows runner at its saved milestone. Give a dedicated run a restart allowance, inspect its accepted commit, and trace a crash from the dashboard or offline report. [The 40 ranked changes, recent research and Windows recovery trials](docs/v0.18-research.md)
+
+```powershell
+nightweaver oneshot C:\src\my-project "Fix the broken share link" --guard-restarts 2 --wait
+nightweaver recovery RUN_ID
+nightweaver restarts RUN_ID
+```
+
+The allowance applies across supervisor launches. To recover after the supervisor itself exits, use `nightweaver dispatch --recover-guards` for one sweep or add `--watch` for ongoing monitoring. In the Windows dashboard, choose **New OneShot → Restart a crashed runner up to twice**.
+
+Version 0.17 added functional handoffs between workers with the partial edits, failed checks and remaining budget intact. [All 30 changes, sources and the restart comparison](docs/v0.17-research.md)
 
 ```powershell
 nightweaver oneshot C:\src\my-project "Fix the broken share link" --preview
