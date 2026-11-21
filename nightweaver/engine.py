@@ -43,7 +43,9 @@ def common_dir(path):
 
 
 def pending_dependencies(store, state):
-    return [item for item in state.get("after", []) if store.get(item)["state"]["phase"] != "done"]
+    keys = state.get("after", [])
+    phases = store.dependency_phases(keys)
+    return [item for item in keys if phases.get(item) != "done"]
 
 
 def checkout(path):
@@ -655,9 +657,24 @@ class Run:
                     return "skipped"
             if state["phase"] == "done" or (state["phase"] == "blocked" and not retry):
                 return state["phase"]
+            if row["pause"]:
+                return "paused"
             pending = pending_dependencies(self.store, state)
             if pending:
                 raise BusyRun("Waiting for prerequisite runs: " + ", ".join(pending))
+            # Acquire ownership before resetting retries, finalizing an interrupted
+            # call or starting the elapsed-time clock. Contention is read-only.
+            try:
+                self.gitdir = common_dir(self.repository)
+                verify_registered_repository(self.spec, self.gitdir)
+                project_lock.enter_context(run_lock(self.gitdir / "nightweaver.lock",
+                                                    "Another Nightweaver run owns this Git repository"))
+            except BusyRun:
+                raise
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                self.set("blocked", {"issue": str(error), "during": state["phase"]},
+                         phase="blocked", blocked_from=state.get("blocked_from") or state["phase"], last_error=str(error))
+                return "blocked"
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
                          attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,
@@ -666,7 +683,7 @@ class Run:
                 self.finish_call(state["pending_call"], recovered=True)
             if not state.get("started_at"):
                 self.set("run_started", {}, started_at=timestamp())
-            self.gitdir = None
+            context_checked = False
             while True:
                 state = self.store.get(self.id)["state"]
                 phase = state["phase"]
@@ -683,16 +700,12 @@ class Run:
                             return "waiting"
                         time.sleep(.2)
                         continue
-                    if self.gitdir is None:
-                        gitdir = common_dir(self.repository)
-                        verify_registered_repository(self.spec, gitdir)
-                        project_lock.enter_context(run_lock(gitdir / "nightweaver.lock",
-                                                            "Another Nightweaver run owns this Git repository"))
-                        self.gitdir = gitdir
+                    if not context_checked:
                         if self.spec.get("context_sha256"):
                             context.load_pack(self.store, self.id)
                         if not (self.root / "context.json").is_file() and (self.spec.get("context_files") or self.spec.get("repository_map")):
                             context.save(self.store, self.id, context.capture(self.spec, state["base"]))
+                        context_checked = True
                     if phase == "promoting":
                         self.promote(state)
                         continue

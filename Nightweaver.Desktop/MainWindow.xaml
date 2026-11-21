@@ -81,6 +81,13 @@
                     Padding="23,21,16,18">
                 <DockPanel>
                     <TextBlock DockPanel.Dock="Top" Text="Runs" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,13"/>
+                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+                        <Label Content="_Find a run" Target="{Binding ElementName=RunSearch}" Foreground="{StaticResource Muted}" Padding="0,0,0,4"/>
+                        <TextBox x:Name="RunSearch" TextChanged="SearchChanged" KeyDown="SearchKeyDown"
+                                 AutomationProperties.Name="Find a run" ToolTip="Search title, status or run ID. Escape clears."/>
+                        <TextBlock x:Name="RunCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,5,0,0"
+                                   AutomationProperties.LiveSetting="Polite"/>
+                    </StackPanel>
                     <ListBox x:Name="RunList" BorderThickness="0" Background="Transparent" Foreground="#ECF1EB"
                              SelectionChanged="Run_SelectionChanged" AutomationProperties.Name="Runs">
                         <ListBox.ItemContainerStyle>
@@ -147,7 +154,11 @@
                         <Button x:Name="PauseButton" Content="Pause" Click="Pause_Click" IsEnabled="False"/>
                         <Button x:Name="ResumeButton" Content="Resume" Click="Resume_Click" IsEnabled="False" Margin="0"/>
                     </StackPanel>
-                    <TextBlock Text="Activity" FontSize="19" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <WrapPanel VerticalAlignment="Center">
+                        <TextBlock Text="Activity" FontSize="19" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="FollowActivity" Content="Follow latest" IsChecked="True"
+                                  VerticalAlignment="Center" Margin="12,4" Foreground="{StaticResource Muted}"/>
+                    </WrapPanel>
                 </DockPanel>
                 <Grid Grid.Row="2">
                     <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>

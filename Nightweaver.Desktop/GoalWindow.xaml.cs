@@ -23,6 +23,7 @@ public partial class GoalWindow : Window
             if (Alternate.Length > 0 && Alternate != Provider) args.AddRange(["--rescue", Alternate]);
         }
         else args.Add("--start");
+        if (GuardRestarts.IsChecked == true) args.AddRange(["--guard-restarts", "2"]);
         if (ProfilePath.Text.Trim() is { Length: > 0 } profile) args.AddRange(["--profile-dir", profile]);
         return args.ToArray();
     }

@@ -1,6 +1,7 @@
 """Durable run records and evidence indexes."""
 
 from contextlib import contextmanager
+from copy import copy
 from datetime import datetime, timezone
 import json
 import os
@@ -51,6 +52,9 @@ class Store:
 
     @contextmanager
     def connect(self):
+        if getattr(self, "_reader", None) is not None:
+            yield self._reader
+            return
         db = sqlite3.connect(self.root / "runs.sqlite3", timeout=15)
         db.row_factory = sqlite3.Row
         try:
@@ -58,6 +62,19 @@ class Store:
                 yield db
         finally:
             db.close()
+
+    @contextmanager
+    def snapshot(self):
+        """Read state, metrics and evidence from the same SQLite WAL revision."""
+        if getattr(self, "_reader", None) is not None:
+            yield self
+            return
+        with self.connect() as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            reader = copy(self)
+            reader._reader = db
+            yield reader
 
     @staticmethod
     def decode(row):
@@ -122,6 +139,28 @@ class Store:
         with self.connect() as db:
             return [self.decode(row) for row in db.execute("SELECT * FROM runs ORDER BY updated DESC")]
 
+    def run_summaries(self):
+        """Read the sidebar's fields without materializing prompts, gate plans or provider configs."""
+        query = """SELECT id, updated, pause, state, json_extract(spec,'$.title') AS title,
+                   json_extract(spec,'$.project') AS project, json_array_length(spec,'$.milestones') AS total,
+                   json_extract(spec,'$.milestones[' || json_extract(state,'$.step') || '].title') AS current
+                   FROM runs ORDER BY updated DESC"""
+        keys = ("phase", "step", "accepted", "result_ref", "dispatch", "after", "retry_at", "last_error", "provider_calls")
+        with self.connect() as db:
+            result = []
+            for row in db.execute(query):
+                state = json.loads(row["state"])
+                summary = {k: state[k] for k in keys if k in state}
+                if issue := state.get("provider_issue"):
+                    summary["provider_issue"] = {k: issue[k] for k in ("provider", "role", "profile_dir") if k in issue}
+                spec = {"title": row["title"]}
+                if row["project"]:
+                    spec["project"] = row["project"]
+                result.append({"id": row["id"], "updated": row["updated"], "pause": bool(row["pause"]),
+                               "spec": spec, "state": summary, "total_milestones": row["total"],
+                               "current_milestone": row["current"]})
+            return result
+
     def dispatch_runs(self):
         with self.connect() as db:
             rows = db.execute("""SELECT * FROM runs WHERE pause=0
@@ -130,6 +169,25 @@ class Store:
                               AND (json_extract(state, '$.retry_at') IS NULL OR json_extract(state, '$.retry_at') <= ?)
                               ORDER BY rowid""", (timestamp(),))
             return [self.decode(row) for row in rows]
+
+    def guarded_runs(self):
+        with self.connect() as db:
+            rows = db.execute("""SELECT * FROM runs WHERE pause=0
+                              AND json_type(state, '$.guard_limit')='integer'
+                              AND COALESCE(json_extract(state, '$.dispatch'),0)=0
+                              AND json_extract(state, '$.phase') NOT IN ('done','blocked') ORDER BY rowid""")
+            return [self.decode(row) for row in rows]
+
+    def dependency_phases(self, ids):
+        keys = list(dict.fromkeys(ids))
+        phases = {}
+        if keys:
+            with self.connect() as db:
+                for i in range(0, len(keys), 500):
+                    batch = keys[i:i+500]
+                    slots = ",".join("?" for _ in batch)
+                    phases.update(db.execute(f"SELECT id, json_extract(state, '$.phase') FROM runs WHERE id IN ({slots})", batch))
+        return phases
 
     def transition(self, run_id, kind, details=None, *, following_event=None, **changes):
         if "last_error" in changes:

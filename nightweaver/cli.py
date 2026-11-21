@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from uuid import uuid4
 
@@ -23,21 +24,39 @@ def output(data):
     print(json.dumps(data, indent=2, ensure_ascii=True))
 
 
-def with_live_status(store, row):
+def launch_exit(result):
+    phase = result.get("phase")
+    if phase is None or phase == "done":
+        return 0
+    from .recovery import EXIT_CODES
+    return EXIT_CODES.get(phase, 4)
+
+
+def with_live_status(store, row, phases=None):
     lock = store.directory(row["id"]) / "runner.lock"
     ref = row["state"].get("result_ref", f"refs/heads/rookline/{row['id']}")
-    waiting = pending_dependencies(store, row["state"])
+    if phases is None:
+        phases = store.dependency_phases(row["state"].get("after", []))
+    waiting = [p for p in row["state"].get("after", []) if phases.get(p) != "done"]
     return redact({**row, "runner_active": runner_active(lock), "result_branch": ref.removeprefix("refs/heads/"),
-            "waiting_for": waiting,
-            "blocked_prerequisites": [item for item in waiting if store.get(item)["state"]["phase"] == "blocked"]})
+            "guard_active": runner_active(lock.with_name("guard.lock")), "waiting_for": waiting,
+            "missing_prerequisites": [item for item in waiting if item not in phases],
+            "blocked_prerequisites": [item for item in waiting if phases.get(item) == "blocked"]})
 
 
-def dispatch(store, watch):
+def dispatch(store, watch, recover_guards=False):
     if watch:
         record_dispatch(store, "Dispatcher started")
     with run_lock(store.root / "dispatcher.lock", "Another dispatcher is already serving this runtime"):
         while True:
             results = []
+            if recover_guards:
+                from .recovery import recovery_status
+                for row in store.guarded_runs():
+                    status = recovery_status(store, row["id"])
+                    if status["disposition"] == "eligible":
+                        pid = background(store, row["id"], False, status["restart_limit"])
+                        results.append({"run_id": row["id"], "supervisor_pid": pid})
             for row in store.dispatch_runs():
                 try:
                     phase = Run(store, row["id"]).run(defer_retries=watch)
@@ -62,15 +81,21 @@ def record_dispatch(store, message):
         print(timestamp(), message, file=log)
 
 
-def background(store, run_id, retry):
+def background(store, run_id, retry, restarts=None):
     root = store.directory(run_id)
-    command = [sys.executable, "-m", "nightweaver", "--home", str(store.root), "run", run_id]
+    command = [sys.executable, "-m", "nightweaver", "--home", str(store.root),
+               "guard" if restarts is not None else "run", run_id]
+    if restarts is not None:
+        command.extend(["--max-restarts", str(restarts)])
     if retry:
         command.append("--retry")
     with (root / "runner.log").open("ab") as out:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  close_fds=True, creationflags=subprocess.DETACHED_PROCESS,
                                  cwd=Path(__file__).resolve().parent.parent)
+    # A long-lived dispatcher must reap its detached child handles. A one-shot
+    # client can exit immediately; Windows keeps the detached process alive.
+    threading.Thread(target=child.wait, name=f"reap-{child.pid}", daemon=True).start()
     return child.pid
 
 
@@ -211,7 +236,15 @@ def register(store, spec, args):
     run_id = create_run(store, spec, enqueue=args.enqueue, after=args.after)
     result = {"run_id": run_id}
     if args.start:
-        if getattr(args, "wait", False):
+        limit = getattr(args, "guard_restarts", None)
+        if limit is not None:
+            from .recovery import supervise
+            store.transition(run_id, "guard_enrolled", {"limit": limit}, guard_limit=limit)
+            if args.wait:
+                result["phase"] = supervise(store, run_id, limit)
+            else:
+                result["supervisor_pid"] = background(store, run_id, False, limit)
+        elif getattr(args, "wait", False):
             result["phase"] = Run(store, run_id).run()
         else:
             result["runner_pid"] = background(store, run_id, False)
@@ -243,6 +276,20 @@ def main(argv=None):
     launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
     launch_one.add_argument("--enqueue", action="store_true", help="Use the persistent queue for the worker run")
     commands.add_parser("repair-history", help="Trace failed candidates and functional worker handoffs").add_argument("id")
+    guard = commands.add_parser("guard", help="Run with bounded recovery after a Windows runner exits unexpectedly")
+    guard.add_argument("id")
+    guard.add_argument("--max-restarts", type=int, choices=range(11), metavar="0..10")
+    guard.add_argument("--retry", action="store_true", help="Explicitly retry an initially blocked run once")
+    for command, help_text in (("recovery", "Explain the saved checkpoint and live recovery disposition"),
+                               ("restarts", "Read the supervisor process and checkpoint history")):
+        commands.add_parser(command, help=help_text).add_argument("id")
+    commands.add_parser("recovery-queue", help="List interrupted and exhausted dedicated runs")
+    single = commands.add_parser("event", help="Inspect one exact evidence event within a run")
+    single.add_argument("id")
+    single.add_argument("seq", type=int)
+    for parser in (one, add, goal):
+        parser.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
+                            help="Launch under a dedicated crash supervisor with this lifetime restart allowance")
     mode = goal.add_mutually_exclusive_group()
     mode.add_argument("--prompt-only", action="store_true", help="Print the actual planner input without calling a model")
     mode.add_argument("--plan-from", type=Path, help="Use a saved planner response with the same validation")
@@ -268,6 +315,8 @@ def main(argv=None):
         parser.add_argument("--after", action="append", default=[], metavar="RUN_ID",
                             help="Wait for this prerequisite run to complete. Requires --enqueue.")
     dispatcher = commands.add_parser("dispatch", help="Start eligible queued runs in order")
+    dispatcher.add_argument("--recover-guards", action="store_true",
+                            help="Also relaunch eligible dedicated runs enrolled in crash supervision")
     dispatcher.add_argument("--watch", action="store_true", help="Keep serving the queue")
     dispatcher.add_argument("--tool-path", help="Add executable directories to the dispatcher's PATH")
     configure = commands.add_parser("configure", help="Configure a provider using an existing local key file")
@@ -281,11 +330,15 @@ def main(argv=None):
         if name in ("start", "resume"):
             parser.add_argument("--wait", action="store_true")
         if name == "events":
+            parser.add_argument("--until", type=int, help="Include events up to this inclusive sequence number")
+            parser.add_argument("--before", type=int, help="Read the previous page before this exclusive sequence")
             parser.add_argument("--after", type=int)
             parser.add_argument("--limit", type=int, default=80)
             parser.add_argument("--all", action="store_true")
             parser.add_argument("--follow", action="store_true", help="Stream new events as JSON lines until the run stops")
             parser.add_argument("--kind", action="append", default=[], help="Only return this event kind (repeatable)")
+        if name == "run":
+            parser.add_argument("--guard-child", help=argparse.SUPPRESS)
     wait = commands.add_parser("wait", help="Observe a run until done, blocked, paused or timed out")
     wait.add_argument("id")
     wait.add_argument("--timeout", type=float, help="Wall-clock seconds to wait")
@@ -385,6 +438,8 @@ def main(argv=None):
                                ("audit-evidence", "Recheck the hashes of recorded gate artifacts")):
         parser = commands.add_parser(command, help=help_text)
         parser.add_argument("id")
+        if command == "handoff":
+            parser.add_argument("--markdown", type=Path, metavar="FILE", help="Save a portable session brief")
         if command == "changes":
             parser.add_argument("--milestone", type=int)
             parser.add_argument("--patch", action="store_true", help="Include a redacted patch for inspection")
@@ -472,6 +527,8 @@ def main(argv=None):
     junit.add_argument("--output", type=Path, required=True)
     for action in ("list","fleet"):
         p = commands.add_parser(action)
+        if action == "list":
+            p.add_argument("--compact", action="store_true", help="Return sidebar summaries without prompts and gate definitions")
         p.add_argument("--project")
         p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","done","blocked"))
     args = app.parse_args(argv)
@@ -481,6 +538,15 @@ def main(argv=None):
         app.error("--after requires --enqueue")
     if args.command in ("add", "goal") and args.wait and not args.start:
         app.error("--wait requires --start")
+    if getattr(args, "guard_restarts", None) is not None and (
+            getattr(args, "preview", False) or getattr(args, "enqueue", False)
+            or (args.command in ("goal", "add") and not args.start)):
+        app.error("--guard-restarts requires a dedicated launch")
+    if args.command == "events":
+        if args.before is not None and (args.after is not None or args.until is not None or args.before < 1):
+            app.error("--before requires a positive exclusive cursor and cannot combine with --after or --until")
+        if args.follow and (args.until is not None or args.before is not None or args.all):
+            app.error("--follow cannot combine with a bounded end cursor or --all")
     if args.command == "doctor":
         if args.live and not (args.plan or args.planner):
             app.error("--live requires --plan or --planner")
@@ -500,6 +566,29 @@ def main(argv=None):
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
+        if name in ("guard", "recovery", "restarts", "recovery-queue"):
+            from .recovery import EXIT_CODES, GUARD_EVENTS, recovery_status, supervise
+            if name == "guard":
+                phase = supervise(store, args.id, args.max_restarts, retry=args.retry)
+                output({"run_id": args.id, "phase": phase})
+                return EXIT_CODES.get(phase, 4)
+            if name == "recovery":
+                output(recovery_status(store, args.id))
+            elif name == "restarts":
+                output(store.events(args.id, limit=None, kinds=GUARD_EVENTS))
+            else:
+                items = (recovery_status(store, r["id"]) for r in store.runs()
+                         if (r["state"].get("started_at") or "guard_limit" in r["state"]) and r["state"]["phase"] not in ("done", "blocked"))
+                output([r for r in items if r["disposition"] in ("eligible", "limit_reached")])
+            return 0
+        if name == "event":
+            if args.seq < 1:
+                raise ValueError("Event sequence must be positive")
+            page = store.events(args.id, after=args.seq-1, until=args.seq, limit=1)
+            if not page:
+                raise ValueError("This run has no event with that sequence")
+            output(page[0])
+            return 0
         if name == "repair-history":
             from .repair import repair_history
             output(repair_history(store, args.id))
@@ -526,7 +615,7 @@ def main(argv=None):
             args.start, args.after = not args.enqueue, []
             result = register(store, spec, args) if args.direct else plan_goal(store, args, raw)
             output(result)
-            return {"blocked": 3, "paused": 2, "waiting": 4}.get(result.get("phase"), 0)
+            return launch_exit(result)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
@@ -547,14 +636,18 @@ def main(argv=None):
                 output(store.bind_project(args.project_name, repository, gitdir, args.replace))
         elif name in ("list","fleet"):
             from .inspection import matching_runs, fleet
-            rows = matching_runs(store, args.project, args.phase)
-            output(fleet(store, rows) if name == "fleet" else [with_live_status(store, row) for row in rows])
+            rows = matching_runs(store, args.project, args.phase, compact=getattr(args, "compact", False))
+            if name == "fleet":
+                output(fleet(store, rows))
+            else:
+                phases = store.dependency_phases({p for r in rows for p in r["state"].get("after", [])})
+                output([with_live_status(store, row, phases) for row in rows])
         elif name == "configure":
             output(configure_deepseek_key(args.key_file))
         elif name in ("add","goal"):
             result = register(store, read_plan(args.plan, store), args) if name == "add" else plan_goal(store, args)
             output(result)
-            return {"blocked": 3, "paused": 2, "waiting": 4}.get(result.get("phase"), 0)
+            return launch_exit(result)
         elif name == "wait":
             from .inspection import wait_for_run
             result, code = wait_for_run(store, args.id, args.timeout)
@@ -640,7 +733,8 @@ def main(argv=None):
                 for event in follow_events(store, args.id, args.after or 0, args.limit, args.kind):
                     print(json.dumps(event, ensure_ascii=True), flush=True)
             else:
-                output(store.events(args.id, limit=None if args.all else args.limit, after=args.after, kinds=args.kind))
+                until = args.before - 1 if args.before is not None else args.until
+                output(store.events(args.id, limit=None if args.all else args.limit, after=args.after, kinds=args.kind, until=until))
         elif name == "attention":
             from .operations import attention
             output(attention(store))
@@ -655,8 +749,15 @@ def main(argv=None):
             else:
                 output(export_trace(store, args.id, args.output, args.after, args.until))
         elif name == "handoff":
-            from .operations import handoff
-            output(handoff(store, args.id))
+            from .operations import handoff, handoff_markdown
+            with store.snapshot() as reader:
+                data = handoff(reader, args.id)
+            if args.markdown:
+                from .safety import atomic_write
+                atomic_write(args.markdown, handoff_markdown(data))
+                output({"run_id": args.id, "handoff": str(args.markdown.resolve())})
+            else:
+                output(data)
         elif name == "changes":
             from .operations import changes
             output(changes(store, args.id, args.milestone, args.patch))
@@ -758,12 +859,19 @@ def main(argv=None):
         elif name == "dispatch":
             if args.tool_path:
                 os.environ["PATH"] = args.tool_path + os.pathsep + os.environ.get("PATH", "")
-            output(dispatch(store, args.watch))
+            output(dispatch(store, args.watch, args.recover_guards))
         elif name == "pause":
             changed = store.pause(args.id, True)
             output({"run_id": args.id, "pause_requested": store.get(args.id)["pause"], "changed": changed})
         elif name == "run":
-            phase = Run(store, args.id).run(retry=args.retry)
+            try:
+                phase = Run(store, args.id).run(retry=args.retry)
+            except BusyRun as error:
+                if not args.guard_child:
+                    raise
+                store.transition(args.id, "guard_child_contended", {"pid": os.getpid(),
+                                 "launch_id": args.guard_child, "reason": str(error)})
+                return 4
             output({"run_id": args.id, "phase": phase})
             return {"done": 0, "paused": 2, "blocked": 3, "waiting": 4}[phase]
         else:
@@ -781,13 +889,20 @@ def main(argv=None):
             if waiting:
                 output({"run_id": args.id, "waiting_for": waiting})
                 return 4 if args.wait else 0
-            elif runner_active(store.directory(args.id) / "runner.lock"):
+            elif any(runner_active(store.directory(args.id) / lock) for lock in ("runner.lock", "guard.lock")):
                 if args.wait:
                     from .inspection import wait_for_run
                     result, code = wait_for_run(store, args.id)
                     output(result)
                     return code
                 output({"run_id": args.id, "runner_active": True, "launched": False})
+            elif "guard_limit" in row["state"]:
+                if args.wait:
+                    from .recovery import supervise
+                    result = {"run_id": args.id, "phase": supervise(store, args.id, retry=args.retry)}
+                    output(result)
+                    return launch_exit(result)
+                output({"run_id": args.id, "supervisor_pid": background(store, args.id, args.retry, row["state"]["guard_limit"])})
             elif args.wait:
                 phase = Run(store,args.id).run(retry=args.retry)
                 output({"run_id":args.id, "phase":phase})
