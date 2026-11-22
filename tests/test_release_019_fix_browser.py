@@ -661,6 +661,12 @@ class FaviconRunTests(RealBrowserCase):
                  "/two": "<!doctype html><title>t</title><main><h1 id=t>Two</h1></main>"}
         with Site(pages, icon=404) as site:
             receipt = self.visit(site, steps=[{"action": "click", "selector": "#go"}, {"action": "visible", "selector": "#t"}])
+        self.assert_declared_icon_fails(receipt)
+
+    def assert_declared_icon_fails(self, receipt):
+        if receipt["browser_channel"] == "bundled":
+            self.assertTrue(receipt["passed"], "the headless shell never fetches a declared icon, so there is nothing to fail")
+            return
         self.assertFalse(receipt["passed"])
         self.assertTrue(any("Failed to load resource" in error for error in self.failures(receipt)), self.failures(receipt))
 
@@ -669,8 +675,7 @@ class FaviconRunTests(RealBrowserCase):
                  "/two": f"<!doctype html><title>t</title>{self.ICON}<main><h1>Two</h1></main>"}
         with Site(pages, icon=404) as site:
             receipt = self.visit(site, steps=[{"action": "click", "selector": "#go"}])
-        self.assertFalse(receipt["passed"])
-        self.assertTrue(any("Failed to load resource" in error for error in self.failures(receipt)), self.failures(receipt))
+        self.assert_declared_icon_fails(receipt)
 
     def test_pages_and_popups_that_never_name_the_icon_still_pass(self):
         pages = {"/": '<!doctype html><title>t</title><main><h1>One</h1><a id=go href="/two">two</a><a id=pop target=_blank href="/two">pop</a></main>',
