@@ -221,6 +221,7 @@ def milestone_timeline(store, run_id):
             "started": None,
             "accepted": None,
             "elapsed_seconds": None,
+            "discarded": False,
             "worker_attempts": 0,
             "rejections": 0,
             "gate_executions": 0,
@@ -229,6 +230,7 @@ def milestone_timeline(store, run_id):
         for i, s in enumerate(row["spec"]["milestones"], 1)
     ]
     cursor = 0
+    gone = set(store.discarded_commits(run_id))
     for event in store.events(
         run_id,
         limit=None,
@@ -245,7 +247,8 @@ def milestone_timeline(store, run_id):
         kind, d = event["kind"], event["details"]
         if kind == "milestone_accepted":
             current = milestones[d["step"] - 1]
-            current.update(accepted=event["time"], commit=d["commit"])
+            # A milestone of a wave a revert threw away was built but is not part of the result.
+            current.update(commit=d["commit"], **({"discarded": True} if d["commit"] in gone else {"accepted": event["time"]}))
             if current["started"]:
                 current["elapsed_seconds"] = round(
                     (
@@ -313,6 +316,7 @@ def ci_summary(store, run_id, output):
         "| Measurement | Value |",
         "| --- | ---: |",
         f"| Milestones accepted | {m['accepted_milestones']} / {m['total_milestones']} |",
+        *([f"| Milestones discarded by a revert | {m['pursuit']['discarded_milestones']} |"] if m.get("pursuit", {}).get("discarded_milestones") else []),
         f"| Worker attempts | {m['worker_attempts']} |",
         f"| Provider calls | {m['provider_calls']} |",
         f"| Failed attempts | {m['failed_attempts']} |",

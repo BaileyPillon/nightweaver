@@ -176,6 +176,8 @@ def diagnose(store, spec=None, planner=None, live=False):
         if pursue := spec.get("pursue"):
             roles.append(("pursuit judge", pursue["judge"]))
             roles.extend((f"pursuit judge fallback {number}", route) for number, route in enumerate(pursue.get("judge_fallbacks", []), 1))
+            if pursue.get("confirm", True) and pursue.get("confirm_judge"):
+                roles.append(("pursuit confirmation judge", pursue["confirm_judge"]))
             roles.append(("pursuit planner", pursue["planner"]))
             roles.extend((f"exploration worker {number}", route) for number, route in enumerate(pursue.get("explore", {}).get("workers", []), 1))
             roles.extend((f"rescue worker {number}", route) for number, route in enumerate(pursue.get("rescue", {}).get("workers", []), 1))

@@ -53,7 +53,7 @@ def anchor_provider_paths(raw, folder):
             pursue["references"] = [str((folder / Path(item).expanduser()).resolve()) if isinstance(item, str) and item.strip() else item
                                     for item in pursue["references"]]
         explore, rescue = pursue.get("explore"), pursue.get("rescue")
-        routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5),
+        routes = [pursue.get("judge"), pursue.get("planner"), pursue.get("confirm_judge"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5),
                   *(array(explore.get("workers", []), "explore workers", 4) if isinstance(explore, dict) else []),
                   *(array(rescue.get("workers", []), "rescue workers", 4) if isinstance(rescue, dict) else [])]
         for route in routes:
@@ -259,8 +259,12 @@ def rescuing(raw, relative_to):
     return out
 
 
+MAX_CRITERIA = 60  # what a judgment can list; more would never fit one answer
+
+
 def pursuit(raw, relative_to, acceptance):
-    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore rescue", "pursue")
+    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore rescue "
+           "confirm confirm_judge confirm_margin", "pursue")
     if "judge" not in raw:
         raise ValueError("pursue requires a judge")
     judge = provider(raw["judge"], REVIEWERS, "judge", relative_to)
@@ -280,8 +284,14 @@ def pursuit(raw, relative_to, acceptance):
     criteria = raw.get("criteria", acceptance)
     if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
         raise ValueError("pursue criteria must be a list of nonempty strings")
+    if len(criteria) > MAX_CRITERIA:
+        raise ValueError(f"pursue criteria (or acceptance, which they default to) must list at most {MAX_CRITERIA} requirements")
+    if type(raw.get("confirm", True)) is not bool:
+        raise ValueError("confirm must be true or false")
     return {"judge": judge, **({"explore": exploration(raw["explore"], relative_to)} if "explore" in raw else {}),
             "rescue": rescuing(raw.get("rescue", {}), relative_to),
+            "confirm": raw.get("confirm", True), "confirm_margin": integer(raw.get("confirm_margin", 3), "confirm_margin", 0, 20),
+            **({"confirm_judge": provider(raw["confirm_judge"], REVIEWERS, "confirm judge", relative_to)} if "confirm_judge" in raw else {}),
             "judge_fallbacks": [provider(p, REVIEWERS, "judge fallback", relative_to) for p in array(raw.get("judge_fallbacks", []), "judge_fallbacks", 5)],
             "planner": provider(raw["planner"], IMPLEMENTERS, "pursuit planner", relative_to) if "planner" in raw else dict(judge),
             "max_waves": integer(raw.get("max_waves", 3), "max_waves", 1, 20),

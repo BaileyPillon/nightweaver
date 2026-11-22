@@ -72,7 +72,7 @@ class ExploreTests(unittest.TestCase):
     def explored(self, *, answers=None, judge=None, explore=None, planner=None, milestones=2, worker=None, **extra):
         """A pursuing run whose first milestone starts with the tournament. One judge route serves comparisons and the goal judgment."""
         block = {"judge": judge or self.table(), "planner": planner or self.sequence("planner", [answers or directions(), plan("Next improvement")]),
-                 "explore": explore if explore is not None else {}}
+                 "explore": explore if explore is not None else {}, "confirm": False}  # these tests count judge calls; a confirmation would add one
         steps = [{"title": "Prepare fixture", "task": "Set the value"}, {"title": "Second milestone", "task": "Extend it"}][:milestones]
         return self.configured((worker or self.builder())["argv"], pursue=block, milestones=steps, **extra)
 

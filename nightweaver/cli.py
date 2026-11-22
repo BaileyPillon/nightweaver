@@ -394,7 +394,7 @@ def main(argv=None):
     pursue_cmd = commands.add_parser("pursuit", help="Show a goal pursuit run's waves, judgments and best build, or grant more waves")
     pursue_cmd.add_argument("id")
     pursue_cmd.add_argument("--json", action="store_true")
-    pursue_cmd.add_argument("--add-waves", type=int, metavar="N", help="Allow N more waves and resume a run stopped at the judge")
+    pursue_cmd.add_argument("--add-waves", type=int, metavar="N", help="Allow N more waves and resume a run stopped after judging (it plans the next wave from the best build's gaps)")
     guard = commands.add_parser("guard", help="Run with bounded recovery after a Windows runner exits unexpectedly")
     guard.add_argument("id")
     guard.add_argument("--max-restarts", type=int, choices=range(11), metavar="0..10")
@@ -924,7 +924,8 @@ def main(argv=None):
                 print(format_report(data))
                 if extension:
                     print(f"Added {args.add_waves} waves (limit now {extension['max_waves']})."
-                          + (" The run is back at the judge; resume or dispatch it to continue." if extension["resumed"] else ""))
+                          + (f" The run is back at the {'planner' if extension['phase'] == 'planning' else 'judge'}; resume or dispatch it to continue."
+                             if extension["resumed"] else ""))
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":

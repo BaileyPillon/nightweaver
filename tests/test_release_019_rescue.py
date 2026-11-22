@@ -83,7 +83,8 @@ class RescueTests(unittest.TestCase):
     def stalled(self, *, judge=None, worker=None, planner=None, rescue=None, plateau=1, extra_pursue=None, **extra):
         """A pursuit that plateaus after its second judgment: 60, then 55. Two strategies by default."""
         block = {"judge": judge or self.table(), "planner": planner or self.sequence("planner", [plan("Next improvement")]), "plateau": plateau,
-                 "max_waves": 4, "rescue": {"strategies": 2} if rescue is None else rescue, **(extra_pursue or {})}
+                 "max_waves": 4, "rescue": {"strategies": 2} if rescue is None else rescue, "confirm": False,  # these tests count judge calls
+                 **(extra_pursue or {})}
         return self.configured((worker or self.builder())["argv"], pursue=block, **extra)
 
     def events(self, run, *kinds):
@@ -441,19 +442,18 @@ class RescueTests(unittest.TestCase):
         self.assertNotIn("Your previous answer was rejected", self.asked("table", DIAGNOSIS)[0], "the retry starts a fresh attempt")
 
     def test_the_best_build_is_shown_through_the_same_checks_as_the_strategies(self):
-        # The screenshot belongs to milestone 1 only; the last milestone, which every strategy is checked by, has none.
+        # The screenshot belongs to a check local to milestone 1. The ledger and every strategy run the checks of the finished build, which are
+        # the last milestone's, and those produce none.
         shot = {"name": "screenshot", "argv": [sys.executable, BUILD, "shot"], "timeout": 20, "artifacts": []}
         run = self.stalled(milestones=[{"title": "Prepare fixture", "task": "Set the value", "gates": [shot]}, {"title": "Polish it", "task": "Polish"}],
                            judge=self.table(order=[INCUMBENT, *NAMES[:2]]))
         self.assertEqual(Run(self.store, run).run(), "blocked")
-        (best_shot,) = self.events(run, "goal_judged")[0]["screenshots"]
+        self.assertEqual(self.events(run, "goal_judged")[0]["screenshots"], [], "the judgment ran the checks of the finished build, not milestone 1's own")
         self.assertEqual([b["screenshots"] for b in self.events(run, "rescue_candidate_built")], [[], []])
         self.assertEqual([c["screenshots"] for c in self.events(run, "rescue_incumbent_checked")], [0], "the best build gets only what the strategies get")
-        self.assertIn(f"- {best_shot}", self.asked("table", DIAGNOSIS)[0], "the diagnosis sees everything the judgment saw")
         comparisons = self.asked("table", COMPARE)
         self.assertEqual(len(comparisons), 4)
         for prompt in comparisons:
-            self.assertNotIn(best_shot, prompt, "a screenshotted incumbent against unscreenshotted strategies favors the incumbent")
             self.assertEqual(prompt.count("none were produced"), 2)
             self.assertNotIn("Only candidate", prompt)
 
@@ -701,13 +701,14 @@ class RescueTests(unittest.TestCase):
             db.execute("UPDATE runs SET spec=? WHERE id=?", (json.dumps(spec), run))
 
     def test_the_budget_runs_out_in_the_middle_of_a_rescue_and_retry_resumes_it(self):
-        # Five calls reach the plateau and seven more fund the rescue. Two tied qualifiers need a head-to-head the minimum does not cover.
-        run = self.stalled(budgets={"max_calls": 12}, judge=self.table(order=[NAMES[1], NAMES[0], INCUMBENT]))
+        # Five calls reach the plateau, seven more fund the rescue and one more the judgment after it. Two tied qualifiers need a head-to-head
+        # the minimum does not cover, so the budget runs out inside the rescue.
+        run = self.stalled(budgets={"max_calls": 13}, judge=self.table(order=[NAMES[1], NAMES[0], INCUMBENT]))
         self.assertEqual(Run(self.store, run).run(), "blocked")
         state = self.store.get(run)["state"]
-        self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"]), ("blocked", "rescuing", 12))
+        self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"]), ("blocked", "rescuing", 13))
         self.assertIn("provider-call budget", state["last_error"])
-        self.assertEqual((state["rescue"]["stage"], [b["index"] for b in state["rescue"]["builds"]], len(state["rescue"]["comparisons"])), ("select", [1, 2], 4))
+        self.assertEqual((state["rescue"]["stage"], [b["index"] for b in state["rescue"]["builds"]], len(state["rescue"]["comparisons"])), ("select", [1, 2], 5))
         self.assertEqual(metrics(self.store, run)["outcome"], "budget_exhausted")
         self.assertEqual(self.events(run, "pursuit_stopped"), [])
         self.raise_budget(run, max_calls=40)
@@ -719,14 +720,15 @@ class RescueTests(unittest.TestCase):
         self.assertEqual(len(self.events(run, "rescue_compared")), 6)
 
     def test_a_rescue_the_budget_cannot_fund_is_skipped_and_the_pursuit_stops_as_a_plateau(self):
-        # Five calls reach the plateau; two strategies need at least seven more (a diagnosis, two builds, four comparisons) and six are left.
+        # Five calls reach the plateau; two strategies need at least eight more (a diagnosis, two builds, four comparisons and the judgment
+        # of the winner) and six are left.
         run = self.stalled(budgets={"max_calls": 11}, judge=self.table(goal=[judged(60), judged(55), judged(50), judged(90, met=True)]))
         self.assertEqual(Run(self.store, run).run(), "blocked")
         state = self.store.get(run)["state"]
         self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"], state.get("rescues_used", 0), state.get("rescue")), ("blocked", "judging", 5, 0, None))
         (skipped,) = self.events(run, "rescue_skipped")
         self.assertEqual((skipped["stage"], skipped["wave"], skipped["best_score"], skipped["rescue"]), ("budget", 2, 60, 1))
-        self.assertIn("Only 6 provider calls are left in the budget and a rescue needs at least 7", skipped["reason"])
+        self.assertIn("Only 6 provider calls are left in the budget and a rescue needs at least 8", skipped["reason"])
         self.assertEqual(self.events(run, "rescue_started"), [])
         (stopped,) = self.events(run, "pursuit_stopped")
         self.assertEqual((stopped["reason"], stopped["best_score"], stopped["waves"]), ("plateau", 60, 2))
@@ -752,8 +754,8 @@ class RescueTests(unittest.TestCase):
         def room(limits, state):
             return rescue.short_of_budget(SimpleNamespace(spec={"budgets": limits, "pursue": {"rescue": {"strategies": 3, "max_rescues": 1}}}), state)
         self.assertIsNone(room({}, {"provider_calls": 500}), "no limit, no shortage")
-        self.assertIsNone(room({"max_calls": 20}, {"provider_calls": 10}), "ten calls left is the minimum for three strategies")
-        self.assertIn("Only 9 provider calls are left in the budget and a rescue needs at least 10", room({"max_calls": 20}, {"provider_calls": 11}))
+        self.assertIsNone(room({"max_calls": 20}, {"provider_calls": 9}), "eleven calls left is the minimum for three strategies: ten and the judgment after")
+        self.assertIn("Only 10 provider calls are left in the budget and a rescue needs at least 11", room({"max_calls": 20}, {"provider_calls": 10}))
         self.assertIn("run-time budget is spent", room({"max_seconds": 5}, {"started_at": PAST}))
         self.assertIsNone(room({"max_seconds": 5}, {}), "a run that has not started has used no time")
         self.assertIn("observed-token budget is spent", room({"max_observed_tokens": 100}, {"observed_tokens": 100}))

@@ -102,13 +102,15 @@ def _stopped(d):
 
 
 def _extended(d):
-    return f"Pursuit extended by {_plural(d['waves'], 'wave')}" + ("; judging resumed" if d.get("resumed") else "")
+    back = {"planning": "planning", "judging": "judging"}.get(d.get("phase"), "run")  # an older event did not say where the run resumed
+    return f"Pursuit extended by {_plural(d['waves'], 'wave')}" + (f"; {back} resumed" if d.get("resumed") else "")
 
 
 # Short, human event names for goal pursuit and the 0.19 runtime. Anything else keeps its generic name.
 LABELS = {
     "goal_judged": lambda d: f"Goal judged {d['score']}/100",
     "goal_met": lambda d: f"Goal met at {d['score']}/100",
+    "confirmation_skipped": lambda d: "Goal judged met without a confirmation: not enough budget left",
     "wave_completed": lambda d: f"Wave {d['wave']} built; judging next",
     "wave_planned": _planned,
     "planner_started": lambda d: f"Planning wave {d['wave'] + 1}",

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .safety import atomic_write, redact
 from .insights import provider_totals
+from .store import current_stop
 from .checks import observed_pass
 
 
@@ -112,13 +113,17 @@ def _metrics(store, run_id):
                     rejected.get("exit"), outcome)
         else:
             outcome = "execution_blocked"
+    current = store.accepted_milestones(run_id)
+    discarded = len(store.accepted_milestones(run_id, discarded=True)) - len(current)  # a revert's milestones are neither accepted nor part of the plan
     pursuit = None
     if row["spec"].get("pursue"):
         judged = row["state"].get("judgments", [])
-        stopped = next((e["details"] for e in reversed(events) if e["kind"] == "pursuit_stopped"), None)
+        stopped = current_stop(events)  # a stop that an extension, a retry or a later block has superseded is not the run's stop
         pursuit = {"waves": row["state"].get("wave", 1), "judgments": len(judged), "last_score": judged[-1]["score"] if judged else None,
                    "best_score": row["state"].get("best_score"), "goal_met": "goal_met" in kinds, "reverts": kinds.count("pursuit_reverted"),
-                   "stop_reason": stopped["reason"] if stopped and phase == "blocked" else None}
+                   "stop_reason": stopped["reason"] if stopped and phase == "blocked" else None,
+                   "confirmations": kinds.count("goal_confirming"), "met_unconfirmed": kinds.count("met_unconfirmed"),
+                   "confirmations_skipped": kinds.count("confirmation_skipped"), "discarded_milestones": discarded}
     exploration = None
     if {"direction_planned", "exploration_skipped"} & set(kinds):
         chosen = next((e["details"] for e in reversed(events) if e["kind"] == "direction_chosen"), None)
@@ -140,7 +145,7 @@ def _metrics(store, run_id):
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
         "last_rejection_stage": rejection.get("phase"),
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
-        "accepted_milestones": len(store.accepted_milestones(run_id)), "total_milestones": len(row["spec"]["milestones"]),
+        "accepted_milestones": len(current), "total_milestones": len(row["spec"]["milestones"]) - discarded,
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
         "queue_seconds": interval(queued, start), "seconds_to_first_acceptance": interval(start, first_acceptance),
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
@@ -204,7 +209,10 @@ def _run_report(store, run_id, output, include_images):
         elif key == "pursuit":
             value = (f"{value['waves']} waves, {value['judgments']} judgments, last {value['last_score']}, best {value['best_score']}, "
                      f"{'goal met' if value['goal_met'] else 'stopped: ' + value['stop_reason'] if value['stop_reason'] else 'in progress'}, "
-                     f"{value['reverts']} reverts")
+                     f"{value['reverts']} reverts"
+                     + (f", {value['confirmations']} confirmations ({value['met_unconfirmed']} not confirmed)" if value["confirmations"] else "")
+                     + (f", {value['confirmations_skipped']} without a confirmation (budget)" if value["confirmations_skipped"] else "")
+                     + (f", {value['discarded_milestones']} milestones discarded" if value["discarded_milestones"] else ""))
         elif key == "exploration":
             value = (f"{value['outcome']}: {value['built']} of {value['directions']} directions passed their checks, "
                      f"{value['comparisons']} judge comparisons"
@@ -227,10 +235,15 @@ def _run_report(store, run_id, output, include_images):
         for wave in data["waves"]:
             verdict = wave["judgment"]
             summary = "Not judged" if verdict is None else f'{verdict["verdict"]} {verdict["score"]}/100'
+            if verdict and verdict.get("confirmation"):
+                sure = verdict["confirmation"]
+                summary += (f" · confirmed ({sure['score']}/100)" if sure["confirmed"] else f" · MET not confirmed ({sure['verdict']} {sure['score']}/100)")
+            if verdict and verdict.get("confirmation_skipped"):
+                summary += " · MET stood without a confirmation (budget)"
             if wave["reverted"]:
                 summary += " · reverted to the best build"
             gaps = "; ".join(g["title"] for g in verdict["gaps"][:3]) if verdict else ""
-            body += (f'<tr><td>{wave["wave"]}</td><td>{escape("; ".join(m["title"] for m in wave["milestones"]))}</td>'
+            body += (f'<tr><td>{wave["wave"]}</td><td>{escape("; ".join(m["title"] + (" (discarded)" if m["discarded"] else "") for m in wave["milestones"]))}</td>'
                      f'<td>{escape(summary)}</td><td>{escape(gaps)}</td></tr>')
         body += '</tbody></table></div>'
         if data.get("exploration"):

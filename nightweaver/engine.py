@@ -245,7 +245,11 @@ def fork_run(store, run_id, milestone, worker=None):
     accepted = store.accepted_milestones(run_id)
     if type(milestone) is not int or not 0 <= milestone <= len(accepted):
         raise ValueError("Choose an accepted milestone number, or 0 for the original baseline")
-    remaining = original["spec"]["milestones"][milestone:]
+    # A pursuit that reverted holds milestones of discarded waves: a checkpoint is a milestone of the current build, and the
+    # discarded work is not carried into the fork.
+    cut = 0 if milestone == 0 else accepted[milestone - 1].get("step", milestone)
+    skipped = {item.get("step") for item in store.accepted_milestones(run_id, discarded=True)} - {item.get("step") for item in accepted}
+    remaining = [step for number, step in enumerate(original["spec"]["milestones"], 1) if number > cut and number not in skipped]
     if not remaining:
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]
@@ -442,7 +446,9 @@ def call_served(run, pending, state):
         if pending["role"] in ("worker", "reviewer", "judge", "planner"):
             try:
                 step = run.spec["milestones"][state["step"]] if pending["role"] in ("worker", "reviewer") else None
-                routed = run.route(state, step, pending["role"])
+                from . import pursuit
+                routed = (pursuit.active_route(run, state)[1] if pending["role"] == "judge" and run.spec.get("pursue") and state.get("phase") == "judging"
+                          else run.route(state, step, pending["role"]))
                 if routed.get("kind") == pending["provider"] and routed.get("model") == pending.get("model"):
                     config = routed  # carries the profile directory a Codex rollout is looked up in
             except (KeyError, IndexError, TypeError):
@@ -1251,6 +1257,9 @@ class Run:
                     if actual in ("exploring", "rescuing"):
                         from . import explore, rescue
                         role, config = (explore if actual == "exploring" else rescue).active_route(self, current)
+                    elif actual == "judging" and self.spec.get("pursue"):
+                        from . import pursuit
+                        role, config = pursuit.active_route(self, current)  # the confirmation judgment has its own route
                     else:
                         config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}
