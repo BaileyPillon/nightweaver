@@ -114,8 +114,8 @@ class RescueTests(unittest.TestCase):
         timeline = [k for k in self.kinds(run) if k.startswith("rescue_") or k in ("goal_judged", "pursuit_reverted", "wave_planned", "milestone_accepted", "goal_met")]
         self.assertEqual(timeline, ["milestone_accepted", "goal_judged", "wave_planned", "milestone_accepted", "goal_judged", "pursuit_reverted", "rescue_started",
                                     "rescue_diagnosis_started", "rescue_diagnosed", "rescue_candidate_started", "rescue_worker_finished", "rescue_candidate_built",
-                                    "rescue_candidate_started", "rescue_worker_finished", "rescue_candidate_built", "rescue_compared", "rescue_compared",
-                                    "rescue_compared", "rescue_compared", "rescue_chosen", "wave_planned", "milestone_accepted", "goal_judged", "goal_met"])
+                                    "rescue_candidate_started", "rescue_worker_finished", "rescue_candidate_built", "rescue_incumbent_checked",
+                                    "rescue_compared", "rescue_compared", "rescue_compared", "rescue_compared", "rescue_chosen", "wave_planned", "milestone_accepted", "goal_judged", "goal_met"])
         (started,) = self.events(run, "rescue_started")
         self.assertEqual((started["wave"], started["best_score"], started["best_commit"], started["stale_judgments"]), (2, 60, first["commit"], 1))
         self.assertEqual((started["rescue"], started["max_rescues"], started["strategies"]), (1, 1, 2))
@@ -255,13 +255,20 @@ class RescueTests(unittest.TestCase):
         diagnosis_prompt = self.asked("table", DIAGNOSIS)[0]
         self.assertIn(f"- {best_shot}", diagnosis_prompt)
         self.assertIn("OPEN each image file", diagnosis_prompt)
+        (checked,) = self.events(run, "rescue_incumbent_checked")
+        self.assertEqual((checked["wave"], checked["screenshots"], checked["evidence"]), (2, 1, str(folder / "00")))
+        (incumbent_shot,) = self.store.get(run)["state"]["rescue"]["shots"]
+        self.assertTrue(incumbent_shot.endswith("screen.png") and Path(incumbent_shot).is_relative_to(folder / "00"), "the best build is checked like a strategy")
         first_call, second_call = self.asked("table", COMPARE)[:2]
         for prompt, order in ((first_call, (0, 1)), (second_call, (1, 0))):
-            images = {0: best_shot, 1: shots[1][0]}
+            images = {0: incumbent_shot, 1: shots[1][0]}
             a, b = (prompt.index(f"Candidate {x}:") for x in "AB")
             self.assertTrue(a < prompt.index(images[order[0]]) < b < prompt.index(images[order[1]]), "each image is listed under its own candidate")
             self.assertIn("OPEN each image file", prompt)
         self.assertEqual({(g["rescue"], g["gate_index"]) for g in self.events(run, "gate_finished") if "rescue" in g}, {(1, 1), (1, 2), (2, 1), (2, 2)})
+        ledger = [(g["name"], g["wave"]) for g in self.events(run, "judge_gate_finished")]
+        self.assertEqual(ledger, [("read fixture value", 1), ("screenshot", 1), ("read fixture value", 2), ("screenshot", 2), ("read fixture value", 2), ("screenshot", 2)],
+                         "two judgments' ledgers, then the last milestone's checks once on the best build")
         self.assertEqual(self.cli("audit-evidence", run)["status"], "verified")
 
     def test_a_second_rescue_starts_after_a_winning_one_stalls_and_the_workers_rotate(self):
@@ -311,6 +318,155 @@ class RescueTests(unittest.TestCase):
         text = self.cli("pursuit", run, raw=True)
         self.assertIn("Position bias in pairs: best build vs 1, best build vs 2", text)
         self.assertEqual(self.cli("pursuit", run, "--json")["waves"][1]["rescue"]["position_bias_pairs"], [[0, 1], [0, 2]])
+
+    def test_a_strategy_the_judge_read_in_only_one_order_does_not_qualify(self):
+        junk = "I cannot decide between these builds."
+        # Strategy 1: its (best build, strategy) call is unreadable twice and the reversed call favors it. Strategy 2 loses both orders.
+        compare = [junk, junk, {"winner": "A", "reason": "The first candidate"}, {"winner": "A", "reason": "The best build"}, {"winner": "B", "reason": "The best build"}]
+        run = self.stalled(judge=self.table(compare=compare))
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        (chosen,) = self.events(run, "rescue_chosen")
+        self.assertEqual(chosen["winner"], None, "one readable order cannot rule out a judge that favors a position")
+        self.assertEqual([(r["index"], r["score"], r["incumbent"], r["readable"], r["qualified"]) for r in chosen["scores"]], [(1, 1.0, 0.0, 1, False), (2, 0.0, 2.0, 2, False)])
+        self.assertEqual((chosen["comparisons"], chosen["invalid_comparisons"], chosen["position_bias_pairs"]), (3, 1, []))
+        self.assertEqual([bool(c.get("invalid")) for c in self.events(run, "rescue_compared")], [True, False, False, False])
+        self.assertEqual(self.events(run, "rescue_failed")[0]["reason"], "No strategy beat the best build")
+        self.assertEqual(len(self.store.get(run)["spec"]["milestones"]), 2, "the unproven strategy was not promoted")
+        self.assertEqual(self.events(run, "pursuit_stopped")[0]["reason"], "plateau")
+        self.assertIn("1. Bold rethink [command] passed, score 1 (judge read 1 of 2 orders)", self.cli("pursuit", run, raw=True))
+        self.assertIn("Judge read 1 of 2 orders", Path(self.cli("report", run)["report"]).read_text(encoding="utf-8"))
+        self.assertEqual(self.cli("pursuit", run, "--json")["waves"][1]["rescue"]["strategies"][0]["readable"], 1)
+
+    def test_a_judge_unreadable_for_one_strategy_only_is_a_verdict_on_the_others(self):
+        junk = "Unparseable."
+        # Strategy 1 is unreadable in both orders; strategy 2 beats the best build in both. One complete pair is enough to conclude.
+        compare = [junk, junk, junk, junk, {"winner": "B", "reason": "The strategy"}, {"winner": "A", "reason": "The strategy"}]
+        run = self.stalled(judge=self.table(compare=compare))
+        self.assertEqual(Run(self.store, run).run(), "done")
+        (chosen,) = self.events(run, "rescue_chosen")
+        self.assertEqual((chosen["winner"], chosen["comparisons"], chosen["invalid_comparisons"]), (2, 2, 2))
+        self.assertEqual([(r["readable"], r["qualified"]) for r in chosen["scores"]], [(0, False), (2, True)])
+
+    def test_a_second_rescue_at_the_same_wave_keeps_the_first_ones_refs_evidence_and_report(self):
+        later = ["Third way", "Fourth way"]
+        judge = self.table(goal=[judged(60), judged(55), judged(50)], diagnosis=[diagnosis(*NAMES[:2]), diagnosis(*later)], order=[INCUMBENT, *NAMES[:2], *later])
+        run = self.stalled(judge=judge, rescue={"strategies": 2, "max_rescues": 2})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        first = {ref.rsplit("/", 1)[1].removeprefix(f"{run}-"): git(self.repo, "rev-parse", ref) for ref in self.refs(run)}
+        self.assertEqual(sorted(first), ["rescue-w02-01", "rescue-w02-02"])
+        # The stop leaves the wave and the plateau count alone, so a retry judges the same wave and plateaus into a second rescue.
+        self.assertEqual(Run(self.store, run).run(retry=True), "blocked")
+        self.assertEqual([(s["wave"], s["rescue"]) for s in self.events(run, "rescue_started")], [(2, 1), (2, 2)])
+        refs = {ref.rsplit("/", 1)[1].removeprefix(f"{run}-"): git(self.repo, "rev-parse", ref) for ref in self.refs(run)}
+        self.assertEqual(sorted(refs), ["rescue-w02-01", "rescue-w02-02", "rescue-w02-r2-01", "rescue-w02-r2-02"])
+        self.assertEqual(len(set(refs.values())), 4, "four strategies, four commits")
+        self.assertEqual({k: refs[k] for k in first}, first, "the second rescue did not move the first one's refs")
+        for ref, name in (("rescue-w02-01", NAMES[0]), ("rescue-w02-02", NAMES[1]), ("rescue-w02-r2-01", later[0]), ("rescue-w02-r2-02", later[1])):
+            self.assertEqual(self.show(f"nightweaver/{run}-{ref}", "strategy.txt"), name)
+        evidence = self.store.directory(run) / "evidence" / "rescue"
+        for folder in ("w02/01", "w02/02", "w02-r2/01", "w02-r2/02"):
+            self.assertTrue((evidence / folder / "checks.json").is_file(), folder)
+        logs = [Path(g["log"]) for g in self.events(run, "gate_started") if "rescue" in g]
+        self.assertEqual((len(logs), len(set(logs)), all(log.is_file() for log in logs)), (4, 4, True), "each rescue's gate logs are still where its events say")
+        for slot in ("w02/00/01", "w02-r2/00/01"):
+            self.assertTrue((evidence / slot / "gate.log").is_file(), slot)
+        self.assertEqual([c["evidence"] for c in self.events(run, "rescue_incumbent_checked")], [str(evidence / "w02" / "00"), str(evidence / "w02-r2" / "00")])
+        self.assertEqual(self.cli("audit-evidence", run)["status"], "verified")
+        # Both rescues are in the report, not only the first.
+        waves = self.cli("pursuit", run, "--json")["waves"]
+        self.assertEqual([(r["n"], r["status"], [s["name"] for s in r["strategies"]]) for r in waves[1]["rescues"]], [(1, "failed", NAMES[:2]), (2, "failed", later)])
+        self.assertEqual(waves[1]["rescue"]["n"], 2, "rescue is the latest of them")
+        text = self.cli("pursuit", run, raw=True)
+        self.assertEqual(text.count("Plateau rescue at best 60/100 - no strategy beat the best build"), 2)
+        for name in (*NAMES[:2], *later):
+            self.assertIn(name, text)
+        html = Path(self.cli("report", run)["report"]).read_text(encoding="utf-8")
+        self.assertIn("Plateau rescue after wave 2</h2>", html)
+        self.assertIn("Plateau rescue after wave 2 (rescue 2)</h2>", html)
+        self.assertIn("Third way", html)
+        self.assertEqual([(r["wave"], r["outcome"]) for r in metrics(self.store, run)["rescue"]["rescues"]], [(2, "failed"), (2, "failed")])
+        self.assertIn(f"Wave 2: {NAMES[0]} (did not beat the best build), {NAMES[1]} (did not beat the best build)", self.asked("table", DIAGNOSIS)[1])
+
+    def test_a_judge_that_cannot_be_read_blocks_the_rescue_for_retry_and_does_not_spend_it(self):
+        run = self.stalled(judge=self.table(compare=["The judge is down and prints no verdict."]))
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["phase"], state["blocked_from"], state.get("rescues_used", 0)), ("blocked", "rescuing", 0))
+        self.assertEqual((state["rescue"]["stage"], state["rescue"]["comparisons"], state["rescue"]["judge_attempts"]), ("select", [], 0), "the calls are forgotten so retry asks them again")
+        self.assertIn("no readable comparison in 4 calls", state["last_error"])
+        for kind in ("rescue_chosen", "rescue_failed", "pursuit_stopped"):
+            self.assertEqual(self.events(run, kind), [], kind)
+        self.assertEqual([bool(c.get("invalid")) for c in self.events(run, "rescue_compared")], [True] * 4)
+        self.assertEqual(len(self.refs(run)), 2, "the strategies are kept")
+        self.assertTrue(all(name in self.rescue_worktrees(run) for name in ("rescue-01", "rescue-02")), "the judge can still read the strategies' source")
+        self.assertEqual(metrics(self.store, run)["outcome"], "execution_blocked")
+        table = self.root / "table.json"
+        fixed = json.loads(table.read_text(encoding="utf-8"))
+        del fixed["compare"]
+        table.write_text(json.dumps(fixed), encoding="utf-8")
+        self.assertEqual(Run(self.store, run).run(retry=True), "done")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["rescues_used"], state["phase"]), (1, "done"))
+        self.assertEqual((len(self.asked("table", DIAGNOSIS)), sum("Plateau rescue" in p for p in self.workers())), (1, 2), "nothing finished was repeated")
+        (chosen,) = self.events(run, "rescue_chosen")
+        self.assertEqual((chosen["winner"], chosen["comparisons"], chosen["invalid_comparisons"]), (1, 4, 0))
+        self.assertEqual(self.events(run, "pursuit_stopped"), [])
+        self.assertEqual(self.rescue_worktrees(run), [])
+
+    def test_a_diagnosis_that_fails_to_run_blocks_for_retry_and_keeps_the_rescue(self):
+        real, seen = invoke, []
+
+        def hang(conf, mode, cwd, log, *args, **kwargs):
+            if mode == "diagnosis" and len(seen) < 2:
+                seen.append(mode)
+                Path(log).write_text("", encoding="utf-8")
+                return 124, None, ""
+            return real(conf, mode, cwd, log, *args, **kwargs)
+        run = self.stalled()
+        with patch("nightweaver.engine.invoke", side_effect=hang):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["phase"], state["blocked_from"], state.get("rescues_used", 0), state["rescue"]["stage"], state["rescue"]["attempts"]),
+                         ("blocked", "rescuing", 0, "diagnose", 0))
+        self.assertEqual([(i["attempt"], i["exit"]) for i in self.events(run, "rescue_diagnosis_invalid")], [(1, 124), (2, 124)])
+        self.assertIn("exited 124", state["last_error"])
+        for kind in ("rescue_skipped", "rescue_failed", "pursuit_stopped", "rescue_diagnosed"):
+            self.assertEqual(self.events(run, kind), [], kind)
+        self.assertEqual(self.events(run, "blocked")[-1]["during"], "rescuing")
+        self.assertEqual(metrics(self.store, run)["outcome"], "execution_blocked")
+        self.assertEqual(Run(self.store, run).run(retry=True), "done")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["rescues_used"], state["phase"]), (1, "done"), "the rescue ran after the retry")
+        self.assertEqual(len(self.events(run, "rescue_diagnosed")), 1)
+        self.assertNotIn("Your previous answer was rejected", self.asked("table", DIAGNOSIS)[0], "the retry starts a fresh attempt")
+
+    def test_the_best_build_is_shown_through_the_same_checks_as_the_strategies(self):
+        # The screenshot belongs to milestone 1 only; the last milestone, which every strategy is checked by, has none.
+        shot = {"name": "screenshot", "argv": [sys.executable, BUILD, "shot"], "timeout": 20, "artifacts": []}
+        run = self.stalled(milestones=[{"title": "Prepare fixture", "task": "Set the value", "gates": [shot]}, {"title": "Polish it", "task": "Polish"}],
+                           judge=self.table(order=[INCUMBENT, *NAMES[:2]]))
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        (best_shot,) = self.events(run, "goal_judged")[0]["screenshots"]
+        self.assertEqual([b["screenshots"] for b in self.events(run, "rescue_candidate_built")], [[], []])
+        self.assertEqual([c["screenshots"] for c in self.events(run, "rescue_incumbent_checked")], [0], "the best build gets only what the strategies get")
+        self.assertIn(f"- {best_shot}", self.asked("table", DIAGNOSIS)[0], "the diagnosis sees everything the judgment saw")
+        comparisons = self.asked("table", COMPARE)
+        self.assertEqual(len(comparisons), 4)
+        for prompt in comparisons:
+            self.assertNotIn(best_shot, prompt, "a screenshotted incumbent against unscreenshotted strategies favors the incumbent")
+            self.assertEqual(prompt.count("none were produced"), 2)
+            self.assertNotIn("Only candidate", prompt)
+
+    def test_a_comparison_says_when_only_one_candidate_has_screenshots(self):
+        run = SimpleNamespace(spec={"objective": "Goal", "pursue": {"criteria": ["Looks right"]}}, root=Path("run folder"))
+        ex = {"strategies": [{"name": "S1", "approach": "do it"}]}
+        shot, bare = {"index": 0, "name": INCUMBENT, "screenshots": [__file__]}, {"index": 1, "name": "S1", "screenshots": []}
+        prompt, images = rescue.comparison_prompt(run, {}, ex, [("A", shot), ("B", bare)])
+        self.assertIn("Only candidate A has screenshots; do not count the other candidate's missing screenshots against it.", prompt)
+        self.assertEqual(images, [__file__])
+        self.assertIn("Only candidate B has screenshots", rescue.comparison_prompt(run, {}, ex, [("A", bare), ("B", shot)])[0])
+        for first, second in ((shot, shot), (bare, bare)):
+            self.assertNotIn("Only candidate", rescue.comparison_prompt(run, {}, ex, [("A", first), ("B", second)])[0])
 
     def test_qualifiers_with_equal_scores_meet_head_to_head(self):
         run = self.stalled(judge=self.table(order=[NAMES[1], NAMES[0], INCUMBENT]))
@@ -510,6 +666,7 @@ class RescueTests(unittest.TestCase):
         self.assertEqual(sum("Plateau rescue" in p for p in self.workers()), 2)
         self.assertEqual([tuple(c["order"]) for c in self.events(run, "rescue_compared")], [(0, 1), (1, 0), (0, 2), (2, 0)])
         self.assertEqual(len(self.events(run, "rescue_candidate_built")), 2)
+        self.assertEqual(len(self.events(run, "rescue_incumbent_checked")), 1)
         self.assertEqual(len(self.events(run, "goal_judged")), 3)
         self.assertEqual(self.cli("audit-evidence", run)["status"], "verified")
         self.assertEqual(self.store.get(run)["state"]["phase"], "done")
@@ -537,25 +694,70 @@ class RescueTests(unittest.TestCase):
         self.assertEqual(self.store.get(run)["state"]["parks"], 0)
         self.assertEqual(self.events(run, "milestone_accepted")[2]["step"], 3)
 
-    def test_the_budget_runs_out_in_the_middle_of_a_rescue_and_retry_resumes_it(self):
-        run = self.stalled(budgets={"max_calls": 7})
-        self.assertEqual(Run(self.store, run).run(), "blocked")
-        state = self.store.get(run)["state"]
-        self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"]), ("blocked", "rescuing", 7))
-        self.assertIn("provider-call budget", state["last_error"])
-        self.assertEqual((state["rescue"]["stage"], [b["index"] for b in state["rescue"]["builds"]]), ("build", [1]))
-        self.assertEqual(metrics(self.store, run)["outcome"], "budget_exhausted")
-        self.assertEqual(self.events(run, "pursuit_stopped"), [])
+    def raise_budget(self, run, **limits):
         spec = self.store.get(run)["spec"]
-        spec["budgets"]["max_calls"] = 40
+        spec["budgets"].update(limits)
         with self.store.connect() as db:
             db.execute("UPDATE runs SET spec=? WHERE id=?", (json.dumps(spec), run))
+
+    def test_the_budget_runs_out_in_the_middle_of_a_rescue_and_retry_resumes_it(self):
+        # Five calls reach the plateau and seven more fund the rescue. Two tied qualifiers need a head-to-head the minimum does not cover.
+        run = self.stalled(budgets={"max_calls": 12}, judge=self.table(order=[NAMES[1], NAMES[0], INCUMBENT]))
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"]), ("blocked", "rescuing", 12))
+        self.assertIn("provider-call budget", state["last_error"])
+        self.assertEqual((state["rescue"]["stage"], [b["index"] for b in state["rescue"]["builds"]], len(state["rescue"]["comparisons"])), ("select", [1, 2], 4))
+        self.assertEqual(metrics(self.store, run)["outcome"], "budget_exhausted")
+        self.assertEqual(self.events(run, "pursuit_stopped"), [])
+        self.raise_budget(run, max_calls=40)
         self.assertEqual(Run(self.store, run).run(retry=True), "done")
         state = self.store.get(run)["state"]
-        self.assertEqual((state["provider_calls"], state["rescues_used"]), (13, 1))
+        self.assertEqual((state["provider_calls"], state["rescues_used"]), (15, 1))
         self.assertEqual(len(self.asked("table", DIAGNOSIS)), 1)
-        self.assertEqual(sum("Plateau rescue" in p for p in self.workers()), 2, "the finished strategy was not built again")
-        self.assertEqual(len(self.events(run, "rescue_compared")), 4)
+        self.assertEqual(sum("Plateau rescue" in p for p in self.workers()), 2, "the finished strategies were not built again")
+        self.assertEqual(len(self.events(run, "rescue_compared")), 6)
+
+    def test_a_rescue_the_budget_cannot_fund_is_skipped_and_the_pursuit_stops_as_a_plateau(self):
+        # Five calls reach the plateau; two strategies need at least seven more (a diagnosis, two builds, four comparisons) and six are left.
+        run = self.stalled(budgets={"max_calls": 11}, judge=self.table(goal=[judged(60), judged(55), judged(50), judged(90, met=True)]))
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["phase"], state["blocked_from"], state["provider_calls"], state.get("rescues_used", 0), state.get("rescue")), ("blocked", "judging", 5, 0, None))
+        (skipped,) = self.events(run, "rescue_skipped")
+        self.assertEqual((skipped["stage"], skipped["wave"], skipped["best_score"], skipped["rescue"]), ("budget", 2, 60, 1))
+        self.assertIn("Only 6 provider calls are left in the budget and a rescue needs at least 7", skipped["reason"])
+        self.assertEqual(self.events(run, "rescue_started"), [])
+        (stopped,) = self.events(run, "pursuit_stopped")
+        self.assertEqual((stopped["reason"], stopped["best_score"], stopped["waves"]), ("plateau", 60, 2))
+        self.assertLess(self.kinds(run).index("rescue_skipped"), self.kinds(run).index("pursuit_stopped"))
+        self.assertEqual((len(self.asked("table", DIAGNOSIS)), self.rescue_worktrees(run), self.refs(run)), (0, [], []))
+        self.assertEqual(metrics(self.store, run)["outcome"], "pursuit_stopped")
+        self.assertEqual((metrics(self.store, run)["rescue"]["attempted"], metrics(self.store, run)["rescue"]["skipped"], metrics(self.store, run)["rescue"]["outcome"]),
+                         (1, 1, "skipped"))
+        text = self.cli("pursuit", run, raw=True)
+        self.assertIn("Plateau rescue at best 60/100 - skipped: Only 6 provider calls are left", text)
+        self.assertIn("Stopped: plateau", text)
+        html = Path(self.cli("report", run)["report"]).read_text(encoding="utf-8")
+        self.assertIn("Plateau rescue after wave 2", html)
+        self.assertIn("Only 6 provider calls are left", html)
+        # The stop is the ordinary one: more waves and more budget resume at the judge, and the next plateau rescues.
+        self.raise_budget(run, max_calls=60)
+        self.assertEqual(self.cli("pursuit", run, "--add-waves", 1, "--json")["extension"]["resumed"], True)
+        self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual((len(self.events(run, "rescue_started")), self.store.get(run)["state"]["rescues_used"]), (1, 1))
+        self.assertEqual([r["outcome"] for r in metrics(self.store, run)["rescue"]["rescues"]], ["skipped", "won"], "the skip did not overwrite the rescue after it")
+
+    def test_a_rescue_needs_calls_time_and_tokens_left(self):
+        def room(limits, state):
+            return rescue.short_of_budget(SimpleNamespace(spec={"budgets": limits, "pursue": {"rescue": {"strategies": 3, "max_rescues": 1}}}), state)
+        self.assertIsNone(room({}, {"provider_calls": 500}), "no limit, no shortage")
+        self.assertIsNone(room({"max_calls": 20}, {"provider_calls": 10}), "ten calls left is the minimum for three strategies")
+        self.assertIn("Only 9 provider calls are left in the budget and a rescue needs at least 10", room({"max_calls": 20}, {"provider_calls": 11}))
+        self.assertIn("run-time budget is spent", room({"max_seconds": 5}, {"started_at": PAST}))
+        self.assertIsNone(room({"max_seconds": 5}, {}), "a run that has not started has used no time")
+        self.assertIn("observed-token budget is spent", room({"max_observed_tokens": 100}, {"observed_tokens": 100}))
+        self.assertIsNone(room({"max_observed_tokens": 100}, {"observed_tokens": 99}))
 
 
 @unittest.skipUnless(os.name == "nt", "Windows controller")
@@ -687,10 +889,17 @@ class RescueUnitTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual((rows[0]["score"], rows[0]["incumbent"], rows[0]["qualified"]), expected)
                 self.assertEqual(leaders, [1] if expected[2] else [])
-        ex, passed = synthetic((0, 1, 1), (1, 0, 0, True), builds=(1,))
-        self.assertEqual(rescue.standing(ex, passed)[0][0]["score"], 1.0, "an unreadable call counts for nobody")
+        for label, calls in (("second order unreadable", [(0, 1, 1), (1, 0, 0, True)]), ("first order unreadable", [(0, 1, 0, True), (1, 0, 1)]),
+                             ("win and an unreadable tie", [(0, 1, 1), (1, 0, None, True)])):
+            ex, passed = synthetic(*calls, builds=(1,))
+            row = rescue.standing(ex, passed)[0][0]
+            with self.subTest(label):
+                self.assertEqual((row["score"], row["incumbent"], row["readable"]), (1.0, 0.0, 1), "an unreadable call counts for nobody")
+                self.assertEqual((row["qualified"], rescue.standing(ex, passed)[1], rescue.decide(ex, passed)[0]), (False, [], None), "but one readable order never qualifies")
         ex, passed = synthetic((0, 1, None, True), (1, 0, None, True), builds=(1,))
         self.assertEqual((rescue.standing(ex, passed)[0][0]["qualified"], rescue.decide(ex, passed)[0]), (False, None))
+        ex, passed = synthetic((0, 1, 1), (1, 0, 1), builds=(1,))
+        self.assertEqual(rescue.standing(ex, passed)[0][0]["readable"], 2)
 
     def test_decide_picks_the_top_score_then_the_head_to_head_then_the_lower_index(self):
         incumbent_loses = [(0, 1, 1), (1, 0, 1), (0, 2, 2), (2, 0, 2), (0, 3, 3), (3, 0, 3)]
@@ -705,6 +914,11 @@ class RescueUnitTests(unittest.TestCase):
         self.assertEqual(rescue.decide(ex, passed)[0], 1, "the strategy that split its two calls does not qualify")
         ex, passed = synthetic((0, 1, 1), (1, 0, None), (0, 2, 2), (2, 0, 2), builds=(1, 2))
         self.assertEqual((rescue.decide(ex, passed)[0], len(rescue.schedule(ex, passed))), (2, 4), "the higher score wins without a head to head")
+        both_beat = [(0, 1, 1), (1, 0, 1), (0, 2, 2), (2, 0, 2)]
+        ex, passed = synthetic(*both_beat, (1, 2, 2), (2, 1, 2), builds=(1, 2))
+        self.assertEqual(rescue.decide(ex, passed)[0], 2, "a complete head to head decides")
+        ex, passed = synthetic(*both_beat, (1, 2, 2), (2, 1, 1, True), builds=(1, 2))
+        self.assertEqual(rescue.decide(ex, passed)[0], 1, "a head to head with an unreadable order is a tie, which the lower index wins")
         ex, passed = synthetic((0, 1, 0), (1, 0, 0), builds=(1,))
         self.assertEqual(rescue.decide(ex, passed), (None, rescue.standing(ex, passed)[0], []))
         self.assertEqual(rescue.schedule(synthetic(builds=(1, 2))[0], synthetic(builds=(1, 2))[1]), [(0, 1), (1, 0), (0, 2), (2, 0)], "nothing is known before the first call")

@@ -129,7 +129,7 @@ def _metrics(store, run_id):
                        "outcome": "chosen" if chosen else "failed" if "exploration_failed" in kinds else
                                   "skipped" if "exploration_skipped" in kinds else "in progress"}
     from .rescue import summary as rescue_summary
-    rescue = rescue_summary(events) if "rescue_started" in kinds else None
+    rescue = rescue_summary(events) if {"rescue_started", "rescue_skipped"} & set(kinds) else None
     return {
         **recovery_metrics(events),
         **({"pursuit": pursuit} if pursuit else {}),
@@ -249,13 +249,11 @@ def _run_report(store, run_id, output, include_images):
                          f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
                          f'<td>{"" if row["score"] is None else format(row["score"], "g")}</td><td>{"Winner" if row["winner"] else ""}</td></tr>')
             body += '</tbody></table></div>'
-        for wave in data["waves"]:
-            if not wave.get("rescue"):
-                continue
-            rescue = wave["rescue"]
+        for wave, rescue in ((w, r) for w in data["waves"] for r in w.get("rescues", [])):
             status = {"chosen": f"strategy {rescue['winner_name']} chosen", "failed": "no strategy beat the best build", "skipped": "skipped",
                       "in_progress": "in progress"}[rescue["status"]]
-            body += (f'<h2>Plateau rescue after wave {wave["wave"]}</h2><p>{escape(status[0].upper() + status[1:])} · best score before {rescue["best_score"]}/100'
+            again = f" (rescue {rescue['n']})" if rescue["n"] > 1 else ""
+            body += (f'<h2>Plateau rescue after wave {wave["wave"]}{again}</h2><p>{escape(status[0].upper() + status[1:])} · best score before {rescue["best_score"]}/100'
                      + (f' · next judgment {rescue["next_score"]}/100' if rescue["next_score"] is not None else "")
                      + f' · {rescue["judge_calls"]} judge calls'
                      + (' · position bias in pairs ' + escape(", ".join(f"{'best build' if a == 0 else a} vs {b}" for a, b in rescue["position_bias_pairs"]))
@@ -266,9 +264,11 @@ def _run_report(store, run_id, output, include_images):
             for item in rescue["strategies"]:
                 worker = item["worker"] or {}
                 checks = "Not built yet" if item["passed"] is None else "Passed" if item["passed"] else "Failed: " + str(item["reason"] or "")[:160]
+                read = item["readable"]
+                result = "Winner" if item["winner"] else f"Judge read {read} of 2 orders" if read is not None and read < 2 else ""
                 body += (f'<tr><td>{item["index"]}. {escape(item["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
                          f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
-                         f'<td>{"" if item["score"] is None else format(item["score"], "g")}</td><td>{"Winner" if item["winner"] else ""}</td></tr>')
+                         f'<td>{"" if item["score"] is None else format(item["score"], "g")}</td><td>{result}</td></tr>')
             body += '</tbody></table></div>'
     from .junit import history
     observations = history(store, run_id)["observations"]

@@ -66,10 +66,10 @@ def slot(parent, number):
     return folder
 
 
-def ledger(run, state, path, folder, tree):
-    """Re-run every distinct check from every milestone on the judged build."""
+def ledger(run, state, path, folder, tree, milestones=None):
+    """Re-run every distinct check from every milestone (or from `milestones`) on the judged build."""
     seen, checks = set(), []
-    for milestone in run.spec["milestones"]:
+    for milestone in milestones or run.spec["milestones"]:
         for check in milestone["gates"]:
             if (digest := contract_hash(check)) not in seen:
                 seen.add(digest)
@@ -319,11 +319,14 @@ def judge(run, state):
         from . import rescue
         if rescue.available(run, state):
             # Progress stalled on the best build: diagnose why and try divergent strategies before giving up.
-            drop_worktree(run, state)
             started, fresh = rescue.begin(run, state, wave, kept)
-            run.set("goal_judged", payload, following_event=[*events, ("rescue_started", started)], phase="rescuing", rescue=fresh,
-                    last_error="", retry_at=None, planner_route=0, **result)
-            return
+            if short := rescue.short_of_budget(run, run.store.get(run.id)["state"]):  # the state after the judge call just made
+                events.append(("rescue_skipped", {**started, "reason": short, "stage": "budget"}))  # the plateau stops as it would without a rescue
+            else:
+                drop_worktree(run, state)
+                run.set("goal_judged", payload, following_event=[*events, ("rescue_started", started)], phase="rescuing", rescue=fresh,
+                        last_error="", retry_at=None, planner_route=0, **result)
+                return
     if stop:
         drop_worktree(run, state)
         message, stopped = stopping(stop, wave, kept["best_score"], kept["best_commit"], result["best_gaps"])
@@ -453,7 +456,7 @@ def report(store, run_id):
         reverted = next((e["details"] for e in reversed(events) if e["kind"] == "pursuit_reverted" and e["details"]["wave"] == number), None)
         waves.append({"wave": number, "planned_by": planned[index - 1]["planner"] if index else None,
                       **({"rescue_strategy": planned[index - 1]["strategy"]} if index and planned[index - 1].get("rescue") else {}),
-                      **({"rescue": found} if (found := next((r for r in rescued if r["wave"] == number), None)) else {}),
+                      **({"rescue": found[-1], "rescues": found} if (found := [r for r in rescued if r["wave"] == number]) else {}),  # rescue: the latest
                       "milestones": [{"step": n, "title": spec["milestones"][n - 1]["title"], "accepted": n in accepted,
                                       "commit": accepted.get(n, {}).get("commit")} for n in range(first, last + 1)],
                       "judgment": None if judged is None else {k: judged[k] for k in ("verdict", "score", "commit", "gaps", "reason")}
@@ -494,9 +497,9 @@ def format_report(data):
         if wave["reverted"]:
             lines.append(f"  Reverted to {wave['reverted']['to'][:12]} (score {wave['reverted']['score']} against best {wave['reverted']['best_score']}); "
                          f"discarded work kept at {wave['reverted']['discarded_ref']}")
-        if wave.get("rescue"):
+        for found in wave.get("rescues", []):
             from .rescue import format_lines as rescue_lines
-            lines += rescue_lines(wave["rescue"])
+            lines += rescue_lines(found)
     if data["met"]:
         lines += ["", "Goal met."]
     elif data["stopped"]:

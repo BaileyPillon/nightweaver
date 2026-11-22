@@ -1,10 +1,11 @@
 """Plateau rescue: when a pursuit stalls, diagnose why, fork divergent strategies from the best build and keep one only if it beats it.
 
 State machine, kept in a compact `rescue` dict so every stage resumes after a crash without repeating finished work:
-  diagnose  one read-only call says why progress stalled and names N genuinely different strategies (two invalid answers skip the rescue)
+  diagnose  one read-only call says why progress stalled and names N genuinely different strategies (two invalid answers skip the rescue;
+            two failed calls block the run for --retry without spending the rescue)
   build     each strategy gets one attempt in its own worktree at the best commit, is checked like a milestone and committed on pass
-  select    the incumbent (the best build) meets each passing strategy pairwise in both orders; a strategy qualifies only if it beats
-            the incumbent on aggregate, and qualifiers with the same score meet each other
+  select    the incumbent (the best build) meets each passing strategy pairwise in both orders; a strategy qualifies only if the judge
+            read both orders and it beats the incumbent on aggregate, and qualifiers with the same score meet each other
   promote   the winner is appended as the milestone "Rescue: <name>" and promoted like any milestone; with no winner the pursuit
             stops as a plateau on the best build, which the result branch already holds
 The contest machinery (worktrees, checks, judge calls, scoring) is explore.py's; the incumbent is candidate 0.
@@ -13,17 +14,18 @@ The contest machinery (worktrees, checks, judge calls, scoring) is explore.py's;
 from itertools import combinations
 import json
 from pathlib import Path
+import shutil
 
 from . import context
-from .engine import tail
+from .engine import git, tail
 from .explore import JUDGE_IMAGES, ask, build_one, checkout, cleanup, compose, criteria_lines, rank, run_check, stage_manifest
 from .insights import budget_status
-from .pursuit import MAX_MILESTONES, lineage, stopping, titles
+from .pursuit import MAX_MILESTONES, ledger, lineage, screenshots, stopping, titles
 from .repair import describe, family
 from .spec import text
 from .verdicts import extract_object
 
-EVENTS = ["rescue_started", "rescue_diagnosed", "rescue_candidate_built", "rescue_candidate_failed", "rescue_compared",
+EVENTS = ["rescue_started", "rescue_diagnosed", "rescue_incumbent_checked", "rescue_candidate_built", "rescue_candidate_failed", "rescue_compared",
           "rescue_chosen", "rescue_failed", "rescue_skipped"]
 RESCUE = {"key": "rescue", "started": "rescue_candidate_started", "worked": "rescue_worker_finished", "passed": "rescue_candidate_built",
           "failed": "rescue_candidate_failed", "compared": "rescue_compared", "invalid": "rescue_comparison_invalid", "then": "select"}
@@ -41,19 +43,36 @@ def available(run, state):
     return bool(rescue) and state.get("rescues_used", 0) < rescue["max_rescues"] and len(run.spec["milestones"]) < MAX_MILESTONES
 
 
+def short_of_budget(run, state):
+    """Why the run's budgets cannot fund a rescue, or None. It needs a diagnosis, a build per strategy and two judge calls per strategy at least."""
+    left, need = budget_status(run.spec, state)["remaining"], 1 + 3 * options(run)["strategies"]
+    if "max_calls" in left and left["max_calls"] < need:
+        return f"Only {left['max_calls']:g} provider calls are left in the budget and a rescue needs at least {need}"
+    spent = [what for key, what in (("max_seconds", "run-time"), ("max_observed_tokens", "observed-token")) if key in left and left[key] <= 0]
+    return f"The {spent[0]} budget is spent" if spent else None
+
+
 def begin(run, state, wave, kept):
     """(rescue_started details, the rescue state) for a plateau after judging `wave`."""
     rescue = options(run)
     used = state.get("rescues_used", 0)
     started = {"wave": wave, "best_score": kept["best_score"], "best_commit": kept["best_commit"], "stale_judgments": kept["stale_judgments"],
                "rescue": used + 1, "max_rescues": rescue["max_rescues"], "strategies": rescue["strategies"]}
-    return started, {"stage": "diagnose", "wave": wave, "step": state["step"], "best_commit": kept["best_commit"], "best_score": kept["best_score"],
-                     "stale": kept["stale_judgments"], "count": rescue["strategies"], "attempts": 0, "builds": [], "comparisons": [],
-                     "current": None}
+    last = state.get("rescue") or {}  # a rescue that follows one at the same wave must not reuse its refs and evidence folder
+    repeat = last.get("repeat", 0) + 1 if last.get("wave") == wave else 0
+    return started, {"stage": "diagnose", "repeat": repeat, "wave": wave, "step": state["step"], "best_commit": kept["best_commit"],
+                     "best_score": kept["best_score"], "stale": kept["stale_judgments"], "count": rescue["strategies"], "attempts": 0,
+                     "builds": [], "comparisons": [], "current": None}
+
+
+def tag(ex):
+    """A rescue's name in refs and folders: its wave, plus its ordinal when an earlier rescue ran at the same wave (a rescue that failed
+    can be followed by another there, after --retry or --add-waves)."""
+    return f"w{ex['wave']:02d}" + (f"-r{ex['repeat'] + 1}" if ex.get("repeat") else "")
 
 
 def folder(run, ex, index=None):
-    path = run.root / "evidence" / "rescue" / f"w{ex['wave']:02d}"
+    path = run.root / "evidence" / "rescue" / tag(ex)
     return path if index is None else path / f"{index:02d}"
 
 
@@ -63,7 +82,7 @@ def worker_for(run, index):
 
 
 def strategy_ref(state, ex, index):
-    return f"{state['result_ref']}-rescue-w{ex['wave']:02d}-{index:02d}"
+    return f"{state['result_ref']}-rescue-{tag(ex)}-{index:02d}"
 
 
 def diagnoser(run, state):
@@ -113,8 +132,9 @@ def diagnosis_prompt(run, state, ex, images):
             line += (f" -> {judged['verdict']} {judged['score']}/100 at {judged['commit'][:12]}, criteria {judged['criteria_met']}/{judged['criteria_total']}. "
                      f"Top gaps: {titles(judged['gaps'])}")
         lines.append(line + (" (discarded; the best build was restored)" if wave["reverted"] else ""))
-    earlier = [f"- Wave {w['wave']}: " + ", ".join(f"{r['name']} ({'won' if r['winner'] else 'did not beat the best build'})" for r in w["rescue"]["strategies"])
-               for w in waves if w.get("rescue") and w["rescue"]["strategies"]]
+    earlier = [f"- Wave {w['wave']}" + (f" (rescue {r['n']})" if r["n"] > 1 else "") + ": "
+               + ", ".join(f"{s['name']} ({'won' if s['winner'] else 'did not beat the best build'})" for s in r["strategies"])
+               for w in waves for r in w.get("rescues", []) if r["strategies"]]
     rejected = [f"- Milestone {d['step']} attempt {d['attempt']} ({d['phase']}): " + " ".join(str(d["issue"]).split())[:300]
                 for d in (e["details"] for e in run.store.events(run.id, limit=6, kinds=["attempt_rejected"]))]
     gaps = "\n".join(f"- {g['title']}: {g['detail']}" for g in state.get("best_gaps", [])) or "- None recorded"
@@ -176,9 +196,12 @@ def diagnose(run, state, ex):
     except ValueError as error:
         attempts = ex["attempts"] + 1
         issue = f"The {role} returned no valid diagnosis (attempt {attempts} of 2): {str(error)[:600]}"
-        if attempts < 2:
+        # A call that failed twice (timeout, crash) says nothing about the strategies: block so --retry diagnoses again, the rescue unspent.
+        blocked = attempts >= 2 and bool(code)
+        if attempts < 2 or blocked:
             run.set("rescue_diagnosis_invalid", {"attempt": attempts, "issue": issue, "exit": code, "log": str(log)}, last_error=issue,
-                    rescue={**ex, "attempts": attempts})
+                    following_event=("blocked", {"issue": issue, "during": "rescuing"}) if blocked else None,
+                    rescue={**ex, "attempts": 0 if blocked else attempts}, **({"phase": "blocked", "blocked_from": "rescuing"} if blocked else {}))
             return
         return stop(run, state, ex, [("rescue_skipped", {"wave": ex["wave"], "reason": issue, "stage": "diagnose", "log": str(log)})])
     run.set("rescue_diagnosed", {"wave": ex["wave"], "role": role, "diagnoser": describe(config), "diagnosis": diagnosis, "strategies": strategies,
@@ -227,20 +250,30 @@ def build_strategy(run, state, ex):
 
 # ---------------------------------------------------------------- stage 3: the incumbent against each strategy
 
+def readable(ex, pair):
+    """How many of the judge's calls between two candidates were readable; both orders are asked, so 2 completes the pair."""
+    return sum(not c.get("invalid") for c in ex["comparisons"] if c["pair"] == sorted(pair))
+
+
 def duel(ex, index):
-    """(the strategy's points, the incumbent's points) over the calls between them; a win is 1, a tie .5 each, an unreadable call nothing."""
+    """(the strategy's points, the incumbent's points, the readable calls) over the calls between them.
+
+    A win is 1, a tie .5 each, an unreadable call nothing."""
     blank = {"name": "", "failed_checks": []}
     sub = {"comparisons": [c for c in ex["comparisons"] if c["pair"] == sorted((0, index))]}
     points = {r["index"]: r["score"] for r in rank(sub, [{**blank, "index": 0}, {**blank, "index": index}])[0]}
-    return points[index], points[0]
+    return points[index], points[0], readable(ex, (0, index))
 
 
 def standing(ex, passed):
-    """(a row per passing strategy, the qualifiers with the top score). A strategy qualifies by strictly out-scoring the incumbent."""
+    """(a row per passing strategy, the qualifiers with the top score).
+
+    A strategy qualifies by strictly out-scoring the incumbent over a pair the judge read in both orders: one readable order cannot rule out
+    a judge that favors a position, so a pair with an unreadable call never qualifies."""
     rows = []
     for build in passed:
-        won, lost = duel(ex, build["index"])
-        rows.append({"index": build["index"], "name": build["name"], "score": won, "incumbent": lost, "qualified": won > lost})
+        won, lost, read = duel(ex, build["index"])
+        rows.append({"index": build["index"], "name": build["name"], "score": won, "incumbent": lost, "readable": read, "qualified": read == 2 and won > lost})
     top = max((r["score"] for r in rows if r["qualified"]), default=None)
     return rows, sorted(r["index"] for r in rows if r["qualified"] and r["score"] == top)
 
@@ -263,12 +296,30 @@ def candidate_block(run, ex, label, build, images):
     return "\n".join(lines)
 
 
+def check_incumbent(run, state, ex):
+    """Run the last milestone's checks on the best build, as every strategy is run, and keep their screenshots in the rescue state.
+
+    The judgment's ledger ran every milestone's checks into one shared folder, so its screenshots cannot be told apart by check. Checking
+    the best build the way a strategy is checked gives both sides of a comparison the same screenshots to show."""
+    out, path = folder(run, ex, 0), incumbent(run, ex)
+    shutil.rmtree(out, ignore_errors=True)
+    # The ledger runner, not a milestone's gate runner: the best build is unchanged, so there is no tracked change to snapshot.
+    results = ledger(run, {**state, "wave": ex["wave"]}, path, out, git(path, "rev-parse", "HEAD^{tree}"), run.spec["milestones"][-1:])
+    git(path, "reset", "--hard", "-q")
+    git(path, "clean", "-fdxq")  # the checkout is read by the judge next
+    shots = [str(p) for p in screenshots(out, 8)]
+    run.set("rescue_incumbent_checked", {"wave": ex["wave"], "evidence": str(out), "failed": [r["name"] for r in results if not r["passed"]],
+                                         "screenshots": len(shots)}, rescue={**ex, "shots": shots})
+
+
 def comparison_prompt(run, state, ex, labelled):
     images = {label: [str(p) for p in build["screenshots"][:JUDGE_IMAGES]] for label, build in labelled}
     blocks = [candidate_block(run, ex, label, build, images[label]) for label, build in labelled]
     gaps = titles(state.get("best_gaps", []), 5)
+    shown = [label for label, files in images.items() if files]
+    one_sided = f" Only candidate {shown[0]} has screenshots; do not count the other candidate's missing screenshots against it." if len(shown) == 1 else ""
     return compose(run, state, ex, [label for label, _ in labelled], blocks, images, False,
-                   f"Context\nProgress on this goal stalled, so alternative strategies were built from the best build so far. Open gaps in that build: {gaps}.")
+                   f"Context\nProgress on this goal stalled, so alternative strategies were built from the best build so far. Open gaps in that build: {gaps}.{one_sided}")
 
 
 def select(run, state, ex):
@@ -277,9 +328,11 @@ def select(run, state, ex):
     number = len(ex["comparisons"])
     if number >= len(calls):
         return conclude(run, state, ex, passed)
+    if "shots" not in ex:
+        return check_incumbent(run, state, ex)
     first, second = calls[number]
     path = incumbent(run, ex)
-    by_index = {0: {"index": 0, "name": INCUMBENT, "screenshots": best_images(run, ex)}, **{b["index"]: b for b in passed}}
+    by_index = {0: {"index": 0, "name": INCUMBENT, "screenshots": ex["shots"]}, **{b["index"]: b for b in passed}}
     labelled = [("A", by_index[first]), ("B", by_index[second])]
     prompt, images = comparison_prompt(run, state, ex, labelled)
     workers = [run.spec["milestones"][-1]["worker"] if b["index"] == 0 else worker_for(run, b["index"]) for _, b in labelled]
@@ -290,21 +343,29 @@ def select(run, state, ex):
 def decide(ex, passed):
     """(winner index or None, a row per passing strategy, the qualifiers with the top score).
 
-    Qualifiers with the same score meet head to head; whatever the judge cannot separate falls to the lower index."""
+    Qualifiers with the same score meet head to head, a pair with an unreadable call counting as a tie; whatever the judge cannot
+    separate falls to the lower index."""
     rows, leaders = standing(ex, passed)
     if len(leaders) > 1:
-        heads = {"comparisons": [c for c in ex["comparisons"] if 0 not in c["pair"]]}
+        heads = {"comparisons": [c for c in ex["comparisons"] if 0 not in c["pair"] and readable(ex, c["pair"]) == 2]}
         return rank(heads, [b for b in passed if b["index"] in leaders])[0][0]["index"], rows, leaders
     return (leaders[0] if leaders else None), rows, leaders
 
 
 def conclude(run, state, ex, passed):
+    valid = [c for c in ex["comparisons"] if not c.get("invalid")]
+    if passed and not valid:
+        # Not one answer could be read, so no strategy was judged: a broken judge is not a verdict. Keep the strategies and their worktrees,
+        # forget the calls and block, so --retry asks them again and the rescue is not spent.
+        issue = (f"The judge returned no readable comparison in {len(ex['comparisons'])} calls, so none of the {len(passed)} passing strategies was judged. "
+                 "Check the judge, then resume with --retry to compare them again.")
+        return run.set("blocked", {"issue": issue, "during": "rescuing"}, phase="blocked", blocked_from="rescuing", last_error=issue,
+                       rescue={**ex, "comparisons": [], "judge_attempts": 0}, retry_at=None, transient_failures=0)
     cleanup(run, "rescue")
     if not passed:
         return stop(run, state, ex, [("rescue_failed", {"wave": ex["wave"], "reason": "No strategy passed its checks",
                                                         "strategies": [{"index": b["index"], "name": b["name"], "reason": b["reason"]} for b in ex["builds"]]})])
     winner, rows, leaders = decide(ex, passed)
-    valid = [c for c in ex["comparisons"] if not c.get("invalid")]
     bias = rank({"comparisons": ex["comparisons"]}, [{"index": 0, "name": INCUMBENT, "failed_checks": []}, *passed])[1]
     chosen = {"wave": ex["wave"], "winner": winner, "scores": rows, "tied": leaders if len(leaders) > 1 else [], "best_score": ex["best_score"],
               "position_bias_pairs": bias, "comparisons": len(valid), "invalid_comparisons": len(ex["comparisons"]) - len(valid),
@@ -357,10 +418,12 @@ def collect(events):
     rescues, current = [], None
     for event in events:
         d, kind = event["details"], event["kind"]
-        if kind == "rescue_started":
-            current = {"wave": d["wave"], "best_score": d["best_score"], "stale_judgments": d["stale_judgments"], "status": "in_progress",
-                       "diagnosis": None, "diagnoser": None, "reason": None, "winner": None, "winner_name": None, "judge_calls": 0,
-                       "invalid_comparisons": 0, "position_bias_pairs": [], "next_score": None, "rows": {}}
+        if kind == "rescue_started" or (kind == "rescue_skipped" and d.get("stage") == "budget"):
+            # A rescue the budget could not fund never started: its skip is its own record, not the outcome of the one before.
+            current = {"n": d.get("rescue", 1), "wave": d["wave"], "best_score": d["best_score"], "stale_judgments": d["stale_judgments"],
+                       "status": "in_progress" if kind == "rescue_started" else "skipped", "diagnosis": None, "diagnoser": None,
+                       "reason": d.get("reason"), "winner": None, "winner_name": None, "judge_calls": 0, "invalid_comparisons": 0,
+                       "position_bias_pairs": [], "next_score": None, "rows": {}}
             rescues.append(current)
         elif current is None:
             continue
@@ -368,10 +431,10 @@ def collect(events):
             current.update(diagnosis=d["diagnosis"], diagnoser=d["diagnoser"])
             for index, item in enumerate(d["strategies"], 1):
                 current["rows"][index] = {"index": index, "name": item["name"], "approach": item["approach"], "worker": None, "passed": None,
-                                          "reason": None, "seconds": None, "commit": None, "score": None, "qualified": None, "winner": False}
+                                          "reason": None, "seconds": None, "commit": None, "score": None, "qualified": None, "readable": None, "winner": False}
         elif kind in ("rescue_candidate_built", "rescue_candidate_failed"):
             row = current["rows"].setdefault(d["index"], {"index": d["index"], "name": d["name"], "approach": d.get("approach"), "score": None,
-                                                           "qualified": None, "winner": False})
+                                                           "qualified": None, "readable": None, "winner": False})
             row.update(worker=d["worker"], passed=d["passed"], reason=d.get("reason"), seconds=d.get("seconds"), commit=d.get("commit"))
         elif kind == "rescue_compared":
             current["judge_calls"] += 1
@@ -380,7 +443,7 @@ def collect(events):
             current["position_bias_pairs"] = d["position_bias_pairs"]
             for item in d["scores"]:
                 if item["index"] in current["rows"]:
-                    current["rows"][item["index"]].update(score=item["score"], qualified=item["qualified"])
+                    current["rows"][item["index"]].update(score=item["score"], qualified=item["qualified"], readable=item.get("readable"))
             if d["winner"] is not None:
                 current.update(status="chosen", winner=d["winner"], winner_name=d["name"])
                 current["rows"][d["winner"]]["winner"] = True
@@ -423,7 +486,8 @@ def format_lines(data):
         first = str(row["reason"] or "").splitlines()
         state = ("not built yet" if row["passed"] is None else "passed" if row["passed"] else "failed" + (": " + first[0][:120] if first else ""))
         lines.append(f"    {row['index']}. {row['name']} [{(row['worker'] or {}).get('kind', '?')}] {state}"
-                     + (f", score {row['score']:g}" if row["score"] is not None else "") + (" - WINNER" if row["winner"] else ""))
+                     + (f", score {row['score']:g}" if row["score"] is not None else "") + (" - WINNER" if row["winner"] else "")
+                     + (f" (judge read {row['readable']} of 2 orders)" if row["readable"] is not None and row["readable"] < 2 else ""))
     if data["position_bias_pairs"]:
         lines.append("    Position bias in pairs: " + ", ".join(f"{'best build' if a == 0 else a} vs {b}" for a, b in data["position_bias_pairs"]))
     if data["next_score"] is not None:
