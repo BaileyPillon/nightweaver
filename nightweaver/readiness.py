@@ -1,8 +1,12 @@
 """Check the routes selected by a plan before starting a run."""
 
+from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
 from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 from uuid import uuid4
@@ -64,9 +68,91 @@ def ollama_readiness(config, live=False):
     return {**result, "status": "unverified" if live else "unavailable", "action": "Install the selected model or change advisory_ollama.model."}
 
 
+INSTALL_CHROMIUM = "python -m playwright install chromium"
+# channel -> (Windows path below a Program Files folder, macOS app name, Linux path, Linux command)
+BROWSER_INSTALLS = {
+    "msedge": ("Microsoft/Edge/Application/msedge.exe", "Microsoft Edge", "/opt/microsoft/msedge/msedge", "microsoft-edge"),
+    "chrome": ("Google/Chrome/Application/chrome.exe", "Google Chrome", "/opt/google/chrome/chrome", "google-chrome"),
+}
+
+
+def installed_channel(channel):
+    """Find a system browser at its standard install location without starting it."""
+    windows, app, linux, command = BROWSER_INSTALLS[channel]
+    if sys.platform == "win32":
+        bases = [os.environ.get(key) for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")]
+        candidates = [Path(base, windows) for base in bases if base]
+    elif sys.platform == "darwin":
+        candidates = [Path(f"/Applications/{app}.app/Contents/MacOS/{app}")]
+    else:
+        candidates = [Path(linux)]
+    found = next((str(path) for path in candidates if path.is_file()), None)
+    return found or (shutil.which(command) if sys.platform.startswith("linux") else None)
+
+
+def playwright_cache(package):
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured == "0":
+        return package / "driver/package/.local-browsers"
+    if configured:
+        return Path(configured)
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Caches/ms-playwright"
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ms-playwright"
+
+
+def browser_readiness():
+    """Report whether browser gates can run, from the install folders alone. No browser is started."""
+    result = {"playwright": {"installed": False}, "bundled": {"present": False}, "channels": {}, "optional": True}
+    spec = None
+    try:
+        spec = find_spec("playwright")
+    except (ImportError, ValueError):
+        pass
+    if spec is None or not spec.submodule_search_locations:
+        return {**result, "status": "unavailable", "action": "Optional. Browser gates need Playwright: python -m pip install playwright, then " + INSTALL_CHROMIUM}
+    try:
+        result["playwright"] = {"installed": True, "version": version("playwright")}
+    except PackageNotFoundError:
+        result["playwright"] = {"installed": True, "version": None}
+    # The default launch is headless, so it needs the headless shell build that this Playwright release pins.
+    revisions, package = {}, Path(next(iter(spec.submodule_search_locations)))
+    try:
+        manifest = package / "driver/package/browsers.json"
+        revisions = {b["name"]: b["revision"] for b in json.loads(manifest.read_text(encoding="utf-8"))["browsers"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    cache = playwright_cache(package)
+    name, pattern, folder = (("chromium-headless-shell", "*/chrome-headless-shell*", "chromium_headless_shell")
+                             if "chromium-headless-shell" in revisions else ("chromium", "*/chrome*", "chromium"))
+    wanted = revisions.get(name)
+    try:
+        found = sorted(path.name.rpartition("-")[2] for path in cache.glob(folder + "-*") if next(path.glob(pattern), None))
+    except OSError:
+        found = []
+    bundled = {"present": bool(found) if wanted is None else wanted in found, "expected_revision": wanted,
+               "installed_revisions": found, "folder": str(cache)}
+    result["bundled"] = bundled
+    result["channels"] = {channel: installed_channel(channel) for channel in BROWSER_INSTALLS}
+    system = next((channel for channel, path in result["channels"].items() if path), None)
+    if bundled["present"]:
+        return {**result, "status": "ready", "channel": "bundled"}
+    hint = INSTALL_CHROMIUM + (f" (this Playwright expects revision {wanted}, found {', '.join(found) or 'none'})" if wanted else "")
+    if system and os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):  # The same rule as browser.fallback_allowed.
+        return {**result, "status": "unavailable", "action": f"PLAYWRIGHT_BROWSERS_PATH is set, so the installed {system} is not used as a fallback. "
+                f"Install Chromium there with {hint}, or unset PLAYWRIGHT_BROWSERS_PATH."}
+    if system:
+        return {**result, "status": "ready_fallback", "channel": system,
+                "action": f"Bundled Chromium is missing, so browser gates use the installed {system}. To use Chromium instead: {hint}"}
+    return {**result, "status": "unavailable", "action": f"Install a browser: {hint}, or install Microsoft Edge or Google Chrome"}
+
+
 def diagnose(store, spec=None, planner=None, live=False):
     report = {"data_directory": str(store.root),
-              "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "gemini", "ollama")}}
+              "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "gemini", "ollama")},
+              "browser": browser_readiness()}
     if not spec and not planner:
         return report
     roles = []
