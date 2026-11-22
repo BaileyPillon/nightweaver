@@ -9,6 +9,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -272,20 +273,91 @@ class BrowserRuntimeUnavailable(RuntimeError):
     """The verification browser could not start."""
 
 
+FALLBACK_CHANNELS = ("msedge", "chrome")
+_FALLBACKS = {}  # Per process: the installed channel that replaced a missing bundled Chromium.
+
+
+def bundled_missing(error):
+    text = str(error)
+    return "Executable doesn't exist" in text or "playwright install" in text
+
+
+def fallback_allowed():
+    """Setting PLAYWRIGHT_BROWSERS_PATH asks for exactly the Chromium kept there, so that stays fail-closed."""
+    return not os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+
+
+def first_line(error):
+    return str(redact(next((l.strip() for l in str(error).splitlines() if l.strip()), type(error).__name__)))[:300]
+
+
+def launch_browser(driver, channel, timeout):
+    """Return (browser, channel used, fallback). Only the bundled default may fall back to an installed Edge or Chrome."""
+    if channel is not None:
+        return driver.chromium.launch(channel=channel, timeout=timeout), channel, None
+    cached = _FALLBACKS.get("bundled") if fallback_allowed() else None
+    if cached:
+        try:
+            return driver.chromium.launch(channel=cached["used"], timeout=timeout), cached["used"], dict(cached)
+        except Exception:
+            _FALLBACKS.clear()
+    try:
+        return driver.chromium.launch(timeout=timeout), "bundled", None
+    except Exception as error:
+        if not bundled_missing(error):
+            raise
+        if not fallback_allowed():
+            raise RuntimeError(f"{error}\nPLAYWRIGHT_BROWSERS_PATH is set, so no installed Edge or Chrome fallback was tried.") from error
+        failures = []
+        for alternate in FALLBACK_CHANNELS:
+            try:
+                browser = driver.chromium.launch(channel=alternate, timeout=timeout)
+            except Exception as other:
+                failures.append(f"{alternate}: {first_line(other)}")
+                continue
+            fallback = {"requested": "bundled", "used": alternate, "reason": first_line(error)}
+            _FALLBACKS["bundled"] = fallback
+            return browser, alternate, dict(fallback)
+        raise RuntimeError(f"{error}\nInstalled browser fallbacks also failed: {'; '.join(failures)}") from error
+
+
 @contextmanager
-def browser_runtime(channel, *, timeout=None):
+def browser_runtime(channel, *, timeout=None, info=None):
+    """Start the verification browser. `info`, when given, receives the requested and used channel and any fallback."""
     with ExitStack() as stack:
         try:
             from playwright.sync_api import sync_playwright
 
             driver = stack.enter_context(sync_playwright())
-            browser = driver.chromium.launch(channel=channel, timeout=timeout)
+            browser, used, fallback = launch_browser(driver, channel, timeout)
             stack.callback(browser.close)
         except Exception as error:
             raise BrowserRuntimeUnavailable(
                 f"Cannot start {channel or 'bundled Chromium'}: {error}"
             ) from error
+        if info is not None:
+            info.update(requested=channel or "bundled", used=used, fallback=fallback)
         yield browser
+
+
+def warm_up(browser):
+    """Installed Edge and Chrome draw their first screenshot slowly. Pay that once, outside the timed cases."""
+    try:
+        context = browser.new_context()
+        try:
+            page = context.new_page()
+            page.set_content("<!doctype html><title>Nightweaver warm-up</title>")
+            page.screenshot(timeout=30000)
+        finally:
+            context.close()
+    except Exception:
+        pass  # A browser that is really broken fails the first case with its own diagnosis.
+
+
+def favicon_failure(message):
+    """Installed Edge and Chrome fetch /favicon.ico on the first page. The headless shell never does, so it is not a page error."""
+    url = (getattr(message, "location", None) or {}).get("url", "")
+    return message.text.startswith("Failed to load resource") and urlparse(url).path == "/favicon.ico"
 
 
 def run_case(
@@ -338,7 +410,7 @@ def run_case(
         page.on("pageerror", lambda err: issue("page_error", err))
         page.on(
             "console",
-            lambda msg: issue("console", msg.text) if msg.type == "error" else None,
+            lambda msg: issue("console", msg.text) if msg.type == "error" and not favicon_failure(msg) else None,
         )
         return page
 
@@ -484,12 +556,17 @@ def _verify_browser(config, root, output):
     config = validate_browser(config)
     root = Path(root).resolve()
     results = []
-    with browser_runtime(config.get("channel")) as browser:
+    channel = {}
+    with browser_runtime(config.get("channel"), info=channel) as browser:
         runtime = {
             "chromium": browser.version,
             "playwright": version("playwright"),
-            "channel": config.get("channel", "bundled"),
+            "channel": channel["used"],
         }
+        if channel["fallback"]:
+            runtime["browser_channel_fallback"] = channel["fallback"]
+        if channel["used"] != "bundled":
+            warm_up(browser)
         with local_page(config, root, output) as (url, server_check):
             for scenario, viewport, steps in journeys.browser_cases(config):
                 results.append(
@@ -508,9 +585,12 @@ def _verify_browser(config, root, output):
     receipt = {
         "schema": "nightweaver.browser.v2",
         "runtime": runtime,
+        "browser_channel": channel["used"],
         "passed": bool(results) and all(r["passed"] for r in results),
         "viewports": results,
     }
+    if channel["fallback"]:
+        receipt["browser_channel_fallback"] = channel["fallback"]
     write_json(output / "browser.json", receipt)
     return receipt
 

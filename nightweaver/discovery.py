@@ -17,6 +17,15 @@ from .spec import strict_json
 
 def verify_tools(gates):
     for gate in gates:
+        if gate.get("kind") == "browser":
+            from .readiness import browser_readiness
+
+            browser = browser_readiness()
+            if browser["status"] == "unavailable":
+                raise ValueError(
+                    f"{gate['name']} needs a browser available before starting this OneShot. {browser['action']}"
+                )
+            continue
         argv = gate["argv"]
         wrapped = gate["name"].startswith(".NET ") or gate["name"] == "npm test"
         executable = argv[4] if wrapped else argv[0]
@@ -110,6 +119,44 @@ def npm_command():
         if npm_cli.is_file() and node:
             return [node, str(npm_cli), "test"]
     return None
+
+
+STATIC_PAGES = ("index.html", "public/index.html", "docs/index.html")
+SERVED_SCRIPTS = ("dev", "start", "preview", "serve")
+# Files a brand-new repository starts with. Anything else means the project has its own shape.
+INERT_FILES = re.compile(
+    r"(?i)(?:readme|licen[cs]e|copying|notice)(?:\.[a-z]+)?|\.(?:gitignore|gitattributes|editorconfig|gitkeep|keep)"
+)
+
+
+def served_by_script(scripts):
+    return isinstance(scripts, dict) and any(
+        isinstance(scripts.get(name), str) and scripts[name].strip() for name in SERVED_SCRIPTS
+    )
+
+
+def static_page(blobs, scripts):
+    """The page a browser smoke check can load for a web repository without tests, or None."""
+    if served_by_script(scripts):
+        return None  # A bundler or framework serves this project, so a bare file server cannot render its index.html.
+    page = next((p for p in STATIC_PAGES if p in blobs), None)
+    if page is None and all(INERT_FILES.fullmatch(p) for p in blobs):
+        page = "index.html"  # A new repository: the worker creates the page.
+    return page
+
+
+def smoke_gate(page):
+    return {"name": "Browser smoke", "kind": "browser", "browser": {"page": page}}
+
+
+def missing_suite(scripts):
+    if served_by_script(scripts):
+        return (
+            "No supported committed test suite found. This web project is served by a package.json script, which OneShot "
+            "cannot start by itself. Use a Nightweaver template with a browser check that owns the server, for example "
+            '{"name": "Browser smoke", "kind": "browser", "browser": {"server": {"argv": ["<executable>", "<server script>", "{port}"]}}}.'
+        )
+    return "No supported committed test suite found. Use a Nightweaver template with an explicit check."
 
 
 def discover(repository, objective, worker, rescue=None, python=None):
@@ -215,6 +262,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
                         "argv": [interpreter, "-B", runner, "unittest", folder],
                     }
                 )
+    scripts, placeholder = {}, None
     js_ext = (".js", ".mjs", ".cjs")
     js_files = [
         p
@@ -257,31 +305,30 @@ def discover(repository, objective, worker, rescue=None, python=None):
             if "no test specified" in declared.lower() or re.fullmatch(
                 r"(?:echo\b[^&|;]*|true|exit\s+0)", declared.strip(), re.IGNORECASE
             ):
-                raise ValueError(
-                    "package.json declares a placeholder test script. Set a real test command or use an explicit plan."
+                placeholder = "package.json declares a placeholder test script. Set a real test command or use an explicit plan."
+            else:
+                argv = npm_command()
+                if not argv:
+                    raise ValueError(
+                        "The committed npm test script needs a native Node/npm installation. Use an explicit plan for another package manager."
+                    )
+                gates.append(
+                    {
+                        "name": "npm test",
+                        "argv": [sys.executable, "-B", runner, "npm", *argv],
+                    }
                 )
-            argv = npm_command()
-            if not argv:
-                raise ValueError(
-                    "The committed npm test script needs a native Node/npm installation. Use an explicit plan for another package manager."
+                protected.update(js_files)
+                script = re.fullmatch(
+                    r"""node\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))""", declared.strip()
                 )
-            gates.append(
-                {
-                    "name": "npm test",
-                    "argv": [sys.executable, "-B", runner, "npm", *argv],
-                }
-            )
-            protected.update(js_files)
-            script = re.fullmatch(
-                r"""node\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))""", declared.strip()
-            )
-            if script:
-                entry = PurePosixPath(
-                    next(value for value in script.groups() if value).replace("\\", "/")
-                ).as_posix()
-                if entry in blobs:
-                    protected.add(entry)
-            protected.update({"package.json", "package-lock.json"} & blobs.keys())
+                if script:
+                    entry = PurePosixPath(
+                        next(value for value in script.groups() if value).replace("\\", "/")
+                    ).as_posix()
+                    if entry in blobs:
+                        protected.add(entry)
+                protected.update({"package.json", "package-lock.json"} & blobs.keys())
     projects = []
     all_projects = sorted(p for p in sources if p.endswith(".csproj"))
     project_dirs = {PurePosixPath(p).parent for p in all_projects}
@@ -328,15 +375,19 @@ def discover(repository, objective, worker, rescue=None, python=None):
             and next((d for d in PurePosixPath(p).parents if d in project_dirs), None)
             == folder
         )
+    page = None if gates else static_page(blobs, scripts)
+    if placeholder and (gates or not page):
+        raise ValueError(placeholder)
     if not gates:
-        raise ValueError(
-            "No supported committed test suite found. Use a Nightweaver template with an explicit check."
-        )
+        if not page:
+            raise ValueError(missing_suite(scripts))
+        # A web page without tests still gets loaded in a desktop and a phone viewport, with screenshots kept as evidence.
+        gates.append(smoke_gate(page))
     if len(protected) > 4096:
         raise ValueError(
             "The discovered suite exceeds 4096 protected files. Use a scoped template."
         )
-    return {
+    plan = {
         "repository": str(root),
         "expected_base": base,
         "title": objective.strip().splitlines()[0][:100],
@@ -356,3 +407,9 @@ def discover(repository, objective, worker, rescue=None, python=None):
         },
         "milestones": [{"title": "Deliver the goal", "task": objective.strip()}],
     }
+    if page:
+        plan["acceptance"] = [
+            f"{page} exists, loads over HTTP without console or page errors and has no horizontal overflow at "
+            "1440x900 (desktop) and 390x844 (phone)."
+        ]
+    return plan

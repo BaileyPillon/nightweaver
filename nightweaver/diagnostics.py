@@ -118,26 +118,33 @@ def preflight(store, spec):
                     errors.append(f"Invalid PNG baseline {name}: {error}")
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
-    errors.extend(probe_browser_channels(browsers))
+    used = {}
+    errors.extend(probe_browser_channels(browsers, used))
     from .contracts import check_schedule
-    return {**report, "check_schedule": check_schedule(spec), "catalog_baselines":catalog_baselines, "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+    return {**report, "check_schedule": check_schedule(spec), "catalog_baselines":catalog_baselines, "browser_work":browser_work, "browser_channels": sorted(browsers), "browser_channels_used": used, "gate_executables": executables, "errors": errors, "model_calls": 0,
             "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
 
-def probe_browser_channels(channels):
-    """Open an in-memory test page once per requested browser, independently of the project."""
+def probe_browser_channels(channels, resolved=None):
+    """Open an in-memory test page once per requested browser, independently of the project.
+
+    The bundled default falls back to an installed Edge or Chrome when its Chromium download is missing.
+    `resolved`, when given, receives the channel each request will actually use and any fallback."""
     errors = []
     for channel in sorted(set(channels)):
+        info = {}
         try:
             from .browser import browser_runtime
-            with browser_runtime(None if channel == "bundled" else channel, timeout=10000) as browser:
+            with browser_runtime(None if channel == "bundled" else channel, timeout=10000, info=info) as browser:
                 page = browser.new_page()
                 page.set_content("<title>Nightweaver preflight</title>")
                 if page.title() != "Nightweaver preflight":
                     errors.append(f"Browser probe failed: {channel}")
         except Exception as error:
             errors.append(f"{channel}: {error}")
+        if info and resolved is not None:
+            resolved[channel] = {"used": info["used"], **({"fallback": info["fallback"]} if info["fallback"] else {})}
     return errors
 
 
