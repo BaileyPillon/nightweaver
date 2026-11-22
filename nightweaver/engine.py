@@ -222,7 +222,10 @@ class Run:
             raise BudgetExceeded("Run observed-token budget exhausted; usage may overshoot by the last call")
 
     def route(self, state, step, role):
+        pursue = self.spec.get("pursue")
         routes = ([step["worker"], *step.get("worker_fallbacks", [])] if role == "worker" else
+                  [pursue["judge"], *pursue["judge_fallbacks"]] if role == "judge" else
+                  [pursue["planner"]] if role == "planner" else
                   [self.spec["reviewer"], *self.spec.get("reviewer_fallbacks", [])])
         return routes[min(state.get(role + "_route", 0), len(routes) - 1)]
 
@@ -234,12 +237,15 @@ class Run:
                  pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
                  usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None))
 
-    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None):
+    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None):
         self.check_budget(call=True)
         state = self.store.get(self.id)["state"]
+        milestone = role in ("worker", "reviewer")
         pending = {"call": state.get("provider_calls", 0) + 1, "role": role, "provider": config["kind"],
                    "model": config.get("model"), "started": timestamp(), "log": str(log),
-                   "step": state["step"] + 1, "attempt": state["attempt"]}
+                   "step": state["step"] + int(milestone), "attempt": state["attempt"]}
+        if not milestone:
+            pending["wave"] = state.get("wave", 1)
         if "effort" in config:
             pending["effort"] = config["effort"]
         self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
@@ -249,8 +255,8 @@ class Run:
         if "idle_timeout" in limits:
             health["idle_timeout"] = limits["idle_timeout"]
         try:
-            return invoke(config, role, path, log, prompt, self.spec["agent_timeout"], self.paused,
-                          session, evidence=evidence, health=health)
+            return invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
+                          session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
         finally:
             self.finish_call(pending)
 
@@ -323,10 +329,13 @@ class Run:
         checks = "\n".join("- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in step["gates"])
         following = self.spec["milestones"][state["step"] + 1:state["step"] + 2]
         next_task = (f"Next milestone after acceptance: {following[0]['title']} — {following[0]['task'][:800]}"
-                     if following else "This is the final milestone.")
+                     if following else "This is the last planned milestone. The goal is judged afterwards and more milestones may follow."
+                     if self.spec.get("pursue") else "This is the final milestone.")
         prior = []
+        from .pursuit import reachable
+        ours = reachable(self, state) if state.get("judgments") else None
         for item in self.store.accepted_milestones(self.id):
-            if item["step"] <= state["step"]:
+            if item["step"] <= state["step"] and (ours is None or item["commit"] in ours):
                 line = f"- {self.spec['milestones'][item['step'] - 1]['title']} ({item['commit']})"
                 if item.get("verified_checks"):
                     line += " · Passed: " + ", ".join(item["verified_checks"])
@@ -334,8 +343,10 @@ class Run:
         prior_summary = "\n".join(prior) or "None yet"
         from .repair import failure_brief
         history = failure_brief(self.store, self.id, state, self.spec.get("repair", {}).get("history", 0))
+        from .pursuit import worker_brief
+        pursuit = worker_brief(self.spec, state)
         return (
-            f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
+            f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}{chr(10) + pursuit if pursuit else ''}\n"
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
             f"{next_task}\n\n"
@@ -568,7 +579,7 @@ class Run:
                 "If required evidence cannot be read or has not been inspected, return REVISE and explain. Remain read-only. "
                 'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision
             )
-            if state["step"] + 1 == len(self.spec["milestones"]):
+            if state["step"] + 1 == len(self.spec["milestones"]) and not self.spec.get("pursue"):
                 prompt += ("\nThis is the final milestone. Also check the complete project objective against the current "
                            "worktree and supplied evidence. Return REVISE for any unfulfilled part of that objective.")
             code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence)
@@ -646,11 +657,14 @@ class Run:
         number = state["step"] + 1
         finished = number == len(self.spec["milestones"])
         passed = [gate["name"] for gate in self.spec["milestones"][number - 1]["gates"]]
-        completion = ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None
+        pursuing = finished and bool(self.spec.get("pursue"))
+        wave = state.get("wave", 1)
+        completion = (("wave_completed", {"wave": wave, "commit": candidate, "branch": self.ref}) if pursuing else
+                      ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None)
         self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref,
                  "tree": state.get("candidate_tree"), "verified_checks": passed},
-                 following_event=completion,
-                 phase="done" if finished else "ready", step=number, accepted=candidate,
+                 following_event=completion, **({"wave": wave, "judge_attempts": 0, "judge_route": 0} if pursuing else {}),
+                 phase="judging" if pursuing else "done" if finished else "ready", step=number, accepted=candidate,
                  attempt=0, attempts_used=0, candidate=None, candidate_tree=None,
                  worker_session=None, last_error="", log=None, retry_at=None, failure_count=0,
                  failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0, route_rejections=0)
@@ -687,7 +701,8 @@ class Run:
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
                          attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,
-                         transient_failures=0, failure_count=0, failure_fingerprint=None, route_rejections=0)
+                         transient_failures=0, failure_count=0, failure_fingerprint=None, route_rejections=0,
+                         **({"judge_attempts": 0, "plan_attempts": 0, "judge_ledger": None} if self.spec.get("pursue") else {}))
             if state.get("pending_call"):
                 self.finish_call(state["pending_call"], recovered=True)
             if not state.get("started_at"):
@@ -701,7 +716,9 @@ class Run:
                 if self.store.get(self.id)["pause"]:
                     self.set("runner_stopped", {"phase": phase})
                     return "paused"
-                step = self.spec["milestones"][state["step"]]
+                if phase in ("judging", "planning") and not self.spec.get("pursue"):
+                    raise ValueError(f"Unrecognized run state: {phase}")
+                step = None if phase in ("judging", "planning") else self.spec["milestones"][state["step"]]
                 try:
                     self.check_budget()
                     if state.get("retry_at") and datetime.fromisoformat(state["retry_at"]) > datetime.now(timezone.utc):
@@ -717,6 +734,10 @@ class Run:
                         context_checked = True
                     if phase == "promoting":
                         self.promote(state)
+                        continue
+                    if phase in ("judging", "planning"):
+                        from . import pursuit
+                        (pursuit.judge if phase == "judging" else pursuit.plan_wave)(self, state)
                         continue
                     path = self.worktree(state)
                     if phase == "working":
@@ -753,10 +774,12 @@ class Run:
                 except ProviderUnavailable as error:
                     current = self.store.get(self.id)["state"]
                     actual = current["phase"]
-                    role = "reviewer" if actual == "reviewing" else "worker"
+                    role = {"reviewing": "reviewer", "judging": "judge", "planning": "planner"}.get(actual, "worker")
                     config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}
-                    routes = step.get("worker_fallbacks", []) if role == "worker" else self.spec.get("reviewer_fallbacks", [])
+                    pursue = self.spec.get("pursue", {})
+                    routes = {"worker": (step or {}).get("worker_fallbacks", []), "reviewer": self.spec.get("reviewer_fallbacks", []),
+                              "judge": pursue.get("judge_fallbacks", []), "planner": []}[role]
                     index = current.get(role + "_route", 0)
                     next_phase = "ready" if actual == "working" else actual
                     refund = {"attempts_used": max(0, current.get("attempts_used", 1) - 1) , "worker_session": None} if role == "worker" else {}

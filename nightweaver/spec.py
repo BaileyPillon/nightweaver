@@ -8,6 +8,7 @@ import re
 
 IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
 REVIEWERS = IMPLEMENTERS
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def strict_json(data, *, parse_float=None):
@@ -46,6 +47,17 @@ def scoped_milestones(raw):
 
 def anchor_provider_paths(raw, folder):
     """A generated plan might be opened outside the template's directory."""
+    pursue = raw.get("pursue")
+    if isinstance(pursue, dict):
+        if isinstance(pursue.get("references"), list):
+            pursue["references"] = [str((folder / Path(item).expanduser()).resolve()) if isinstance(item, str) and item.strip() else item
+                                    for item in pursue["references"]]
+        routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5)]
+        for route in routes:
+            if isinstance(route, dict):
+                for key in ("profile_dir", "api_key_file"):
+                    if key in route:
+                        route[key] = str((folder / Path(text(route, key)).expanduser()).resolve())
     for section in [raw, *array(raw.get("milestones", []), "milestones", 50)]:
         if not isinstance(section, dict):
             raise ValueError("A milestone must be an object")
@@ -200,6 +212,38 @@ def gate_spec(item):
     return result
 
 
+def pursuit(raw, relative_to, acceptance):
+    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria", "pursue")
+    if "judge" not in raw:
+        raise ValueError("pursue requires a judge")
+    judge = provider(raw["judge"], REVIEWERS, "judge", relative_to)
+    references = []
+    for item in array(raw.get("references", []), "references", 6):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("references must be paths of image files")
+        path = (relative_to or Path.cwd()) / Path(item.strip()).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(f"Reference image not found: {item}") from error
+        if not path.is_file() or path.suffix.casefold() not in IMAGE_SUFFIXES:
+            raise ValueError(f"Reference images must be .png, .jpg, .jpeg or .webp files: {item}")
+        if str(path) not in references:
+            references.append(str(path))
+    criteria = raw.get("criteria", acceptance)
+    if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
+        raise ValueError("pursue criteria must be a list of nonempty strings")
+    return {"judge": judge,
+            "judge_fallbacks": [provider(p, REVIEWERS, "judge fallback", relative_to) for p in array(raw.get("judge_fallbacks", []), "judge_fallbacks", 5)],
+            "planner": provider(raw["planner"], IMPLEMENTERS, "pursuit planner", relative_to) if "planner" in raw else dict(judge),
+            "max_waves": integer(raw.get("max_waves", 3), "max_waves", 1, 20),
+            "wave_size": integer(raw.get("wave_size", 3), "wave_size", 1, 5),
+            "target_score": integer(raw.get("target_score", 85), "target_score", 0, 100),
+            "plateau": integer(raw.get("plateau", 2), "plateau", 1, 5),
+            "regression_margin": integer(raw.get("regression_margin", 5), "regression_margin", 0, 50),
+            "references": references, "criteria": [item.strip() for item in criteria]}
+
+
 def resolve_repository(raw, relative_to=None, store=None):
     if not isinstance(raw, dict):
         raise ValueError("A plan must be a JSON object")
@@ -223,7 +267,7 @@ def resolve_repository(raw, relative_to=None, store=None):
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
-           "reviewer_fallbacks context_files repository_map source_issue repair", "plan")
+           "reviewer_fallbacks context_files repository_map source_issue repair pursue", "plan")
     if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
         raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
@@ -321,6 +365,8 @@ def validate(raw, relative_to=None, store=None):
         out["expected_base"] = base
     if "reviewer" in raw:
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
+    if "pursue" in raw:
+        out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
     if "advisory_ollama" in raw:
         fields(raw["advisory_ollama"], "model port timeout max_tokens think required", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")

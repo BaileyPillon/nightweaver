@@ -14,6 +14,24 @@ from .store import default_home
 from .safety import json_events
 
 
+READ_ONLY = ("reviewer", "judge", "replanner")
+JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["verdict", "score", "criteria", "gaps", "reason"],
+                "properties": {"verdict": {"enum": ["MET", "NOT_MET"]}, "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                               "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                            "required": ["criterion", "met", "note"],
+                                            "properties": {"criterion": {"type": "string"}, "met": {"type": "boolean"}, "note": {"type": "string"}}}},
+                               "gaps": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                        "required": ["title", "detail"],
+                                        "properties": {"title": {"type": "string"}, "detail": {"type": "string"}}}},
+                               "reason": {"type": "string"}}}
+WAVE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["milestones"],
+               "properties": {"milestones": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False,
+                              "required": ["title", "task"], "properties": {"title": {"type": "string"}, "task": {"type": "string"}}}}}}
+SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
+                        "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}},
+           "judge": JUDGE_SCHEMA, "replanner": WAVE_SCHEMA}
+
+
 class ProviderUnavailable(ValueError):
     """An account or service problem that another coding attempt cannot fix."""
 
@@ -111,7 +129,7 @@ def configure_deepseek_key(path):
     return {"provider": "deepseek", "configured": True, "api_key_file": str(path)}
 
 
-def adapter(config, mode, session=None):
+def adapter(config, mode, session=None, images=()):
     kind = config["kind"]
     env = os.environ.copy()
     if kind == "command":
@@ -149,6 +167,9 @@ def adapter(config, mode, session=None):
         argv.append("exec")
         if session:
             argv += ["resume", session]
+        for image in images:
+            # --image takes values greedily, so a following flag must end it before the stdin marker.
+            argv += ["--image", str(image)]
         argv += ["--json"]
         if config.get("model"):
             argv += ["--model", config["model"]]
@@ -161,11 +182,9 @@ def adapter(config, mode, session=None):
         argv += ["--effort", config["effort"]]
         env["CLAUDE_CODE_EFFORT_LEVEL"] = config["effort"]
     if mode != "worker":
-        argv += ["--tools", "Read,Grep,Glob" if mode == "reviewer" else ""]
-    if mode == "reviewer":
-        schema = {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
-                  "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}}
-        argv += ["--json-schema", json.dumps(schema)]
+        argv += ["--tools", "Read,Grep,Glob" if mode in READ_ONLY else ""]
+    if mode in SCHEMAS:
+        argv += ["--json-schema", json.dumps(SCHEMAS[mode])]
     if mode == "probe":
         argv += ["--no-session-persistence", "--strict-mcp-config",
                  "--system-prompt", "This is a connection test. Reply READY and use no tools."]
@@ -203,7 +222,7 @@ def metadata(path, kind, mode=None):
                 session = event.get("session_id") or session
             if event.get("type") == "result" and isinstance(event.get("result"), str):
                 last = event["result"] or last
-            if mode == "reviewer" and event.get("type") == "result" and isinstance(event.get("structured_output"), dict):
+            if mode in SCHEMAS and event.get("type") == "result" and isinstance(event.get("structured_output"), dict):
                 last = json.dumps(event["structured_output"])
             item = event.get("item", {})
             if isinstance(item, dict) and event.get("type") == "item.completed" and item.get("type") == "agent_message":
@@ -253,9 +272,9 @@ def usage(path, kind):
     return {"observed_tokens": total if seen else None, "token_channels": channels, "billing": "not_measured"}
 
 
-def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None):
+def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None, images=()):
     executable = check_provider(config, cwd)
-    argv, env = adapter(config, mode, session)
+    argv, env = adapter(config, mode, session, images)
     argv = [executable, *argv[1:]]
     if Path(executable).suffix.casefold() in (".cmd", ".bat"):
         # npm's Windows launcher is a shell script. Resolve the known package without executing a shell.
@@ -267,10 +286,16 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
     if evidence is not None:
         env["NIGHTWEAVER_EVIDENCE"] = str(evidence)
         env["ROOKLINE_EVIDENCE"] = str(evidence)
+    folders = [] if evidence is None else [Path(evidence)]
+    for image in images:
+        folder = Path(image).parent
+        if folder not in folders and not any(folder.is_relative_to(known) for known in folders):
+            folders.append(folder)
+    for folder in folders:
         if config["kind"] in {"claude", "deepseek"}:
-            argv += ["--add-dir", str(evidence)]
+            argv += ["--add-dir", str(folder)]
         elif config["kind"] == "gemini":
-            argv += ["--include-directories", str(evidence)]
+            argv += ["--include-directories", str(folder)]
     with ExitStack() as resources:
         if os.name == "nt" and config["kind"] == "codex" and mode == "worker":
             # Windows sandbox setup grants write access to the child process's temp root.

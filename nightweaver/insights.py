@@ -129,6 +129,9 @@ def diagnosis(store, run_id):
         "dispatcher_run_failed",
         "repeated_failure_stopped",
         "verification_inconsistent",
+        "pursuit_stopped",
+        "judge_invalid",
+        "plan_invalid",
         "blocked",
     }
     failures = [e for e in events if e["kind"] in kinds]
@@ -177,6 +180,9 @@ def export_trace(store, run_id, output, after=0, until=None):
         "stability_runs",
         "seconds",
         "same_failure_count",
+        "wave",
+        "score",
+        "verdict",
     }
     header = {"schema": "nightweaver.trace.v1", "run_id": run_id, "base": row["state"]["base"]}
     records = [header]

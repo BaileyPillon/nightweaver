@@ -70,7 +70,7 @@ def _metrics(store, run_id):
     if row["state"]["phase"] == "blocked":
         terminal = next((event for event in reversed(events) if event["kind"] in (
             "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed",
-            "repeated_failure_stopped", "verification_inconsistent")), None)
+            "repeated_failure_stopped", "verification_inconsistent", "pursuit_stopped")), None)
         if terminal:
             stop = terminal["time"]
     seconds = None
@@ -95,6 +95,8 @@ def _metrics(store, run_id):
             outcome = "verification_inconsistent"
         elif terminal and terminal["kind"] == "provider_unavailable":
             outcome = "provider_blocked"
+        elif terminal and terminal["kind"] == "pursuit_stopped":
+            outcome = "pursuit_stopped"
         elif terminal and terminal["kind"] == "budget_exhausted":
             outcome = "budget_exhausted"
             recovered = next((event["seq"] for event in reversed(events) if event["kind"] == "interrupted_worker_recovered"), 0)
@@ -110,8 +112,16 @@ def _metrics(store, run_id):
                     rejected.get("exit"), outcome)
         else:
             outcome = "execution_blocked"
+    pursuit = None
+    if row["spec"].get("pursue"):
+        judged = row["state"].get("judgments", [])
+        stopped = next((e["details"] for e in reversed(events) if e["kind"] == "pursuit_stopped"), None)
+        pursuit = {"waves": row["state"].get("wave", 1), "judgments": len(judged), "last_score": judged[-1]["score"] if judged else None,
+                   "best_score": row["state"].get("best_score"), "goal_met": "goal_met" in kinds, "reverts": kinds.count("pursuit_reverted"),
+                   "stop_reason": stopped["reason"] if stopped and phase == "blocked" else None}
     return {
         **recovery_metrics(events),
+        **({"pursuit": pursuit} if pursuit else {}),
         "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
@@ -178,11 +188,29 @@ def _run_report(store, run_id, output, include_images):
             value = f"{value['name']} ({value['duration_ms']:,} ms)"
         elif key == "mixed_gate_results":
             value = ", ".join(f"{g['name']} at {g['tree'][:12]}" for g in value) or "None observed"
+        elif key == "pursuit":
+            value = (f"{value['waves']} waves, {value['judgments']} judgments, last {value['last_score']}, best {value['best_score']}, "
+                     f"{'goal met' if value['goal_met'] else 'stopped: ' + value['stop_reason'] if value['stop_reason'] else 'in progress'}, "
+                     f"{value['reverts']} reverts")
         elif key == "provider_usage":
             value = " · ".join(f"{r['role']} / {r['provider']} ({r['model'] or 'default'}), "
                                f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
         body += f'<tr><th scope="row">{escape(key.replace("_", " ").capitalize())}</th><td>{escape(str(value) if value is not None else "Unavailable")}</td></tr>'
     body += '</tbody></table></div>'
+    if row["spec"].get("pursue"):
+        from .pursuit import report as pursuit_report
+        data = pursuit_report(store, run_id)
+        body += ('<h2>Goal pursuit</h2><div class="table"><table><thead><tr><th>Wave</th><th>Milestones</th><th>Judgment</th>'
+                 '<th>Top gaps</th></tr></thead><tbody>')
+        for wave in data["waves"]:
+            verdict = wave["judgment"]
+            summary = "Not judged" if verdict is None else f'{verdict["verdict"]} {verdict["score"]}/100'
+            if wave["reverted"]:
+                summary += " · reverted to the best build"
+            gaps = "; ".join(g["title"] for g in verdict["gaps"][:3]) if verdict else ""
+            body += (f'<tr><td>{wave["wave"]}</td><td>{escape("; ".join(m["title"] for m in wave["milestones"]))}</td>'
+                     f'<td>{escape(summary)}</td><td>{escape(gaps)}</td></tr>')
+        body += '</tbody></table></div>'
     from .junit import history
     observations = history(store, run_id)["observations"]
     if observations:
@@ -230,7 +258,7 @@ def _run_report(store, run_id, output, include_images):
         unavailable = Counter()
         evidence_root = (store.directory(run_id) / "evidence").resolve()
         for event in events:
-            if event["kind"] != "gate_finished":
+            if event["kind"] not in ("gate_finished", "judge_gate_finished"):
                 continue
             for artifact in event["details"].get("artifacts", []):
                 if not isinstance(artifact, dict) or not str(artifact.get("path", "")).lower().endswith(".png"):

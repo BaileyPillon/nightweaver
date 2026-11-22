@@ -31,6 +31,9 @@ def category(event):
         "budget_exhausted",
         "repeated_failure_stopped",
         "verification_inconsistent",
+        "pursuit_stopped",
+        "judge_invalid",
+        "plan_invalid",
     ):
         return "Problems"
     if kind.startswith("provider_call"):
@@ -62,6 +65,10 @@ def checkpoint_header(row, events):
         body.append(
             f"<dt>Current milestone</dt><dd>{escape(steps[accepted]['title'])}</dd>"
         )
+    if "wave" in state or "judgments" in state:
+        best = state.get("best_score")
+        body.append(f"<dt>Goal pursuit</dt><dd>Wave {int(state.get('wave', 1))} · {len(state.get('judgments', []))} judgments"
+                    + (f" · best score {int(best)}/100" if best is not None else "") + "</dd>")
     if "guard_limit" in state:
         body.append(
             f"<dt>Crash restarts used</dt><dd>{int(state.get('guard_restarts', 0))} of {int(state['guard_limit'])}</dd>"

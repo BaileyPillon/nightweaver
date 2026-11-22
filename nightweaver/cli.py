@@ -15,7 +15,7 @@ from .engine import Run, checkout, create_run, directory_identity, fork_run, pen
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
-from .spec import IMPLEMENTERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
+from .spec import IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
 from .safety import redact
 
@@ -235,6 +235,30 @@ def planner_route(args):
     return config
 
 
+def route_config(kind, profile, model, effort, label, choices=IMPLEMENTERS):
+    config = {"kind": kind}
+    if profile:
+        config["profile_dir"] = str(Path(profile).expanduser().resolve())
+    if model:
+        config["model"] = model
+    if effort:
+        config["effort"] = effort
+    return provider(config, choices, label)
+
+
+def pursuit_block(args):
+    judge = args.judge or ("claude" if args.worker != "claude" else "codex")
+    block = {"judge": route_config(judge, args.judge_profile, args.judge_model, args.judge_effort, "judge", REVIEWERS)}
+    if args.planner_kind:
+        block["planner"] = route_config(args.planner_kind, args.planner_profile, args.planner_model, args.planner_effort, "planner")
+    for key, value in (("max_waves", args.waves), ("target_score", args.target_score)):
+        if value is not None:
+            block[key] = value
+    if args.reference:
+        block["references"] = [str(Path(item).expanduser().resolve()) for item in args.reference]
+    return block
+
+
 def register(store, spec, args):
     run_id = create_run(store, spec, enqueue=args.enqueue, after=args.after)
     result = {"run_id": run_id}
@@ -275,11 +299,33 @@ def main(argv=None):
     one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
     one.add_argument("--rescue-profile", help="Signed-in CLI profile for the alternate")
     one.add_argument("--direct", action="store_true", help="Use the objective as one milestone and skip the planner call")
+    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "deepseek"), help="Review every milestone with this provider")
+    one.add_argument("--reviewer-model")
+    one.add_argument("--reviewer-effort")
+    one.add_argument("--reviewer-profile", help="Signed-in CLI profile for the milestone reviewer")
+    one.add_argument("--pursue", action="store_true", help="Keep judging and planning further waves until the goal is met or progress stops")
+    one.add_argument("--judge", choices=("codex", "claude", "gemini", "deepseek"),
+                     help="Independent goal judge (default: a different model family from the worker)")
+    one.add_argument("--judge-model")
+    one.add_argument("--judge-effort")
+    one.add_argument("--judge-profile", help="Signed-in CLI profile for the judge")
+    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "deepseek"), help="Wave planner (default: the judge)")
+    one.add_argument("--planner-model")
+    one.add_argument("--planner-effort")
+    one.add_argument("--planner-profile")
+    one.add_argument("--waves", type=int, help="Additional waves allowed after the initial plan (1 to 20, default 3)")
+    one.add_argument("--target-score", type=int, help="Judge score from 0 to 100 that counts as done (default 85)")
+    one.add_argument("--reference", action="append", default=[], metavar="IMAGE",
+                     help="Reference image the judge compares screenshots with (repeatable, at most 6)")
     launch_one = one.add_mutually_exclusive_group()
     launch_one.add_argument("--preview", action="store_true", help="Print the reusable plan and its checks without calling a model")
     launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
     launch_one.add_argument("--enqueue", action="store_true", help="Use the persistent queue for the worker run")
     commands.add_parser("repair-history", help="Trace failed candidates and functional worker handoffs").add_argument("id")
+    pursue_cmd = commands.add_parser("pursuit", help="Show a goal pursuit run's waves, judgments and best build, or grant more waves")
+    pursue_cmd.add_argument("id")
+    pursue_cmd.add_argument("--json", action="store_true")
+    pursue_cmd.add_argument("--add-waves", type=int, metavar="N", help="Allow N more waves and resume a run stopped at the judge")
     guard = commands.add_parser("guard", help="Run with bounded recovery after a Windows runner exits unexpectedly")
     guard.add_argument("id")
     guard.add_argument("--max-restarts", type=int, choices=range(11), metavar="0..10")
@@ -535,7 +581,7 @@ def main(argv=None):
         if action == "list":
             p.add_argument("--compact", action="store_true", help="Return sidebar summaries without prompts and gate definitions")
         p.add_argument("--project")
-        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","done","blocked"))
+        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","judging","planning","done","blocked"))
     args = app.parse_args(argv)
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
@@ -547,6 +593,18 @@ def main(argv=None):
             getattr(args, "preview", False) or getattr(args, "enqueue", False)
             or (args.command in ("goal", "add") and not args.start)):
         app.error("--guard-restarts requires a dedicated launch")
+    if args.command == "oneshot" and not args.pursue:
+        extras = [flag for flag, value in (("--judge", args.judge), ("--judge-model", args.judge_model), ("--judge-effort", args.judge_effort),
+                  ("--judge-profile", args.judge_profile), ("--planner-kind", args.planner_kind), ("--planner-model", args.planner_model),
+                  ("--planner-effort", args.planner_effort), ("--planner-profile", args.planner_profile), ("--waves", args.waves),
+                  ("--target-score", args.target_score), ("--reference", args.reference)) if value]
+        if extras:
+            app.error(f"{', '.join(extras)} require --pursue")
+    if args.command == "oneshot":
+        if not args.planner_kind and (args.planner_model or args.planner_effort or args.planner_profile):
+            app.error("--planner-model, --planner-effort and --planner-profile require --planner-kind")
+        if not args.reviewer and (args.reviewer_model or args.reviewer_effort or args.reviewer_profile):
+            app.error("--reviewer-model, --reviewer-effort and --reviewer-profile require --reviewer")
     if args.command == "events":
         if args.before is not None and (args.after is not None or args.until is not None or args.before < 1):
             app.error("--before requires a positive exclusive cursor and cannot combine with --after or --until")
@@ -610,6 +668,12 @@ def main(argv=None):
             if worker == alternate:
                 raise ValueError("Choose a distinct rescue provider or profile")
             raw = discover(args.repository, args.objective, worker, alternate, args.python)
+            if args.reviewer:
+                raw["reviewer"] = route_config(args.reviewer, args.reviewer_profile, args.reviewer_model, args.reviewer_effort, "reviewer", REVIEWERS)
+            if args.pursue:
+                raw["pursue"] = pursuit_block(args)
+                if raw["budgets"] == {"max_calls": 15, "max_seconds": 3600}:
+                    raw["budgets"] = {"max_calls": 80, "max_seconds": 21600}
             if args.expected_base and raw["expected_base"] != args.expected_base.lower():
                 raise ValueError("The repository moved since preview. Preview its checks again.")
             spec = validate(raw, store=store)
@@ -730,6 +794,17 @@ def main(argv=None):
         elif name in ("call-ledger", "browser-hotspots"):
             from .trajectory import call_ledger, browser_hotspots
             output((call_ledger if name == "call-ledger" else browser_hotspots)(store, args.id))
+        elif name == "pursuit":
+            from .pursuit import format_report, report
+            extension = store.extend_pursuit(args.id, args.add_waves) if args.add_waves is not None else None
+            data = {**report(store, args.id), **({"extension": extension} if extension else {})}
+            if args.json:
+                output(data)
+            else:
+                print(format_report(data))
+                if extension:
+                    print(f"Added {args.add_waves} waves (limit now {extension['max_waves']})."
+                          + (" The run is back at the judge; resume or dispatch it to continue." if extension["resumed"] else ""))
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":

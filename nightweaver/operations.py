@@ -158,6 +158,10 @@ def handoff(store, run_id):
             "operator_feedback": store.feedback_text(run_id),
             "budget": budget_report(store, run_id),
             "waiting_for": pending_dependencies(store, state),
+            **({"pursuit": {"wave": state.get("wave", 1), "max_waves": spec["pursue"]["max_waves"], "target_score": spec["pursue"]["target_score"],
+                            "best_score": state.get("best_score"), "best_commit": state.get("best_commit"),
+                            "judgments": state.get("judgments", []), "open_gaps": state.get("pursuit_gaps", [])}}
+               if spec.get("pursue") else {}),
         }
     )
 
@@ -174,6 +178,11 @@ def handoff_markdown(data):
         for label, items in (("Allowed paths", step["paths"]), ("Checks", step["checks"])):
             if items:
                 lines += ["", label, *[f"- {item}" for item in items]]
+    if pursuit := data.get("pursuit"):
+        lines += ["", "## Goal pursuit", "", f"Wave {pursuit['wave']} of at most {pursuit['max_waves'] + 1}; target score {pursuit['target_score']}; "
+                  f"best score {pursuit['best_score']}"]
+        lines += [f"- Wave {j['wave']}: {j['score']}/100 {j['verdict']}" for j in pursuit["judgments"]]
+        lines += [f"- Open gap: {g['title']}" for g in pursuit["open_gaps"][:5]]
     if data["acceptance"]:
         lines += ["", "## Acceptance requirements", "", *[f"- {item}" for item in data["acceptance"]]]
     if data["waiting_for"]:
@@ -217,7 +226,7 @@ def audit_evidence(store, run_id):
     store.get(run_id)
     root = (store.directory(run_id) / "evidence").resolve()
     files = []
-    for event in store.events(run_id, limit=None, kinds=["gate_finished"]):
+    for event in store.events(run_id, limit=None, kinds=["gate_finished", "judge_gate_finished"]):
         detail = event["details"]
         artifacts = [(a, "artifact") for a in detail.get("artifacts", [])]
         if detail.get("log_sha256"):

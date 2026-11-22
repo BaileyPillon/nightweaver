@@ -145,7 +145,8 @@ class Store:
                    json_extract(spec,'$.project') AS project, json_array_length(spec,'$.milestones') AS total,
                    json_extract(spec,'$.milestones[' || json_extract(state,'$.step') || '].title') AS current
                    FROM runs ORDER BY updated DESC"""
-        keys = ("phase", "step", "accepted", "result_ref", "dispatch", "after", "retry_at", "last_error", "provider_calls")
+        keys = ("phase", "step", "accepted", "result_ref", "dispatch", "after", "retry_at", "last_error", "provider_calls",
+                "wave", "best_score")
         with self.connect() as db:
             result = []
             for row in db.execute(query):
@@ -199,9 +200,46 @@ class Store:
             db.execute("UPDATE runs SET state=?,updated=? WHERE id=?",
                        (json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, kind, details or {})
-            if following_event is not None:
-                self._event(db, run_id, *following_event)
+            for extra in [following_event] if isinstance(following_event, tuple) else following_event or ():
+                self._event(db, run_id, *extra)
         return row["state"]
+
+    def extend_plan(self, run_id, milestones, details, **changes):
+        """Append a planned wave, its state and its event in one transaction."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            first = len(row["spec"]["milestones"]) + 1
+            if first - 1 + len(milestones) > 50:
+                raise ValueError("A run supports at most 50 milestones")
+            row["spec"]["milestones"] = [*row["spec"]["milestones"], *milestones]
+            row["state"].update(changes)
+            db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
+                       (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
+            self._event(db, run_id, "wave_planned", {**details, "first_step": first})
+        return row
+
+    def extend_pursuit(self, run_id, waves):
+        """Grant more waves; a stop at the judge resumes there with a fresh plateau count."""
+        if type(waves) is not int or not 1 <= waves <= 20:
+            raise ValueError("Added waves must be an integer between 1 and 20")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            if not row["spec"].get("pursue"):
+                raise ValueError("This run does not pursue a goal")
+            if row["state"]["phase"] == "done":
+                raise ValueError("The goal was already met")
+            row["spec"]["pursue"]["max_waves"] += waves
+            resumed = row["state"]["phase"] == "blocked" and row["state"].get("blocked_from") == "judging"
+            if resumed:
+                row["state"].update(phase="judging", blocked_from=None, last_error="", provider_issue=None, retry_at=None,
+                                    judge_attempts=0, judge_ledger=None, stale_judgments=0, transient_failures=0)
+            db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
+                       (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
+            self._event(db, run_id, "pursuit_extended", {"waves": waves, "max_waves": row["spec"]["pursue"]["max_waves"],
+                                                          "resumed": resumed})
+        return {"max_waves": row["spec"]["pursue"]["max_waves"], "resumed": resumed, "phase": row["state"]["phase"]}
 
     def pause(self, run_id, value):
         with self.connect() as db:

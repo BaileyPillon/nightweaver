@@ -30,7 +30,7 @@ def lint_plan(spec):
     steps = spec["milestones"]
     minimum_calls = len(steps) * (
         1 + int(bool(spec.get("reviewer"))) + int(bool(spec.get("advisory_ollama")))
-    )
+    ) + int(bool(spec.get("pursue")))
     if (limit := spec["budgets"].get("max_calls")) is not None and limit < minimum_calls:
         findings.append(
             {"severity": "error", "code": "insufficient_calls", "minimum": minimum_calls, "configured": limit}
