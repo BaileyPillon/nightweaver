@@ -7,11 +7,12 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
+import shutil
 import subprocess
 import time
 
 from .process import BusyRun, PausedRun, run_lock
-from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, usage
+from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, usage
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
 from . import context
@@ -23,19 +24,34 @@ class BudgetExceeded(ValueError):
     pass
 
 
-def git_bytes(repo, *args, attributes_from=None):
+GIT_TIMEOUT = 90
+WORKTREE_ADD_TIMEOUT = 900
+IDLE_DEFAULT = 900
+PARK_MARGIN, PARK_UNPARSED, PARK_UNPARSED_MAX = 90, 1800, 7200
+
+
+def use_git_timeout(spec):
+    """The run's git_timeout is the default for every git call this process makes until another run sets its own."""
+    global GIT_TIMEOUT
+    GIT_TIMEOUT = spec.get("git_timeout", 90)
+
+
+def git_bytes(repo, *args, attributes_from=None, timeout=None):
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     if attributes_from is not None:
         env["GIT_ATTR_SOURCE"] = attributes_from
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=90,
+    limit = timeout or GIT_TIMEOUT
+    if args[:2] == ("worktree", "add"):
+        limit = max(limit, WORKTREE_ADD_TIMEOUT)  # a checkout of a very large repository takes minutes
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=limit,
                             creationflags=subprocess.CREATE_NO_WINDOW, env=env)
     if result.returncode:
         raise ValueError(result.stderr.decode("utf-8", "replace").strip() or f"Git {args[0]} failed")
     return result.stdout
 
 
-def git(repo, *args):
-    return git_bytes(repo, *args).decode("utf-8", "replace").rstrip("\r\n")
+def git(repo, *args, timeout=None):
+    return git_bytes(repo, *args, timeout=timeout).decode("utf-8", "replace").rstrip("\r\n")
 
 
 def common_dir(path):
@@ -135,13 +151,26 @@ def tail(path, count=3600):
         return data.read().decode("utf-8", "replace").strip()
 
 
+def tool_dropping(name):
+    """Files that browsers and agent tooling leave behind, never part of a milestone's work."""
+    *folders, leaf = name.split("/")
+    leaf = leaf.casefold()
+    return leaf in ("debug.log", "chrome_debug.log") or leaf.endswith(".dmp") or ".playwright-mcp" in (f.casefold() for f in folders)
+
+
 def tree(path, base, allowed, protected):
     from .contracts import under
     if git(path, "rev-parse", "HEAD") != base:
         raise ValueError("Worktree HEAD changed. Keep agent edits uncommitted.")
     git(path, "add", "-A", "--", ".")
-    names = git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", base).split("\0")
-    names = [name for name in names if name]
+    fields = git(path, "diff", "--cached", "--no-renames", "--name-status", "-z", base).split("\0")
+    changes = list(zip(fields[0::2], fields[1::2]))
+    # Only paths absent from the base can be droppings; a tracked file with such a name stays a real change.
+    dropped = [name for status, name in changes if status == "A" and tool_dropping(name)]
+    for start in range(0, len(dropped), 100):
+        git(path, "--literal-pathspecs", "reset", "-q", "--", *dropped[start:start + 100])
+    skipped = set(dropped)
+    names = [name for _, name in changes if name not in skipped]
     if not names:
         raise ValueError("The milestone produced no tracked changes")
     forbidden = [name for name in names if under(name, protected)]
@@ -193,6 +222,56 @@ def preserve_artifacts(path, output, names, before, max_bytes=32 * 1024 * 1024):
     return recorded
 
 
+def counted_usage(receipt, log, kind, state):
+    """Codex reports usage cumulatively across a resumed thread, so count only what this call added.
+
+    Returns the receipt to record (observed_tokens is the delta, reported_tokens the raw figure) and the state to keep."""
+    session = metadata(Path(log), kind)[0] if kind == "codex" and receipt["observed_tokens"] is not None else None
+    if not session:
+        return receipt, {}
+    sessions, channels = state.get("session_usage", {}), state.get("session_channels", {})
+    seen = channels.get(session, {})
+
+    def added(total, before):
+        return total if before is None or total < before else total - before
+
+    raw = receipt["observed_tokens"]
+    counted = {**receipt, "observed_tokens": added(raw, sessions.get(session)), "reported_tokens": raw, "session": session,
+               "token_channels": {key: added(value, seen.get(key)) for key, value in receipt["token_channels"].items()}}
+    return counted, {"session_usage": {**sessions, session: raw}, "session_channels": {**channels, session: receipt["token_channels"]}}
+
+
+def park_plan(spec, state, error, now, kind):
+    """Decide whether a usage limit is waited out or blocks the run, and until when."""
+    policy = spec.get("retry", {})
+    number = state.get("parks", 0) + 1
+    reset = error.reset_at or reset_after(str(error), now)
+    parsed = reset is not None
+    until = (max(reset, now) + timedelta(seconds=PARK_MARGIN) if parsed else
+             now + timedelta(seconds=min(PARK_UNPARSED_MAX, PARK_UNPARSED * 2 ** (number - 1))))
+    wait = (until - now).total_seconds()
+    name = {"codex": "Codex", "claude": "Claude", "deepseek": "DeepSeek", "gemini": "Gemini"}.get(kind, kind)
+    when = (reset if parsed else until).astimezone()
+    clock = when.strftime("%H:%M" if when.date() == now.astimezone().date() else "%b %d %H:%M")
+    limits = spec.get("budgets", {})
+    deadline = (datetime.fromisoformat(state["started_at"]) + timedelta(seconds=limits["max_seconds"])
+                if limits.get("max_seconds") and state.get("started_at") else None)
+    allowed, longest = policy.get("max_parks", 8), policy.get("max_park_seconds", 21600)
+    if number > allowed:
+        block = (f"{name} usage limit reached and waiting is disabled (retry.max_parks is 0)" if not allowed else
+                 f"{name} usage limit was hit again after {number - 1} waits, the most this run allows (retry.max_parks {allowed})")
+    elif wait > longest:
+        block = (f"{name} usage limit {'resets at ' + clock if parsed else 'gave no reset time and the next retry is at ' + clock}, "
+                 f"{wait / 3600:.1f} hours away, longer than this run waits (retry.max_park_seconds {longest})")
+    elif deadline and until > deadline:
+        block = (f"{name} usage limit resets at {clock}, after this run's time budget" if parsed else
+                 f"{name} usage limit gave no reset time and the next retry at {clock} is after this run's time budget")
+    else:
+        block = None
+    return {"block": block, "park": number, "parsed": parsed, "until": until.isoformat(timespec="milliseconds"),
+            "reset": reset.isoformat(timespec="seconds") if parsed else None, "seconds": round(wait)}
+
+
 class Run:
     def __init__(self, store, run_id):
         self.store = store
@@ -229,13 +308,14 @@ class Run:
                   [self.spec["reviewer"], *self.spec.get("reviewer_fallbacks", [])])
         return routes[min(state.get(role + "_route", 0), len(routes) - 1)]
 
-    def finish_call(self, pending, *, recovered=False):
-        receipt = usage(Path(pending["log"]), pending["provider"])
+    def finish_call(self, pending, *, recovered=False, succeeded=False):
         state = self.store.get(self.id)["state"]
+        receipt, sessions = counted_usage(usage(Path(pending["log"]), pending["provider"]), pending["log"], pending["provider"], state)
         self.set("provider_call_finished", {**pending, **receipt, "recovered": recovered,
                  "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds())},
                  pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
-                 usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None))
+                 usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None), **sessions,
+                 **({"parks": 0} if succeeded and state.get("parks") else {}))
 
     def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None):
         self.check_budget(call=True)
@@ -254,17 +334,32 @@ class Run:
                   "heartbeat": lambda info: self.set("process_heartbeat", {**info, "role": role})}
         if "idle_timeout" in limits:
             health["idle_timeout"] = limits["idle_timeout"]
+        elif role in ("worker", "reviewer", "judge", "planner"):
+            health["idle_timeout"] = IDLE_DEFAULT  # a silent stall otherwise runs to the full agent timeout
+        returned = False
         try:
-            return invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
-                          session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
+            result = invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
+                            session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
+            returned = True
+            return result
         finally:
-            self.finish_call(pending)
+            self.finish_call(pending, succeeded=returned)
 
     def worktree(self, state):
+        use_git_timeout(self.spec)
         path = self.root / "worktrees" / f"{state['step'] + 1:02d}"
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            git(self.repository, "worktree", "add", "--detach", str(path), state["accepted"])
+            try:
+                git(self.repository, "worktree", "add", "--detach", str(path), state["accepted"])
+            except subprocess.TimeoutExpired as error:
+                shutil.rmtree(path, ignore_errors=True)  # a half-made checkout would otherwise block every retry
+                try:
+                    git(self.repository, "worktree", "prune")
+                except (ValueError, subprocess.TimeoutExpired):
+                    pass
+                raise ValueError(f"Creating the run worktree took more than {int(error.timeout)} seconds on this repository. "
+                                 "Raise git_timeout in the plan, then resume with --retry.") from error
             self.set("worktree_ready", {"path": str(path), "base": state["accepted"]})
         if not (path / ".git").is_file():
             raise ValueError(f"The run worktree is missing its Git link: {path}")
@@ -788,9 +883,19 @@ class Run:
                                  phase=next_phase, **{role + "_route": index + 1}, **({"route_rejections": 0} if role == "worker" else {}),
                                  last_error=str(error), transient_failures=0, retry_at=None, **refund)
                         continue
+                    if error.kind == "usage_limit":
+                        plan = park_plan(self.spec, current, error, datetime.now(timezone.utc), config["kind"])
+                        if plan["block"] is None:
+                            self.set("provider_parked", {"issue": str(error), **{k: plan[k] for k in ("until", "reset", "seconds", "parsed", "park")},
+                                     **provider}, phase=next_phase, parks=plan["park"], retry_at=plan["until"], **refund)
+                            continue
+                        self.set("provider_unavailable", {"issue": plan["block"], "provider_message": str(error), **provider}, phase="blocked",
+                                 blocked_from="ready" if actual == "working" else actual, last_error=plan["block"],
+                                 provider_issue=provider, parks=0)
+                        return "blocked"
                     failures = current.get("transient_failures", 0)
                     policy = self.spec.get("retry", {})
-                    if error.kind in ("usage_limit", "transient") and failures < policy.get("transient_attempts", 2):
+                    if error.kind == "transient" and failures < policy.get("transient_attempts", 2):
                         delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** failures)
                         self.set("provider_retry_scheduled", {"issue": str(error), "seconds": delay, **provider},
                                  phase=next_phase, transient_failures=failures + 1, **refund,

@@ -1,6 +1,7 @@
 """Use native authenticated CLIs and an optional loopback model."""
 
 from contextlib import ExitStack
+from datetime import datetime, time, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ from urllib.request import Request, urlopen
 
 from .process import execute
 from .store import default_home
-from .safety import json_events
+from .safety import json_events, redact
 
 
 READ_ONLY = ("reviewer", "judge", "replanner")
@@ -35,9 +36,149 @@ SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "requir
 class ProviderUnavailable(ValueError):
     """An account or service problem that another coding attempt cannot fix."""
 
-    def __init__(self, message, kind="unavailable"):
+    def __init__(self, message, kind="unavailable", reset_at=None):
         super().__init__(message)
         self.kind = kind
+        self.reset_at = reset_at
+
+
+MONTHS = {name: number for number, name in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+CUE = r"(?:reset\w*|retry\w*|try again|available|until)\W{0,4}(?:(?:at|on|after|by|time)\b\W{0,3})*"
+CLOCK = r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*\((?P<z>[A-Za-z][A-Za-z_+\-/0-9]{1,40})\))?"
+ISO = r"(?P<iso>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s?(?:Z|[+-]\d{2}:?\d{2})?)(?:\s*\((?P<z>[A-Za-z][A-Za-z_+\-/0-9]{1,40})\))?"
+DATED = (r"(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(?P<year>\d{4}))?,?\s*(?:at\s+)?"
+         + CLOCK)
+
+
+def zone_named(name):
+    if not name:
+        return None
+    if name.upper() in ("UTC", "GMT", "Z", "ETC/UTC"):
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except (ImportError, KeyError, ValueError, OSError):
+        return None
+
+
+def wall_clock(hour, minute, meridiem):
+    """24-hour (hour, minute) from a clock reading, or None when it is not a time of day."""
+    minute = int(minute or 0)
+    hour = int(hour)
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem[0].lower() == "p" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def in_zone(naive, zone):
+    return (naive.replace(tzinfo=zone) if zone else naive.astimezone()).astimezone(timezone.utc)
+
+
+def reset_after(message, now=None):
+    """The UTC moment a usage limit lifts, read from a provider's message, or None when it names none.
+
+    Understands epoch seconds in JSON (resetsAt, reset_at), ISO-8601 stamps, dated and plain clock times
+    ("resets 3:30pm (America/New_York)", "try again at Nov 22nd, 2026 3:42 PM") and relative waits
+    ("try again in 2 hours 13 minutes", "in 47m"). A clock time uses its named IANA zone when this system
+    knows it, otherwise local time, and rolls to tomorrow when today's has passed."""
+    if not isinstance(message, str):
+        return None
+    now = now or datetime.now(timezone.utc)
+    now = now.astimezone() if now.tzinfo is None else now
+    epochs = re.findall(r"(?:reset\w*_?at|reset_?time|limit reached\|)\W{0,4}(\d{9,13})(?![\d:])", message, re.I)
+    if epochs:
+        value = int(epochs[-1])
+        return datetime.fromtimestamp(value / 1000 if value > 10 ** 11 else value, timezone.utc)
+    seconds = re.search(r"(?:retry[_-]?after(?:_seconds)?|reset[s_]?_?in(?:_seconds)?|reset_?after(?:_seconds)?)\W{0,4}(\d+(?:\.\d+)?)(?![\d:])", message, re.I)
+    if seconds:
+        return now + timedelta(seconds=float(seconds.group(1)))
+    for found in re.finditer(CUE + ISO, message, re.I):
+        text = re.sub(r"^(\d{4}-\d{2}-\d{2}) ", lambda day: day.group(1) + "T", found.group("iso").strip()).replace(" ", "")
+        text = re.sub(r"Z$", "+00:00", text, flags=re.I)
+        text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
+        text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+        try:
+            stamp = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo else in_zone(stamp, zone_named(found.group("z")))
+    relative = re.search(r"\b(?:in|after)\s+((?:\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])[\s,]*(?:and\s+)?)+)",
+                         message, re.I)
+    if relative:
+        total = sum(float(n) * UNITS[unit[0].lower()] for n, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+)", relative.group(1), re.I))
+        return now + timedelta(seconds=total)
+    for found in re.finditer(CUE + DATED, message, re.I):
+        clock = wall_clock(found.group("h"), found.group("m"), found.group("ap"))
+        zone = zone_named(found.group("z"))
+        if clock is None or (found.group("m") is None and not found.group("ap")):
+            continue
+        today = now.astimezone(zone).date() if zone else now.astimezone().date()
+        year = int(found.group("year") or today.year)
+        try:
+            when = in_zone(datetime(year, MONTHS[found.group("mon").lower()], int(found.group("day")), *clock), zone)
+            if found.group("year") is None and when < now - timedelta(days=1):
+                when = in_zone(datetime(year + 1, when.month, when.day, *clock), zone)
+        except (ValueError, OverflowError):
+            continue
+        return when
+    for found in re.finditer(CUE + CLOCK, message, re.I):
+        clock = wall_clock(found.group("h"), found.group("m"), found.group("ap"))
+        if clock is None or (found.group("m") is None and not found.group("ap")):
+            continue
+        zone = zone_named(found.group("z"))
+        today = now.astimezone(zone).date() if zone else now.astimezone().date()
+        when = in_zone(datetime.combine(today, time(*clock)), zone)
+        if when <= now:
+            when = in_zone(datetime.combine(today + timedelta(days=1), time(*clock)), zone)
+        return when
+    return None
+
+
+OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
+# Credentials of another vendor's route never belong in a child that does not use them.
+FOREIGN_CREDENTIALS = (OAUTH_VARIABLE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY")
+
+
+def user_environment(name):
+    """A user-level environment variable straight from the registry, for processes started before it was set."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value = winreg.QueryValueEx(key, name)[0]
+    except (ImportError, OSError):
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def token_from_file(path):
+    try:
+        token = Path(path).expanduser().read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError) as error:
+        raise ProviderUnavailable("Claude's configured oauth_token_file could not be read. Fix the file or remove oauth_token_file.",
+                                  "missing_credentials") from error
+    if not token or not token.isascii() or any(char.isspace() for char in token):
+        raise ProviderUnavailable("Claude's oauth_token_file must hold one token with no spaces. "
+                                  "Create it with claude setup-token.", "missing_credentials")
+    return token
+
+
+def claude_auth(config=None):
+    """(long-lived token or None, source) for a Claude route. The token is never logged or returned to a report."""
+    config = config or {}
+    if config.get("oauth_token_file"):
+        return token_from_file(config["oauth_token_file"]), "oauth_token_file"
+    if os.environ.get(OAUTH_VARIABLE, "").strip():
+        return os.environ[OAUTH_VARIABLE].strip(), "oauth_token_env"
+    if token := user_environment(OAUTH_VARIABLE):
+        return token, "oauth_token_user_env"
+    profile = Path(profile_override({**config, "kind": "claude"}) or Path.home() / ".claude").expanduser()
+    return None, "cli_login" if (profile / ".credentials.json").is_file() else "none"
 
 
 def provider_executable(config):
@@ -89,6 +230,8 @@ def check_provider(config, cwd):
                                   "missing_profile")
     if config["kind"] == "deepseek":
         deepseek_key(config)
+    if config["kind"] == "claude":
+        claude_auth(config)
     return executable
 
 
@@ -136,6 +279,14 @@ def adapter(config, mode, session=None, images=()):
         return config["argv"], env
     exe = provider_executable(config)
     model = config.get("model")
+    if kind in ("codex", "gemini"):
+        for variable in FOREIGN_CREDENTIALS:
+            env.pop(variable, None)
+    elif kind == "claude":
+        env.pop("DEEPSEEK_API_KEY", None)
+        token, _ = claude_auth(config)
+        if token:
+            env[OAUTH_VARIABLE] = token
     if kind == "deepseek":
         key = deepseek_key(config)
         model = model or "deepseek-flash"
@@ -323,6 +474,10 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
                 r"invalid.*api.?key|authentication_error|authentication.fail|insufficient.balance|invalid.authentication", detail, re.I):
             raise ProviderUnavailable("DeepSeek reported an API credential or balance error. "
                                       "Check the configured key and API account, then resume with --retry.", "credentials_or_balance")
+        if config["kind"] == "claude" and re.search(r"reached its time limit|cannot be renewed|setup-token", detail, re.I):
+            raise ProviderUnavailable("The Claude login on this machine expired and cannot be renewed. Run claude setup-token, "
+                                      f"set the user environment variable {OAUTH_VARIABLE} to the token (or point this route's "
+                                      "oauth_token_file at a file holding it), then resume this run with --retry.", "authentication")
         if re.search(r"authentication_failed|failed to authenticate|not logged in|please (?:log|sign) in|refresh token.*expired|token.*(expired|revoked)", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} authentication needs renewal for the selected profile. "
                                       "Sign in with that CLI, then resume this run with --retry.", "authentication")
@@ -337,9 +492,17 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if re.search(r"credit balance.*(?:low|insufficient)|billing.hard.limit|insufficient credits", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a billing or credit balance problem. Check the selected account.",
                                       "billing")
-        if re.search(r"usage limit|rate.limit|quota exceeded|too many requests|(?:HTTP|status|API error)[: ]+429\b", detail, re.I):
-            raise ProviderUnavailable(f"{config['kind']} reached a rate or usage limit. Retry after the limit resets.",
-                                      "usage_limit")
+        if re.search(r"usage limit|hit your limit|rate.limit|quota exceeded|too many requests|(?:HTTP|status|API error)[: ]+429\b", detail, re.I):
+            now = datetime.now(timezone.utc)
+            with log.open("rb") as stream:
+                stream.seek(max(0, log.stat().st_size - 16000))
+                tail = stream.read().decode("utf-8", "replace")
+            reset = reset_after(detail, now) or reset_after(tail, now)
+            quote = re.search(r"[^\n\"{}]{0,120}(?:usage limit|hit your limit|rate.?limit|quota exceeded|too many requests|\b429\b)[^\n\"{}]{0,200}",
+                              detail, re.I)
+            note = f" Provider said: {redact(' '.join(quote.group(0).split()))}" if quote else ""
+            raise ProviderUnavailable(f"{config['kind']} reached a rate or usage limit. Retry after the limit resets.{note}",
+                                      "usage_limit", reset)
         if re.search(r"ECONNRESET|ETIMEDOUT|temporarily unavailable|service unavailable|(?:HTTP|status|API error)[: ]+50[234]\b", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a temporary network or service failure.", "transient")
         if re.search(r"model_not_found|unsupported model|model .*?(?:not found|does not exist|not supported|not available)", detail, re.I):

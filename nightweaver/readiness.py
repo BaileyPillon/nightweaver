@@ -12,11 +12,16 @@ from urllib.request import urlopen
 from uuid import uuid4
 
 from .engine import source_info
-from .providers import ProviderUnavailable, advisory, check_provider, describe_provider, invoke
+from .providers import ProviderUnavailable, advisory, check_provider, claude_auth, describe_provider, invoke
 
 
 def check_route(store, config, cwd, live):
     result = describe_provider(config)
+    if config["kind"] == "claude":
+        try:
+            result["auth"] = claude_auth(config)[1]  # the source only; the token itself is never reported
+        except ProviderUnavailable:
+            result["auth"] = "oauth_token_file"
     try:
         result["executable"] = check_provider(config, cwd)
     except ProviderUnavailable as error:
@@ -167,6 +172,10 @@ def diagnose(store, spec=None, planner=None, live=False):
         for index, step in enumerate(spec["milestones"], 1):
             roles.extend((f"worker {index} fallback {number}", route) for number, route in enumerate(step.get("worker_fallbacks", []), 1))
         roles.extend((f"reviewer fallback {number}", route) for number, route in enumerate(spec.get("reviewer_fallbacks", []), 1))
+        if pursue := spec.get("pursue"):
+            roles.append(("pursuit judge", pursue["judge"]))
+            roles.extend((f"pursuit judge fallback {number}", route) for number, route in enumerate(pursue.get("judge_fallbacks", []), 1))
+            roles.append(("pursuit planner", pursue["planner"]))
     if planner:
         roles.insert(0, ("planner", planner))
     routes = {}
@@ -177,6 +186,8 @@ def diagnose(store, spec=None, planner=None, live=False):
             routes[key] = {**check_route(store, config, cwd, live), "roles": []}
         routes[key]["roles"].append(role)
     report["providers"] = list(routes.values())
+    claude = next((p for p in report["providers"] if p.get("provider") == "claude"), None)
+    report["claude_auth"] = claude["auth"] if claude else claude_auth()[1]
     if spec and "advisory_ollama" in spec:
         report["providers"].append(ollama_readiness(spec["advisory_ollama"], live))
     return report
