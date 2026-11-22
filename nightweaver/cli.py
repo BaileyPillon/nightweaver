@@ -378,6 +378,24 @@ def main(argv=None):
     single = commands.add_parser("event", help="Inspect one exact evidence event within a run")
     single.add_argument("id")
     single.add_argument("seq", type=int)
+    wisher = commands.add_parser("wish", help="Turn one line into a fully specified goal-pursuit run: brief, checks, models and pursuit")
+    wisher.add_argument("target", help="Repository folder or bound project name")
+    wisher.add_argument("wish", help="The wish, in one line")
+    wisher.add_argument("--roster", choices=("default", "fast"), default="default",
+                        help="default: extra-high effort everywhere; fast: CLI defaults and no reviewer or advisory")
+    wisher.add_argument("--brief-kind", choices=("claude", "codex", "deepseek"), help="Brief writer (default claude claude-opus-5-5 xhigh)")
+    wisher.add_argument("--brief-model")
+    wisher.add_argument("--brief-effort")
+    wisher.add_argument("--waves", type=int, help="Additional waves allowed after the initial plan (1 to 20, default 3)")
+    wisher.add_argument("--target-score", type=int, help="Judge score from 0 to 100 that counts as done (default 88)")
+    wisher.add_argument("--reference", action="append", default=[], metavar="IMAGE",
+                        help="Reference image the judge compares screenshots with (repeatable, at most 6)")
+    wisher.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
+                        help="With --start, launch under a dedicated crash supervisor with this lifetime restart allowance")
+    wish_launch = wisher.add_mutually_exclusive_group()
+    wish_launch.add_argument("--preview", action="store_true", help="Write the brief and template and stop before any planner call")
+    wish_launch.add_argument("--start", action="store_true", help="Plan with the pursuit planner and start a dedicated runner now")
+    wisher.add_argument("--wait", action="store_true", help="With --start, run through verification and return the outcome")
     for parser in (one, add, goal):
         parser.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
                             help="Launch under a dedicated crash supervisor with this lifetime restart allowance")
@@ -744,6 +762,9 @@ def main(argv=None):
             result = register(store, spec, args) if args.direct else plan_goal(store, args, raw)
             output(result)
             return launch_exit(result)
+        if name == "wish":
+            from .wish import run_wish
+            return run_wish(store, args)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
