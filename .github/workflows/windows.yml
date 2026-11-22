@@ -8,7 +8,11 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -16,10 +20,28 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+      - run: python -m pip install -e ".[browser]"
+      - run: python -m playwright install chromium
+      - name: Run test shard ${{ matrix.shard }} of 4
+        shell: pwsh
+        run: |
+          $modules = Get-ChildItem tests -Filter 'test_*.py' | Sort-Object Name | ForEach-Object Name
+          $failed = @()
+          for ($i = 0; $i -lt $modules.Count; $i++) {
+            if ($i % 4 -ne ${{ matrix.shard }}) { continue }
+            python -m unittest discover -s tests -p $modules[$i] -v
+            if ($LASTEXITCODE) { $failed += $modules[$i] }
+          }
+          if ($failed) { "Failed modules: $($failed -join ', ')"; exit 1 }
+
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.x'
-      - run: python -m pip install -e ".[browser]"
-      - run: python -m playwright install chromium
-      - run: python -m unittest discover -s tests -v
       - run: dotnet build Nightweaver.Desktop -c Release
