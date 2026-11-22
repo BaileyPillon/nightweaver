@@ -15,7 +15,7 @@ from .store import default_home
 from .safety import json_events, redact
 
 
-READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking")
+READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking", "diagnosis")
 JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["verdict", "score", "criteria", "gaps", "reason"],
                 "properties": {"verdict": {"enum": ["MET", "NOT_MET"]}, "score": {"type": "integer", "minimum": 0, "maximum": 100},
                                "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": False,
@@ -38,10 +38,14 @@ COMPARISON_SCHEMA = {"type": "object", "additionalProperties": False, "required"
 RANKING_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ranking", "reason"],
                   "properties": {"ranking": {"type": "array", "minItems": 2, "maxItems": 4, "items": {"type": "string"}},
                                  "reason": {"type": "string"}}}
+DIAGNOSIS_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["diagnosis", "strategies"],
+                    "properties": {"diagnosis": {"type": "string"}, "strategies": {"type": "array", "minItems": 2, "maxItems": 4, "items": {
+                        "type": "object", "additionalProperties": False, "required": ["name", "approach"],
+                        "properties": {"name": {"type": "string"}, "approach": {"type": "string"}}}}}}
 SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
                         "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}},
            "judge": JUDGE_SCHEMA, "replanner": WAVE_SCHEMA, "directions": DIRECTIONS_SCHEMA, "comparison": COMPARISON_SCHEMA,
-           "ranking": RANKING_SCHEMA}
+           "ranking": RANKING_SCHEMA, "diagnosis": DIAGNOSIS_SCHEMA}
 
 
 class ProviderUnavailable(ValueError):

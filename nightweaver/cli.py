@@ -269,6 +269,9 @@ def pursuit_block(args):
             block[key] = value
     if args.reference:
         block["references"] = [str(Path(item).expanduser().resolve()) for item in args.reference]
+    if args.rescue_strategies is not None:
+        # 0 turns the plateau rescue off; the rescue is otherwise on, with three strategies and one rescue per run.
+        block["rescue"] = {"max_rescues": 0} if args.rescue_strategies == 0 else {"strategies": args.rescue_strategies}
     if args.explore is not None:
         block["explore"] = {"directions": args.explore}
         if args.explore_workers:
@@ -376,6 +379,8 @@ def main(argv=None):
                      help="Before milestone 1, build N divergent design directions, compare them and keep the winner (2 to 4; requires --pursue)")
     one.add_argument("--explore-workers", metavar="KIND[,KIND...]",
                      help="Workers that build the directions in turn: codex, claude, deepseek or gemini (default: the primary worker)")
+    one.add_argument("--rescue-strategies", type=int, metavar="N",
+                     help="When progress stalls, try N divergent strategies from the best build (2 to 4, default 3; 0 turns the rescue off; requires --pursue)")
     launch_one = one.add_mutually_exclusive_group()
     launch_one.add_argument("--preview", action="store_true", help="Print the reusable plan and its checks without calling a model")
     launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
@@ -674,7 +679,7 @@ def main(argv=None):
         if action == "list":
             p.add_argument("--compact", action="store_true", help="Return sidebar summaries without prompts and gate definitions")
         p.add_argument("--project")
-        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","planning","done","blocked"))
+        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","rescuing","planning","done","blocked"))
     args = app.parse_args(argv)
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
@@ -691,7 +696,7 @@ def main(argv=None):
                   ("--judge-profile", args.judge_profile), ("--planner-kind", args.planner_kind), ("--planner-model", args.planner_model),
                   ("--planner-effort", args.planner_effort), ("--planner-profile", args.planner_profile), ("--waves", args.waves),
                   ("--target-score", args.target_score), ("--reference", args.reference), ("--explore", args.explore is not None),
-                  ("--explore-workers", args.explore_workers)) if value]
+                  ("--explore-workers", args.explore_workers), ("--rescue-strategies", args.rescue_strategies is not None)) if value]
         if extras:
             app.error(f"{', '.join(extras)} require --pursue")
     if args.command == "oneshot":

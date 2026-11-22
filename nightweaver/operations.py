@@ -160,7 +160,8 @@ def handoff(store, run_id):
             "waiting_for": pending_dependencies(store, state),
             **({"pursuit": {"wave": state.get("wave", 1), "max_waves": spec["pursue"]["max_waves"], "target_score": spec["pursue"]["target_score"],
                             "best_score": state.get("best_score"), "best_commit": state.get("best_commit"),
-                            "judgments": state.get("judgments", []), "open_gaps": state.get("pursuit_gaps", [])}}
+                            "judgments": state.get("judgments", []), "open_gaps": state.get("pursuit_gaps", []),
+                            "rescues_used": state.get("rescues_used", 0)}}
                if spec.get("pursue") else {}),
         }
     )
@@ -180,7 +181,7 @@ def handoff_markdown(data):
                 lines += ["", label, *[f"- {item}" for item in items]]
     if pursuit := data.get("pursuit"):
         lines += ["", "## Goal pursuit", "", f"Wave {pursuit['wave']} of at most {pursuit['max_waves'] + 1}; target score {pursuit['target_score']}; "
-                  f"best score {pursuit['best_score']}"]
+                  f"best score {pursuit['best_score']}" + (f"; plateau rescues used {pursuit['rescues_used']}" if pursuit.get("rescues_used") else "")]
         lines += [f"- Wave {j['wave']}: {j['score']}/100 {j['verdict']}" for j in pursuit["judgments"]]
         lines += [f"- Open gap: {g['title']}" for g in pursuit["open_gaps"][:5]]
     if data["acceptance"]:

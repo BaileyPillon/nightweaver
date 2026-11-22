@@ -145,13 +145,18 @@ def compact(gaps):
     return [{"title": g["title"], "detail": g["detail"][:500]} for g in gaps[:8]]
 
 
+def judged_lines(run):
+    lines = []
+    for event in run.store.events(run.id, limit=None, kinds=["goal_judged"]):
+        d = event["details"]
+        lines.append(f"- Wave {d['wave']}: {d['score']}/100 {d['verdict']} at {d['commit'][:12]}. Top gaps: {titles(d.get('gaps', []))}")
+    return lines
+
+
 def judge_prompt(run, state, results, images, references):
     pursue = run.spec["pursue"]
     criteria = pursue["criteria"] or run.spec.get("acceptance", [])
-    history = []
-    for event in run.store.events(run.id, limit=None, kinds=["goal_judged"]):
-        d = event["details"]
-        history.append(f"- Wave {d['wave']}: {d['score']}/100 {d['verdict']} at {d['commit'][:12]}. Top gaps: {titles(d.get('gaps', []))}")
+    history = judged_lines(run)
     summary = [f"- {'PASS' if r['passed'] else 'FAIL'} {r['name']}" + ("" if r["passed"] else f": {r['note'][:400]}") + f" (log: {r['log']})"
                for r in results]
     parts = [
@@ -237,6 +242,13 @@ def revert(run, state, wave, current, best):
     return discarded
 
 
+def stopping(reason, wave, best_score, best_commit, best_gaps):
+    """The message and event of a pursuit that stops without meeting its goal."""
+    message = (f"Goal not met after {wave} wave{'s' * (wave != 1)} (best score {best_score}/100). "
+               f"Top gaps: {titles(best_gaps)}")
+    return message, ("pursuit_stopped", {"reason": reason, "best_score": best_score, "best_commit": best_commit, "waves": wave})
+
+
 def judge(run, state):
     run.spec = run.store.get(run.id)["spec"]
     pursue, wave, commit = run.spec["pursue"], state.get("wave", 1), state["accepted"]
@@ -303,11 +315,19 @@ def judge(run, state):
         result["accepted"] = kept["best_commit"]
         note = (f"Wave {wave} scored {score}/100, below the best score of {kept['best_score']}/100, so its changes were discarded "
                 f"(saved at {discarded}). Plan from the best build. That wave's own gaps: {titles(verdict['gaps'])}.")
+    if stop == "plateau":
+        from . import rescue
+        if rescue.available(run, state):
+            # Progress stalled on the best build: diagnose why and try divergent strategies before giving up.
+            drop_worktree(run, state)
+            started, fresh = rescue.begin(run, state, wave, kept)
+            run.set("goal_judged", payload, following_event=[*events, ("rescue_started", started)], phase="rescuing", rescue=fresh,
+                    last_error="", retry_at=None, planner_route=0, **result)
+            return
     if stop:
         drop_worktree(run, state)
-        message = (f"Goal not met after {wave} wave{'s' * (wave != 1)} (best score {kept['best_score']}/100). "
-                   f"Top gaps: {titles(result['best_gaps'])}")
-        events.append(("pursuit_stopped", {"reason": stop, "best_score": kept["best_score"], "best_commit": kept["best_commit"], "waves": wave}))
+        message, stopped = stopping(stop, wave, kept["best_score"], kept["best_commit"], result["best_gaps"])
+        events.append(stopped)
         run.set("goal_judged", payload, following_event=events, phase="blocked", blocked_from="judging", last_error=message, **result)
         return
     run.set("goal_judged", payload, following_event=events, phase="planning", plan_attempts=0, planner_route=0, last_error="",
@@ -421,6 +441,8 @@ def report(store, run_id):
     events = store.events(run_id, limit=None, kinds=["wave_planned", "milestone_accepted", "goal_judged", "pursuit_reverted",
                                                       "pursuit_stopped", "pursuit_extended", "goal_met"])
     planned = [e["details"] for e in events if e["kind"] == "wave_planned"]
+    from .rescue import report as rescue_report
+    rescued = rescue_report(store, run_id)
     firsts = [1, *(d["first_step"] for d in planned)]
     accepted = {e["details"]["step"]: e["details"] for e in events if e["kind"] == "milestone_accepted"}
     waves = []
@@ -430,6 +452,8 @@ def report(store, run_id):
         judged = next((e["details"] for e in reversed(events) if e["kind"] == "goal_judged" and e["details"]["wave"] == number), None)
         reverted = next((e["details"] for e in reversed(events) if e["kind"] == "pursuit_reverted" and e["details"]["wave"] == number), None)
         waves.append({"wave": number, "planned_by": planned[index - 1]["planner"] if index else None,
+                      **({"rescue_strategy": planned[index - 1]["strategy"]} if index and planned[index - 1].get("rescue") else {}),
+                      **({"rescue": found} if (found := next((r for r in rescued if r["wave"] == number), None)) else {}),
                       "milestones": [{"step": n, "title": spec["milestones"][n - 1]["title"], "accepted": n in accepted,
                                       "commit": accepted.get(n, {}).get("commit")} for n in range(first, last + 1)],
                       "judgment": None if judged is None else {k: judged[k] for k in ("verdict", "score", "commit", "gaps", "reason")}
@@ -459,7 +483,8 @@ def format_report(data):
         from .explore import format_lines
         lines += format_lines(data["exploration"])
     for wave in data["waves"]:
-        lines += ["", f"Wave {wave['wave']}" + (f" (planned by {wave['planned_by'].get('kind')})" if wave["planned_by"] else " (initial plan)")]
+        lines += ["", f"Wave {wave['wave']}" + (f" (rescue: {wave['rescue_strategy']})" if wave.get("rescue_strategy") else
+                                                 f" (planned by {wave['planned_by'].get('kind')})" if wave["planned_by"] else " (initial plan)")]
         lines += [f"  {m['step']}. {m['title']} - " + (f"accepted {m['commit'][:12]}" if m["accepted"] else "not accepted") for m in wave["milestones"]]
         if judgment := wave["judgment"]:
             lines.append(f"  Judged {judgment['verdict']} {judgment['score']}/100 at {judgment['commit'][:12]}, "
@@ -469,6 +494,9 @@ def format_report(data):
         if wave["reverted"]:
             lines.append(f"  Reverted to {wave['reverted']['to'][:12]} (score {wave['reverted']['score']} against best {wave['reverted']['best_score']}); "
                          f"discarded work kept at {wave['reverted']['discarded_ref']}")
+        if wave.get("rescue"):
+            from .rescue import format_lines as rescue_lines
+            lines += rescue_lines(wave["rescue"])
     if data["met"]:
         lines += ["", "Goal met."]
     elif data["stopped"]:

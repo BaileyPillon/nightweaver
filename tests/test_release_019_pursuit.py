@@ -119,7 +119,8 @@ class PursuitTests(unittest.TestCase):
         self.assertEqual(metrics(self.store, run)["pursuit"]["waves"], 2)
 
     def test_plateau_stops_on_the_best_build(self):
-        run = self.pursue([judged(60), judged(62), judged(61), judged(60)], [plan("Round")], extra_pursue={"max_waves": 10})
+        # The plateau rescue is on by default; with max_rescues 0 a plateau stops the pursuit exactly as in 0.19.
+        run = self.pursue([judged(60), judged(62), judged(61), judged(60)], [plan("Round")], extra_pursue={"max_waves": 10, "rescue": {"max_rescues": 0}})
         self.assertEqual(Run(self.store, run).run(), "blocked")
         state = self.store.get(run)["state"]
         judgments = self.events(run, "goal_judged")
@@ -372,7 +373,8 @@ class PursuitSpecTests(unittest.TestCase):
     def test_defaults_are_filled(self):
         pursue = validate(self.raw())["pursue"]
         self.assertEqual(pursue, {"judge": {"kind": "codex"}, "judge_fallbacks": [], "planner": {"kind": "codex"}, "max_waves": 3, "wave_size": 3,
-                                  "target_score": 85, "plateau": 2, "regression_margin": 5, "references": [], "criteria": ["Beautiful"]})
+                                  "target_score": 85, "plateau": 2, "regression_margin": 5, "references": [], "criteria": ["Beautiful"],
+                                  "rescue": {"strategies": 3, "max_rescues": 1}})
         self.assertIsNot(pursue["planner"], pursue["judge"])
         full = validate(self.raw(planner={"kind": "claude", "effort": "high"}, criteria=["Fast"], max_waves=20, wave_size=5, target_score=0,
                                  plateau=5, regression_margin=50, judge_fallbacks=[{"kind": "gemini"}]))["pursue"]

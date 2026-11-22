@@ -727,9 +727,11 @@ class Run:
         evidence = self.evidence_dir(state)
         try:
             raw = (evidence / "checks.json").read_bytes()
-            # The manifest of a direction that won the exploration tournament holds receipts from that direction's evidence folder.
-            won = state.get("exploration") or {}
-            root = Path(won["evidence"]) if state["step"] == 0 and won.get("evidence") and won.get("checks_sha256") == hashlib.sha256(raw).hexdigest() else evidence
+            # The manifest of a direction or rescue strategy that won its tournament holds receipts from that candidate's evidence folder.
+            digest = hashlib.sha256(raw).hexdigest()
+            won = next((w for w in (state.get("exploration"), state.get("rescue")) if w and w.get("evidence") and w.get("checks_sha256") == digest
+                        and w.get("step", 0) == state["step"]), None)
+            root = Path(won["evidence"]) if won else evidence
             if state.get("checks_sha256") and hashlib.sha256(raw).hexdigest() != state["checks_sha256"]:
                 raise ValueError("The accepted check manifest changed")
             checks = json.loads(raw)
@@ -979,9 +981,9 @@ class Run:
                 if self.store.get(self.id)["pause"]:
                     self.set("runner_stopped", {"phase": phase})
                     return "paused"
-                if phase in ("judging", "planning") and not self.spec.get("pursue"):
+                if phase in ("judging", "planning", "rescuing") and not self.spec.get("pursue"):
                     raise ValueError(f"Unrecognized run state: {phase}")
-                step = None if phase in ("judging", "planning") else self.spec["milestones"][state["step"]]
+                step = None if phase in ("judging", "planning", "rescuing") else self.spec["milestones"][state["step"]]
                 try:
                     self.check_budget()
                     if state.get("retry_at") and (wait := (datetime.fromisoformat(state["retry_at"]) - datetime.now(timezone.utc)).total_seconds()) > 0:
@@ -1001,6 +1003,10 @@ class Run:
                     if phase in ("judging", "planning"):
                         from . import pursuit
                         (pursuit.judge if phase == "judging" else pursuit.plan_wave)(self, state)
+                        continue
+                    if phase == "rescuing":
+                        from . import rescue
+                        rescue.advance(self, state)
                         continue
                     if phase in ("queued", "ready", "exploring") and self.explores(state):
                         from . import explore
@@ -1042,14 +1048,14 @@ class Run:
                     current = self.store.get(self.id)["state"]
                     actual = current["phase"]
                     role = {"reviewing": "reviewer", "judging": "judge", "planning": "planner"}.get(actual, "worker")
-                    if actual == "exploring":
-                        from . import explore
-                        role, config = explore.active_route(self, current)
+                    if actual in ("exploring", "rescuing"):
+                        from . import explore, rescue
+                        role, config = (explore if actual == "exploring" else rescue).active_route(self, current)
                     else:
                         config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}
                     pursue = self.spec.get("pursue", {})
-                    routes = {"worker": [] if actual == "exploring" else (step or {}).get("worker_fallbacks", []),
+                    routes = {"worker": [] if actual in ("exploring", "rescuing") else (step or {}).get("worker_fallbacks", []),
                               "reviewer": self.spec.get("reviewer_fallbacks", []),
                               "judge": pursue.get("judge_fallbacks", []), "planner": []}[role]
                     index = current.get(role + "_route", 0)

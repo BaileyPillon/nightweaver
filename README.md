@@ -8,7 +8,7 @@ Windows-native orchestration for coding agents. Give Nightweaver a goal with che
 
 Until 0.19 a run ended when its fixed milestone list was accepted, and a person decided what came next. Version 0.19 adds that outer loop. After the last planned milestone is accepted, the controller re-runs every distinct check from every milestone on the finished build and collects screenshots. This is the evidence ledger. An independent, read-only judge then returns `MET` or `NOT_MET`, a 0–100 score, a result for each criterion and a ranked list of gaps. The run is done only when the judge says `MET` at or above `target_score` and every ledger check passes. Otherwise a read-only planner turns the gaps into the next wave of milestones, which inherit the last milestone's checks, scope and workers.
 
-A pursuit stops when the goal is met, when the score stops improving (`plateau`), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped at the judge.
+A pursuit stops when the goal is met, when the score stops improving (`plateau`, after one [plateau rescue](#rescue-a-plateau) by default), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped at the judge.
 
 ```powershell
 nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
@@ -215,8 +215,30 @@ Plans and OneShot templates take the same settings in a `pursue` block beside `w
 | `regression_margin` | 5 (0–50) | A wave scoring this far below the best build is discarded and the best build restored. |
 | `references` | none | Up to six `.png`, `.jpg`, `.jpeg` or `.webp` images, relative to the plan file. |
 | `criteria` | the plan's `acceptance` | What defines done. The judge answers each one. |
+| `rescue` | on: 3 strategies, 1 rescue | What happens when the score plateaus. See [Rescue a plateau](#rescue-a-plateau). |
 
 The judge reads the source, the check logs and up to eight distinct screenshots from the ledger checks, plus any reference images. A pursuit stops with `wave_limit` when `max_waves` is spent, `plateau` when progress stalls, or `milestone_limit` at 50 milestones. It leaves the best build on `nightweaver/<run-id>`.
+
+### Rescue a plateau
+
+When the score stops improving, repeating the same kind of wave rarely helps. Before a pursuit stops with `plateau`, Nightweaver runs one plateau rescue:
+
+1. **Diagnose.** One read-only call explains why progress stalled and proposes N genuinely different strategies, at least one a bold rethink. It sees the goal, the criteria, every judgment with its top gaps, the milestones built in each wave, recent rejection reasons and the best build's screenshots. The planner diagnoses unless it comes from the worker's vendor family, in which case the judge does. Two unreadable answers skip the rescue and the pursuit stops as before.
+2. **Fork.** Each strategy gets one attempt in its own worktree at the best commit, by a rotating worker (default: the last milestone's worker). It runs the last milestone's checks and, on a pass, is committed on the best build and saved at `nightweaver/<run-id>-rescue-wNN-II`.
+3. **Select.** The judge compares the best build with each passing strategy in both orders. A strategy qualifies only by scoring strictly more than half the points, so an answer that depends on the order shown never wins. Qualifiers with equal scores meet each other, and the lower number breaks any remaining tie.
+4. **Promote or stop.** A winner is appended as the milestone `Rescue: <strategy>`, promoted like any milestone and judged as the next wave. If none wins, the pursuit stops with `plateau` on the best build, exactly as it would have.
+
+```json
+"rescue": {"strategies": 3, "max_rescues": 1, "workers": [{"kind": "codex"}, {"kind": "claude"}]}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `strategies` | 3 (2–4) | Strategies the diagnosis proposes and the rescue builds. |
+| `max_rescues` | 1 (0–3) | Rescues one run may start. `0` turns the rescue off and keeps the earlier behavior exactly. |
+| `workers` | the last milestone's worker | Up to four workers that build the strategies in turn. |
+
+`oneshot --pursue --rescue-strategies N` sets the strategy count, and `--rescue-strategies 0` turns the rescue off (`--rescue` still names an alternate repair worker). A rescue costs one diagnosis call, one worker call per strategy and two judge calls per passing strategy. `pursuit` shows the diagnosis, the strategies, their scores and the winner, and `metrics` reports `rescue`: how many were attempted and won, the winning strategy and the score before and after the next judgment, so you can see whether rescues pay off.
 
 ### Read and extend a pursuit
 

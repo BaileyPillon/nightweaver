@@ -4,6 +4,7 @@ State machine, kept in a compact `exploration` dict so every stage resumes after
   directions  one planner call names N divergent design directions (two invalid answers skip the tournament)
   build       each direction is built once in its own worktree, checked like a normal milestone, and committed on pass
   tournament  passed directions meet pairwise (both orders) or in one ranked call; the winner goes through Run.promote
+The build, check, compare and promote helpers take a `names` mapping so the plateau rescue (rescue.py) runs the same machinery.
 """
 
 from datetime import datetime, timezone
@@ -28,6 +29,10 @@ from .verdicts import extract_object, normalize
 RANK_LIMIT, JUDGE_IMAGES = 12, 6
 EVENTS = ["direction_planned", "direction_built", "direction_failed", "direction_compared", "direction_chosen",
           "exploration_skipped", "exploration_failed"]
+# What a contest of builds calls its state key, events and worktrees; the rescue contest brings its own set.
+EXPLORE = {"key": "exploration", "started": "direction_started", "worked": "direction_worker_finished",
+           "passed": "direction_built", "failed": "direction_failed", "compared": "direction_compared", "invalid": "comparison_invalid",
+           "then": "tournament"}
 
 
 def options(run):
@@ -87,7 +92,7 @@ def advance(run, state):
 
 # ---------------------------------------------------------------- worktrees
 
-def drop(run, path):
+def drop(run, path, role="explore"):
     if not path.exists():
         return
     try:
@@ -101,21 +106,20 @@ def drop(run, path):
     except (ValueError, OSError, subprocess.TimeoutExpired):
         pass
     if path.exists():
-        run.set("explore_worktree_cleanup_failed", {"path": str(path), "issue": issue[:300]})
+        run.set(f"{role}_worktree_cleanup_failed", {"path": str(path), "issue": issue[:300]})
 
 
-def cleanup(run):
-    """Remove every exploration worktree. The direction refs keep the commits."""
+def cleanup(run, role="explore"):
+    """Remove every worktree of a contest. The refs keep the commits."""
     root = run.root / "worktrees"
-    for path in sorted(root.glob("explore-*")) if root.is_dir() else ():
-        drop(run, path)
+    for path in sorted(root.glob(f"{role}-*")) if root.is_dir() else ():
+        drop(run, path, role)
 
 
-def worktree(run, state, index, *, keep=False):
-    """A detached checkout of the base for one direction. A clean one is reused; a half-edited one is rebuilt unless kept."""
+def checkout(run, base, name, *, keep=False, role="explore"):
+    """A detached checkout of a base commit. A clean one is reused; a half-edited one is rebuilt unless kept."""
     use_git_timeout(run.spec)
-    base = state["accepted"]
-    path = run.root / "worktrees" / f"explore-{index:02d}"
+    path = run.root / "worktrees" / name
     if path.exists():
         try:
             if ((path / ".git").is_file() and common_dir(path) == run.gitdir and git(path, "rev-parse", "HEAD") == base
@@ -123,7 +127,7 @@ def worktree(run, state, index, *, keep=False):
                 return path
         except (ValueError, subprocess.TimeoutExpired):
             pass
-        drop(run, path)
+        drop(run, path, role)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         git(run.repository, "worktree", "add", "--detach", str(path), base)
@@ -133,10 +137,15 @@ def worktree(run, state, index, *, keep=False):
             git(run.repository, "worktree", "prune")
         except (ValueError, subprocess.TimeoutExpired):
             pass
-        raise ValueError(f"Creating an exploration worktree took more than {int(error.timeout)} seconds on this repository. "
-                         "Raise git_timeout in the plan, then resume with --retry.") from error
-    run.set("worktree_ready", {"path": str(path), "base": base, "role": "explore"})
+        raise ValueError(f"Creating {'an exploration' if role == 'explore' else 'a rescue'} worktree took more than {int(error.timeout)} seconds "
+                         "on this repository. Raise git_timeout in the plan, then resume with --retry.") from error
+    run.set("worktree_ready", {"path": str(path), "base": base, "role": role})
     return path
+
+
+def worktree(run, state, index, *, keep=False):
+    """The checkout of the base for one direction."""
+    return checkout(run, state["accepted"], f"explore-{index:02d}", keep=keep)
 
 
 # ---------------------------------------------------------------- stage 1: directions
@@ -214,13 +223,17 @@ def plan_directions(run, state, ex):
 
 def gate(run, state, step, path, snapshot, out, index, number, check):
     """Run one check on a direction like the normal verify path (stability rounds included) -> (receipts, problem or None)."""
+    return run_check(run, state, step, path, snapshot, out, number, check, {"step": 1, "attempt": 0, "explore": index})
+
+
+def run_check(run, state, step, path, snapshot, out, number, check, where):
     count, receipts = check.get("stability_runs", 1), []
     for round_index in range(2 if count > 1 else 1):
         batch = []
         for sample in range(round_index * count + 1, (round_index + 1) * count + 1):
             if run.paused():
                 raise PausedRun()
-            location = {"step": 1, "attempt": 0, "gate_index": number, "explore": index, **({"sample": sample, "stability_runs": count} if count > 1 else {})}
+            location = {**where, "gate_index": number, **({"sample": sample, "stability_runs": count} if count > 1 else {})}
             batch.append(run.observe_gate(check, path, state, step, snapshot, location, evidence=out))
             if observed_pass(batch[-1]) is None:
                 last = batch[-1]
@@ -244,32 +257,41 @@ def build_direction(run, state, ex):
     path = worktree(run, state, index, keep=current is not None)
     detail = {"index": index, "count": len(ex["directions"]), "name": direction["name"], "brief": direction["brief"], "worker": describe(config),
               "evidence": str(out), "ref": None, "commit": None, "tree": None, "screenshots": [], "failed_checks": [], "checks": []}
+    prompt = (run.worker_prompt(state, step) + f"\n\nDesign direction {direction['name']}: {direction['brief']}. "
+              "Make this direction unmistakable; do not hedge toward a generic look.")
+    build_one(run, state, ex, current, config=config, path=path, out=out, step=step, detail=detail, prompt=prompt,
+              ref=direction_ref(state, index), gate_fn=gate, names=EXPLORE)
+
+
+def build_one(run, state, ex, current, *, config, path, out, step, detail, prompt, ref, gate_fn, names):
+    """One attempt at a candidate: the worker builds, every check of `step` runs, a pass is committed on the base and saved as `ref`.
+
+    `current` is the interrupted attempt this call resumes, if any; `detail` holds the candidate's identity (index, count, name)."""
+    index = detail["index"]
     if current is None:
         shutil.rmtree(out, ignore_errors=True)  # whatever an interrupted attempt left behind
         log = out / "worker.jsonl"
         feedback = run.store.get(run.id)["state"].get("feedback_version", 0)
         current = {"index": index, "started": timestamp(), "feedback": feedback, "summary": ""}
-        run.set("direction_started", {"index": index, "count": detail["count"], "name": direction["name"], "worker": describe(config),
+        run.set(names["started"], {"index": index, "count": detail["count"], "name": detail["name"], "worker": describe(config),
                 "adapter": config["kind"]}, log=str(log), retry_at=None)
-        prompt = (run.worker_prompt(state, step) + f"\n\nDesign direction {direction['name']}: {direction['brief']}. "
-                  "Make this direction unmistakable; do not hedge toward a generic look.")
         code, _, answer = run.call_provider(config, "worker", path, log, prompt)
         current["summary"] = redact(answer or "").strip()[:1500]
         if code:
             label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            return record(run, ex, {**detail, "passed": False, "reason": redact(f"Worker exit {label}\n{answer or tail(log)}")[:1500]}, current)
+            return record(run, ex, {**detail, "passed": False, "reason": redact(f"Worker exit {label}\n{answer or tail(log)}")[:1500]}, current, names)
         ex = {**ex, "current": current}
-        run.set("direction_worker_finished", {"index": index, "log": str(log)}, exploration=ex)
+        run.set(names["worked"], {"index": index, "log": str(log)}, **{names["key"]: ex})
     try:
         snapshot = run.snapshot(path, state, step)
     except ValueError as error:
-        return record(run, ex, {**detail, "passed": False, "reason": redact(str(error))[:1500]}, current)
+        return record(run, ex, {**detail, "passed": False, "reason": redact(str(error))[:1500]}, current, names)
     for item in out.iterdir() if out.is_dir() else ():  # a verification interrupted earlier must not leave stale evidence
         if not item.name.startswith("worker."):
             shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink(missing_ok=True)
     outputs, reason, failed = [], None, []
     for number, check in enumerate(step["gates"], 1):
-        receipts, problem = gate(run, state, step, path, snapshot, out, index, number, check)
+        receipts, problem = gate_fn(run, state, step, path, snapshot, out, index, number, check)
         outputs.extend(receipts)
         if problem:
             reason, failed = problem, [check["name"]]
@@ -279,25 +301,24 @@ def build_direction(run, state, ex):
     detail.update(tree=snapshot, failed_checks=failed, screenshots=[str(p) for p in screenshots(out, 8)],
                   checks=[{"name": r["name"], "exit": r["exit"], "passed": observed_pass(r)} for r in outputs])
     if reason is not None:
-        return record(run, ex, {**detail, "passed": False, "reason": redact(reason)[:1500]}, current)
+        return record(run, ex, {**detail, "passed": False, "reason": redact(reason)[:1500]}, current, names)
     write_json(out / "checks.json", outputs)
-    ref = direction_ref(state, index)
     commit = git(path, "commit-tree", snapshot, "-p", state["accepted"], "-m", step["title"])
     verify_registered_repository(run.spec, common_dir(run.repository))
     git(run.repository, "update-ref", ref, commit)
     record(run, ex, {**detail, "passed": True, "reason": None, "commit": commit, "ref": ref,
-                     "checks_sha256": hashlib.sha256((out / "checks.json").read_bytes()).hexdigest()}, current)
+                     "checks_sha256": hashlib.sha256((out / "checks.json").read_bytes()).hexdigest()}, current, names)
 
 
-def record(run, ex, detail, current):
-    """Save one finished direction and move on to the next, or to the tournament after the last."""
+def record(run, ex, detail, current, names=EXPLORE):
+    """Save one finished candidate and move on to the next, or to the contest's last stage after the final one."""
     seconds = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(current["started"])).total_seconds())
     detail = {**detail, "seconds": round(seconds, 1), "summary": current["summary"], "feedback": current["feedback"]}
     kept = {k: detail[k] for k in ("index", "name", "worker", "passed", "tree", "commit", "evidence", "feedback", "failed_checks",
                                    "checks_sha256", "screenshots") if k in detail}
     kept["reason"] = (detail["reason"] or "")[:300]
-    ex = {**ex, "builds": [*ex["builds"], kept], "current": None, "stage": "build" if detail["index"] < detail["count"] else "tournament"}
-    run.set("direction_built" if detail["passed"] else "direction_failed", detail, exploration=ex, last_error="", retry_at=None,
+    ex = {**ex, "builds": [*ex["builds"], kept], "current": None, "stage": "build" if detail["index"] < detail["count"] else names["then"]}
+    run.set(names["passed"] if detail["passed"] else names["failed"], detail, **{names["key"]: ex}, last_error="", retry_at=None,
             transient_failures=0)
 
 
@@ -319,7 +340,14 @@ def comparison_prompt(run, state, ex, labelled, single):
     step = run.spec["milestones"][0]
     cap = JUDGE_IMAGES if not single else max(2, RANK_LIMIT // len(labelled))
     images = {label: [str(p) for p in build["screenshots"][:cap]] for label, build in labelled}
-    names = " and ".join(label for label, _ in labelled)
+    blocks = [candidate_block(run, ex, label, build, images[label]) for label, build in labelled]
+    return compose(run, state, ex, [label for label, _ in labelled], blocks, images, single,
+                   f"Milestone 1: {step['title']}\n{step['task'][:1500]}")
+
+
+def compose(run, state, ex, labels, blocks, images, single, task):
+    """The judge's comparison prompt and the images to attach, for candidate blocks already written. `images` maps a label to its files."""
+    names = " and ".join(labels)
     ask = ("Rank all candidates from best to worst. Which build better achieves the goal for a demanding owner — visual quality first, "
            "then completeness and polish? Judge only what you can see in the images and source. Every candidate passed the same "
            f'automated checks, so do not reward that. Return only JSON {{"ranking":["B","A"],"reason":"..."}} listing every candidate label ({names}) exactly once.'
@@ -331,12 +359,11 @@ def comparison_prompt(run, state, ex, labelled, single):
         *([f"Your previous answer was rejected. {state['last_error']}"] if ex.get("judge_attempts") and state.get("last_error") else []),
         f"Independently compare {'these candidate builds' if single else 'two candidate builds'} of the same goal. Open the image files and read "
         "the source folders with your file-reading tools. Remain read-only; do not edit anything.",
-        f"Goal\n{run.spec['objective']}", "Criteria that define done\n" + criteria_lines(run),
-        f"Milestone 1: {step['title']}\n{step['task'][:1500]}",
-        *(candidate_block(run, ex, label, build, images[label]) for label, build in labelled),
+        f"Goal\n{run.spec['objective']}", "Criteria that define done\n" + criteria_lines(run), task,
+        *blocks,
         *(["Images\nOPEN each image file listed above with your file-reading tool and judge what you actually see. Candidate screenshots "
            "are listed under their own candidate; the images are attached in that order."] if any(images.values()) else []),
-        ask]), [p for label, _ in labelled for p in images[label]]
+        ask]), [p for label in labels for p in images[label]]
 
 
 def label_of(value):
@@ -379,13 +406,20 @@ def tournament(run, state, ex):
         first, second = pairs(passed)[number // 2][::(1 if number % 2 == 0 else -1)]
         by_index = {b["index"]: b for b in passed}
         labelled = [("A", by_index[first]), ("B", by_index[second])]
-    config = run.route(state, None, "judge")
-    for _, build in labelled:
-        run.independence(state, "judge", config, worker_for(run, build["index"]))
     prompt, images = comparison_prompt(run, state, ex, labelled, single)
-    log = folder(run) / f"compare-{number + 1:02d}-{state.get('provider_calls', 0) + 1:04d}.jsonl"
+    ask(run, state, ex, labelled, prompt, images, single=single, total=total, workers=[worker_for(run, b["index"]) for _, b in labelled],
+        names=EXPLORE, where=folder(run))
+
+
+def ask(run, state, ex, labelled, prompt, images, *, single, total, workers, names, where, extra=None):
+    """One judge call over `labelled` candidates ([(label, build)]); records the answer, or retries once and then an unscored tie."""
+    number = len(ex["comparisons"])
+    config = run.route(state, None, "judge")
+    for worker in workers:
+        run.independence(state, "judge", config, worker)
+    log = where / f"compare-{number + 1:02d}-{state.get('provider_calls', 0) + 1:04d}.jsonl"
     (run.root / "worktrees").mkdir(parents=True, exist_ok=True)
-    code, _, answer = run.call_provider(config, "judge", run.root / "worktrees", log, prompt, evidence=folder(run), images=images,
+    code, _, answer = run.call_provider(config, "judge", run.root / "worktrees", log, prompt, evidence=where, images=images,
                                         mode="ranking" if single else "comparison")
     order = [b["index"] for _, b in labelled]
     invalid = None
@@ -404,8 +438,8 @@ def tournament(run, state, ex):
         attempts = ex.get("judge_attempts", 0) + 1
         invalid = f"The judge returned no valid comparison (attempt {attempts} of 2): {str(error)[:600]}"
         if attempts < 2:
-            run.set("comparison_invalid", {"attempt": attempts, "issue": invalid, "exit": code, "log": str(log)}, last_error=invalid,
-                    exploration={**ex, "judge_attempts": attempts})
+            run.set(names["invalid"], {"attempt": attempts, "issue": invalid, "exit": code, "log": str(log)}, last_error=invalid,
+                    **{names["key"]: {**ex, "judge_attempts": attempts}})
             return
         # Two unreadable answers: record an unscored tie so one bad judge call cannot wedge the run. Measurements skip it.
         reason = invalid
@@ -413,8 +447,8 @@ def tournament(run, state, ex):
                   {"pair": sorted(order), "order": order, "result": "tie", "winner": None})
         result["invalid"] = True
     saved = {**result, "reason": reason[:400]}
-    run.set("direction_compared", {**result, "number": number + 1, "of": total, "reason": reason, "log": str(log),
-            **({"issue": invalid} if invalid else {})}, exploration={**ex, "comparisons": [*ex["comparisons"], saved], "judge_attempts": 0},
+    run.set(names["compared"], {**result, **(extra or {}), "number": number + 1, "of": total, "reason": reason, "log": str(log),
+            **({"issue": invalid} if invalid else {})}, **{names["key"]: {**ex, "comparisons": [*ex["comparisons"], saved], "judge_attempts": 0}},
             log=str(log), last_error="", retry_at=None, transient_failures=0)
 
 
@@ -441,6 +475,14 @@ def rank(ex, passed):
     return ranking, bias
 
 
+def stage_manifest(run, state, build, what):
+    """Put the winner's check manifest where Run.promote verifies a normal attempt 1 of the milestone it becomes."""
+    manifest = (Path(build["evidence"]) / "checks.json").read_bytes()
+    if hashlib.sha256(manifest).hexdigest() != build["checks_sha256"]:
+        raise ValueError(f"The chosen {what}'s check manifest changed after its verification")
+    atomic_write(run.evidence_dir({**state, "attempt": 1}) / "checks.json", manifest)
+
+
 def conclude(run, state, ex, passed):
     cleanup(run)
     if not passed:
@@ -453,11 +495,7 @@ def conclude(run, state, ex, passed):
     by = "owner" if type(pick) is int and pick in [r["index"] for r in ranking[:2]] else "judge"
     winner = pick if by == "owner" else ranking[0]["index"]
     build = next(b for b in passed if b["index"] == winner)
-    manifest = (Path(build["evidence"]) / "checks.json").read_bytes()
-    if hashlib.sha256(manifest).hexdigest() != build["checks_sha256"]:
-        raise ValueError("The chosen direction's check manifest changed after its verification")
-    # Run.promote verifies the manifest where a normal attempt 1 of milestone 1 keeps it.
-    atomic_write(run.evidence_dir({**state, "attempt": 1}) / "checks.json", manifest)
+    stage_manifest(run, state, build, "direction")
     valid = [c for c in ex["comparisons"] if not c.get("invalid")]
     done = {"stage": "done", "winner": winner, "chosen_by": by, "evidence": build["evidence"], "checks_sha256": build["checks_sha256"], "ranking": ranking,
             "builds": [{k: b[k] for k in ("index", "name", "passed", "commit")} for b in ex["builds"]]}

@@ -240,14 +240,14 @@ def _database_check(file):
                     "invalid run state": """SELECT count(*) FROM runs WHERE json_type(state)!='object'
                         OR json_type(spec)!='object' OR coalesce(json_type(state,'$.step'),'')!='integer'
                         OR coalesce(json_extract(state,'$.phase'),'') NOT IN
-                        ('queued','ready','exploring','working','checking','reviewing','promoting','judging','planning','blocked','done')""",
+                        ('queued','ready','exploring','working','checking','reviewing','promoting','judging','rescuing','planning','blocked','done')""",
                     "invalid milestone cursor": """SELECT count(*) FROM runs WHERE
                         coalesce(json_type(spec,'$.milestones'),'') != 'array'
                         OR json_array_length(spec,'$.milestones') < 1
                         OR json_extract(state,'$.step') < 0
-                        OR CASE WHEN json_extract(state,'$.phase') IN ('done','judging','planning')
+                        OR CASE WHEN json_extract(state,'$.phase') IN ('done','judging','rescuing','planning')
                             OR (json_extract(state,'$.phase')='blocked'
-                                AND coalesce(json_extract(state,'$.blocked_from'),'') IN ('judging','planning'))
+                                AND coalesce(json_extract(state,'$.blocked_from'),'') IN ('judging','rescuing','planning'))
                             THEN json_extract(state,'$.step') != json_array_length(spec,'$.milestones')
                             ELSE json_extract(state,'$.step') >= json_array_length(spec,'$.milestones') END""",
                     "missing prerequisite": """SELECT count(*) FROM runs r, json_each(r.state,'$.after') d

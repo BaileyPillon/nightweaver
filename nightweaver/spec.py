@@ -52,9 +52,10 @@ def anchor_provider_paths(raw, folder):
         if isinstance(pursue.get("references"), list):
             pursue["references"] = [str((folder / Path(item).expanduser()).resolve()) if isinstance(item, str) and item.strip() else item
                                     for item in pursue["references"]]
-        explore = pursue.get("explore")
+        explore, rescue = pursue.get("explore"), pursue.get("rescue")
         routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5),
-                  *(array(explore.get("workers", []), "explore workers", 4) if isinstance(explore, dict) else [])]
+                  *(array(explore.get("workers", []), "explore workers", 4) if isinstance(explore, dict) else []),
+                  *(array(rescue.get("workers", []), "rescue workers", 4) if isinstance(rescue, dict) else [])]
         for route in routes:
             if isinstance(route, dict):
                 for key in ("profile_dir", "api_key_file", "oauth_token_file"):
@@ -237,8 +238,22 @@ def exploration(raw, relative_to):
     return out
 
 
+def rescuing(raw, relative_to):
+    """The plateau rescue that runs when progress stalls: a diagnosis, N strategies forked from the best build and a tournament.
+
+    Workers default to the last milestone's worker, chosen when a rescue starts. max_rescues 0 turns the rescue off."""
+    fields(raw, "strategies max_rescues workers", "pursue.rescue")
+    out = {"strategies": integer(raw.get("strategies", 3), "strategies", 2, 4), "max_rescues": integer(raw.get("max_rescues", 1), "max_rescues", 0, 3)}
+    if "workers" in raw:
+        workers = array(raw["workers"], "rescue workers", 4)
+        if not workers:
+            raise ValueError("rescue workers must list at least one worker")
+        out["workers"] = [provider(item, IMPLEMENTERS, "rescue worker", relative_to) for item in workers]
+    return out
+
+
 def pursuit(raw, relative_to, acceptance):
-    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore", "pursue")
+    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore rescue", "pursue")
     if "judge" not in raw:
         raise ValueError("pursue requires a judge")
     judge = provider(raw["judge"], REVIEWERS, "judge", relative_to)
@@ -259,6 +274,7 @@ def pursuit(raw, relative_to, acceptance):
     if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
         raise ValueError("pursue criteria must be a list of nonempty strings")
     return {"judge": judge, **({"explore": exploration(raw["explore"], relative_to)} if "explore" in raw else {}),
+            "rescue": rescuing(raw.get("rescue", {}), relative_to),
             "judge_fallbacks": [provider(p, REVIEWERS, "judge fallback", relative_to) for p in array(raw.get("judge_fallbacks", []), "judge_fallbacks", 5)],
             "planner": provider(raw["planner"], IMPLEMENTERS, "pursuit planner", relative_to) if "planner" in raw else dict(judge),
             "max_waves": integer(raw.get("max_waves", 3), "max_waves", 1, 20),
