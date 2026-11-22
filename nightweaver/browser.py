@@ -20,7 +20,7 @@ from urllib.parse import quote, urlparse
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nightweaver import journeys
+from nightweaver import journeys, sweep as interaction
 from nightweaver.spec import strict_json
 from nightweaver.safety import redact, write_json
 from nightweaver.server import CandidateStartupFailure
@@ -28,7 +28,7 @@ from nightweaver.server import CandidateStartupFailure
 
 def validate_browser(raw):
     from nightweaver.spec import array, artifact, fields, integer, text
-    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline network scenarios", "browser")
+    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline network scenarios sweep", "browser")
     if sum(key in raw for key in ("page", "url", "server")) != 1:
         raise ValueError("Browser needs exactly one of page, loopback url or owned server")
     out = dict(raw)
@@ -67,6 +67,8 @@ def validate_browser(raw):
     validate_steps(out["steps"], out.get("offline", False))
     if "scenarios" in out:
         journeys.validate_scenarios(out, validate_steps)
+    if "sweep" in raw:
+        out["sweep"] = interaction.validate_sweep(raw["sweep"])
     out["viewports"] = array(raw.get("viewports", [
         {"name": "desktop", "width": 1440, "height": 900}, {"name": "mobile", "width": 390, "height": 844}
     ]), "viewports", 8)
@@ -361,7 +363,7 @@ def favicon_failure(message):
 
 
 def run_case(
-    browser, config, scenario, viewport, steps, root, output, url, server_check
+    browser, config, scenario, viewport, steps, root, output, url, server_check, sweep=None
 ):
     from playwright.sync_api import expect
 
@@ -393,8 +395,10 @@ def run_case(
         result["scenario"] = scenario["name"]
     stage = {"action": "navigate"}
     error_counts = Counter()
+    events = []  # (category, message) in arrival order; the sweep attributes errors to the control it just clicked.
     first_error_stage = None
     started = monotonic()
+    base_traffic = None
 
     def issue(category, message):
         nonlocal first_error_stage
@@ -402,6 +406,10 @@ def run_case(
         if first_error_stage is None:
             first_error_stage = stage.copy()
         message = str(redact(str(message)))[:2000]
+        if len(events) < 500:
+            events.append((category, message))
+        if "control" in stage:
+            message = f"After clicking '{stage['control']}': {message}"
         if len(result["errors"]) < 20 and message not in result["errors"]:
             result["errors"].append(message)
 
@@ -413,6 +421,10 @@ def run_case(
             lambda msg: issue("console", msg.text) if msg.type == "error" and not favicon_failure(msg) else None,
         )
         return page
+
+    def mark(new):
+        nonlocal stage
+        stage = new
 
     def navigate(page):
         response = page.goto(url, wait_until=config["wait_until"], timeout=timeout)
@@ -502,14 +514,26 @@ def run_case(
                 issue("screenshot", f"Screenshot unavailable: {error}")
             stage = {"action": "trace"}
             try:
+                # The trace records the load and the steps. The sweep's pictures are its evidence; tracing them too makes
+                # an animated page's trace.zip outgrow the artifact limit.
                 file = f"{case}.trace.zip"
                 context.tracing.stop(path=str(output / file))
                 result["trace"] = file
             except Exception as error:
                 issue("trace", f"Trace unavailable: {error}")
+            if sweep is not None and result["passed"] and not error_counts:
+                # Only a page that loaded cleanly is exercised; the network budget below counts the load, not the clicking.
+                base_traffic, stage = traffic.summary(), {"action": "sweep"}
+                try:
+                    interaction.run(page, sweep, limit=config["sweep"]["max_controls"], timeout=config["timeout_ms"], output=output,
+                                    restore=lambda: navigate(page), events=events, mark=mark, issue=issue,
+                                    writes=config["sweep"].get("allow_writes", False), stepped=bool(steps),
+                                    overflow=result.get("overflow_px", 0))
+                except Exception as error:
+                    issue("sweep", f"Interaction sweep failed: {interaction.brief(error)}")
     finally:
         context.close()
-    result["network_summary"] = traffic.summary()
+    result["network_summary"] = base_traffic or traffic.summary()
     total = result["network_summary"]["requests"]
     network = config.get("network", {})
     if "network" in config:
@@ -557,6 +581,8 @@ def _verify_browser(config, root, output):
     root = Path(root).resolve()
     results = []
     channel = {}
+    sweep_viewport = next((v["name"] for v in config["viewports"] if v["name"] == "desktop"), config["viewports"][0]["name"])
+    sweep_out, swept = ({"sweep": [], "sweep_found": 0, "sweep_skipped": [], "sweep_unvisited": []} if "sweep" in config else None), False
     with browser_runtime(config.get("channel"), info=channel) as browser:
         runtime = {
             "chromium": browser.version,
@@ -569,6 +595,9 @@ def _verify_browser(config, root, output):
             warm_up(browser)
         with local_page(config, root, output) as (url, server_check):
             for scenario, viewport, steps in journeys.browser_cases(config):
+                # One sweep per gate: the desktop viewport (else the first one) of the first scenario.
+                sweeps = sweep_out if sweep_out is not None and not swept and viewport["name"] == sweep_viewport else None
+                swept = swept or sweeps is not None
                 results.append(
                     run_case(
                         browser,
@@ -580,6 +609,7 @@ def _verify_browser(config, root, output):
                         output,
                         url,
                         server_check,
+                        sweeps,
                     )
                 )
     receipt = {
@@ -591,6 +621,8 @@ def _verify_browser(config, root, output):
     }
     if channel["fallback"]:
         receipt["browser_channel_fallback"] = channel["fallback"]
+    if sweep_out is not None:
+        receipt.update(sweep_out)
     write_json(output / "browser.json", receipt)
     return receipt
 

@@ -146,7 +146,7 @@ def static_page(blobs, scripts):
 
 
 def smoke_gate(page):
-    return {"name": "Browser smoke", "kind": "browser", "browser": {"page": page}}
+    return {"name": "Browser smoke", "kind": "browser", "browser": {"page": page, "sweep": {}}}
 
 
 def missing_suite(scripts):
@@ -381,7 +381,7 @@ def discover(repository, objective, worker, rescue=None, python=None):
     if not gates:
         if not page:
             raise ValueError(missing_suite(scripts))
-        # A web page without tests still gets loaded in a desktop and a phone viewport, with screenshots kept as evidence.
+        # A web page without tests still gets loaded in a desktop and a phone viewport, and its visible controls get clicked, with screenshots kept as evidence.
         gates.append(smoke_gate(page))
     if len(protected) > 4096:
         raise ValueError(
