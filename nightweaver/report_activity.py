@@ -1,5 +1,6 @@
 """Offline navigation for a run's checkpoint and event evidence."""
 
+from datetime import datetime
 import json
 from html import escape
 
@@ -9,7 +10,7 @@ from .checks import observed_pass
 def category(event):
     kind = event["kind"]
     detail = event["details"]
-    if kind == "gate_finished":
+    if kind in ("gate_finished", "judge_gate_finished"):
         verdict = observed_pass(detail)
         return (
             "Passed checks"
@@ -22,6 +23,10 @@ def category(event):
         "interrupted_worker_recovered",
         "repair_handoff",
         "provider_fallback",
+        "provider_parked",
+        "worker_stalled",
+        "review_unparseable",
+        "pursuit_reverted",
     ):
         return "Recovery"
     if kind in (
@@ -34,11 +39,94 @@ def category(event):
         "pursuit_stopped",
         "judge_invalid",
         "plan_invalid",
+        "independence_degraded",
     ):
         return "Problems"
     if kind.startswith("provider_call"):
         return "Model calls"
     return "Progress"
+
+
+STOP_REASONS = {
+    "wave_limit": "wave limit reached",
+    "plateau": "score plateau",
+    "milestone_limit": "milestone limit reached",
+}
+
+
+def _plural(count, noun):
+    return f"{count} {noun}{'s' * (count != 1)}"
+
+
+def _clock(stamp):
+    """A local wall-clock time for a stored UTC stamp, with the date when it is not today."""
+    when = datetime.fromisoformat(stamp).astimezone()
+    return when.strftime("%H:%M" if when.date() == datetime.now().astimezone().date() else "%b %d %H:%M")
+
+
+def _park(d):
+    if d.get("parsed"):
+        return f"Waiting for usage reset until {_clock(d['reset'])}"
+    return f"Usage limit reached; retrying at {_clock(d['until'])}"
+
+
+def _ledger(d):
+    failed = len(d.get("failed", []))
+    return "Evidence ledger ready: " + (f"{_plural(failed, 'check')} failed" if failed else "all checks passed")
+
+
+def _ledger_check(d):
+    verdict = observed_pass(d)
+    return f"Ledger check {d['name']} " + ("passed" if verdict is True else "failed" if verdict is False else "unscored")
+
+
+def _planned(d):
+    text = f"Wave {d['wave']} planned: {_plural(len(d['titles']), 'milestone')}"
+    conflicts = len(d.get("conflicts") or [])
+    return text + (f" (planner flagged {_plural(conflicts, 'conflict')})" if conflicts else "")
+
+
+def _stopped(d):
+    best = d.get("best_score")
+    return (f"Pursuit stopped: {STOP_REASONS.get(d['reason'], str(d['reason']).replace('_', ' '))}"
+            + (f", best {best}/100" if isinstance(best, (int, float)) else ""))
+
+
+def _extended(d):
+    return f"Pursuit extended by {_plural(d['waves'], 'wave')}" + ("; judging resumed" if d.get("resumed") else "")
+
+
+# Short, human event names for goal pursuit and the 0.19 runtime. Anything else keeps its generic name.
+LABELS = {
+    "goal_judged": lambda d: f"Goal judged {d['score']}/100",
+    "goal_met": lambda d: f"Goal met at {d['score']}/100",
+    "wave_completed": lambda d: f"Wave {d['wave']} built; judging next",
+    "wave_planned": _planned,
+    "planner_started": lambda d: f"Planning wave {d['wave'] + 1}",
+    "judge_started": lambda d: f"Judging wave {d['wave']}",
+    "judge_ledger_ready": _ledger,
+    "judge_gate_finished": _ledger_check,
+    "judge_invalid": lambda d: f"Judge returned no valid judgment (attempt {d['attempt']} of 2)",
+    "plan_invalid": lambda d: f"Planner returned no valid plan (attempt {d['attempt']} of 2)",
+    "pursuit_reverted": lambda d: f"Wave {d['wave']} scored {d['score']}/100; reverted to best build ({d['best_score']}/100)",
+    "pursuit_stopped": _stopped,
+    "pursuit_extended": _extended,
+    "judge_worktree_cleanup_failed": lambda d: "Judge workspace cleanup failed",
+    "provider_parked": _park,
+    "worker_stalled": lambda d: "Worker stalled; retrying fresh",
+    "review_unparseable": lambda d: "Reviewer answer unreadable; asking again",
+    "independence_degraded": lambda d: f"{str(d['role']).capitalize()} shares the worker's vendor",
+}
+
+
+def event_label(event):
+    make = LABELS.get(event["kind"])
+    if make:
+        try:
+            return make(event["details"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass
+    return event["kind"].replace("_", " ").capitalize()
 
 
 def checkpoint_header(row, events):
@@ -98,7 +186,7 @@ def checkpoint_header(row, events):
         label = (
             detail.get("issue")
             or detail.get("name")
-            or latest["kind"].replace("_", " ")
+            or event_label(latest)
         )
         seq = int(latest["seq"])
         body.append(
@@ -168,7 +256,7 @@ def activity(events):
         body.append(
             f'<details id="event-{seq}" data-category="{group}"><summary>'
             f'<time datetime="{escape(e["time"])}">{escape(e["time"])}</time>'
-            f"{escape(e['kind'].replace('_', ' ').capitalize())}"
+            f"{escape(event_label(e))}"
             f'<span class="event-tag">{group}</span><span class="event-id">#{seq}</span></summary>'
             f'<a href="#event-{seq}">Link to event #{seq}</a><pre>{escape(json.dumps(e["details"], indent=2))}</pre></details>'
         )

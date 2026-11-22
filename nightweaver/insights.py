@@ -132,6 +132,7 @@ def diagnosis(store, run_id):
         "pursuit_stopped",
         "judge_invalid",
         "plan_invalid",
+        "independence_degraded",
         "blocked",
     }
     failures = [e for e in events if e["kind"] in kinds]
