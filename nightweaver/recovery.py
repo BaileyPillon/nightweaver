@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from . import notify
 from .engine import pending_dependencies
 from .process import run_lock, runner_active
 from .safety import redact
@@ -128,7 +129,8 @@ def supervise(store, run_id, limit=None, *, retry=False):
         )
 
         def stop(reason):
-            store.transition(run_id, "guard_stopped", {"reason": reason})
+            details = {"reason": reason}
+            notify.announce(store, run_id, "guard_stopped", details, store.transition(run_id, "guard_stopped", details))
             return reason
 
         initial = disposition(store, row)
@@ -144,6 +146,7 @@ def supervise(store, run_id, limit=None, *, retry=False):
             {"pid": os.getpid(), "limit": limit},
             guard_limit=limit,
         )
+        notify.release_due(store)  # a supervisor coming alive after a quiet night is a chance to send what the night held back
         if launch := row["state"].get("guard_launch"):
             # Both process locks are free but the old supervisor did not record
             # an exit. Preserve uncertainty; never invent a PID or exit code.

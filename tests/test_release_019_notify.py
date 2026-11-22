@@ -384,7 +384,7 @@ class QuietHoursAndDigest(Base):
             for number in range(5):
                 run.set("blocked", {"cause": f"Daytime {number}"})
             notify.flush()
-        self.assertEqual(len(self.ntfy.of("POST")), 7, "daytime is unlimited")
+        self.assertEqual(len(self.ntfy.of("POST")), 8, "daytime is unlimited, and its first message also sends the two the night held")
 
     def test_held_messages_are_redacted_on_disk(self):
         self.enable(max_per_night=0, quiet_hours="23:00-07:00")
@@ -419,7 +419,7 @@ class QuietHoursAndDigest(Base):
         with at(NIGHT):
             run.set("blocked", {"cause": "loud"})
             notify.flush()
-        self.assertEqual(len(self.ntfy.of("POST")), 1)
+        self.assertEqual(len(self.ntfy.of("POST")), 2, "the message itself, then the one held while quiet hours were on")
 
     def build_runs(self):
         done = self.configured(fixtures.fixture("good"), title="Alpha done")
