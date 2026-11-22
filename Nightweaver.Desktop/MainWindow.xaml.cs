@@ -398,8 +398,63 @@ public partial class MainWindow : Window
             var details = data.GetProperty("details");
             string kind = Get(data, "kind");
             string Read(string key) => details.TryGetProperty(key, out var value) ? value.ToString() : "";
+            int Count(string key) => details.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.Array
+                ? value.GetArrayLength() : 0;
+            bool Flag(string key) => details.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.True;
+            string Titles(string key, int take) => details.TryGetProperty(key, out var list) && list.ValueKind == JsonValueKind.Array
+                ? string.Join("; ", list.EnumerateArray().Select(item => item.ValueKind == JsonValueKind.Object &&
+                    item.TryGetProperty("title", out var title) ? title.ToString() : item.ToString()).Take(take)) : "";
+            string Clock(string key) => DateTimeOffset.TryParse(Read(key), out var at)
+                ? at.ToLocalTime().ToString(at.ToLocalTime().Date == DateTime.Today ? "HH:mm" : "MMM dd HH:mm") : "later";
+            string Best() => Read("best_score").Length > 0 ? $", best {Read("best_score")}/100" : "";
+            string label = kind switch
+            {
+                "goal_judged" => $"Goal judged {Read("score")}/100",
+                "goal_met" => $"Goal met at {Read("score")}/100",
+                "wave_completed" => $"Wave {Read("wave")} built; judging next",
+                "wave_planned" => $"Wave {Read("wave")} planned: {Plural(Count("titles"), "milestone")}" +
+                    (Count("conflicts") > 0 ? $" (planner flagged {Plural(Count("conflicts"), "conflict")})" : ""),
+                "planner_started" => details.TryGetProperty("wave", out var judged) && judged.TryGetInt32(out int wave)
+                    ? $"Planning wave {wave + 1}" : "Planning the next wave",
+                "judge_started" => $"Judging wave {Read("wave")}",
+                "judge_ledger_ready" => Count("failed") == 0 ? "Evidence ledger ready: all checks passed"
+                    : $"Evidence ledger ready: {Plural(Count("failed"), "check")} failed",
+                "judge_gate_finished" => $"Ledger check {Read("name")} " + Observed(details) switch
+                    { true => "passed", false => "failed", null => "unscored" },
+                "judge_invalid" => $"Judge returned no valid judgment (attempt {Read("attempt")} of 2)",
+                "plan_invalid" => $"Planner returned no valid plan (attempt {Read("attempt")} of 2)",
+                "pursuit_reverted" => $"Wave {Read("wave")} scored {Read("score")}/100; reverted to best build ({Read("best_score")}/100)",
+                "pursuit_stopped" => $"Pursuit stopped: {StopReason(Read("reason"))}{Best()}",
+                "pursuit_extended" => $"Pursuit extended by {Plural(details.TryGetProperty("waves", out var added) &&
+                    added.TryGetInt32(out int count) ? count : 0, "wave")}" + (Flag("resumed") ? "; judging resumed" : ""),
+                "judge_worktree_cleanup_failed" => "Judge workspace cleanup failed",
+                "provider_parked" => Flag("parsed") ? $"Waiting for usage reset until {Clock("reset")}"
+                    : $"Usage limit reached; retrying at {Clock("until")}",
+                "worker_stalled" => "Worker stalled; retrying fresh",
+                "review_unparseable" => "Reviewer answer unreadable; asking again",
+                "independence_degraded" => $"{Display(Read("role"))} shares the worker's vendor",
+                _ => Display(kind),
+            };
             string detail = kind switch
             {
+                "goal_judged" => Titles("gaps", 3) is { Length: > 0 } gaps ? $"Top gaps: {gaps}" : Brief(Read("reason")),
+                "goal_met" => $"Build {ShortCommit(Read("commit"))} meets the goal",
+                "wave_completed" => $"Verified commit {ShortCommit(Read("commit"))}",
+                "wave_planned" => Titles("titles", 5) + (Count("conflicts") > 0 ? $"\nConflicts: {Titles("conflicts", 3)}" : ""),
+                "planner_started" => $"{Display(Read("adapter"))} is planning from the judged gaps",
+                "judge_started" => $"{Display(Read("adapter"))} is judging build {ShortCommit(Read("commit"))}",
+                "judge_ledger_ready" => Count("failed") > 0 ? $"Failed: {Titles("failed", 5)}" : "Every check passed on the judged build",
+                "judge_gate_finished" => $"{Read("name")} · Exit code {Read("exit")}",
+                "judge_invalid" or "plan_invalid" or "judge_worktree_cleanup_failed" or "independence_degraded" => Brief(Read("issue")),
+                "pursuit_reverted" => $"Discarded work kept at {Read("discarded_ref").Replace("refs/heads/", "")}",
+                "pursuit_stopped" => (Read("best_commit").Length > 0
+                    ? $"Best build {ShortCommit(Read("best_commit"))} stays on the result branch." : "No judged build to keep.") +
+                    " Add waves with the pursuit command to continue.",
+                "pursuit_extended" => details.TryGetProperty("max_waves", out var limit) && limit.TryGetInt32(out int most)
+                    ? $"At most {most + 1} waves in total" : "",
+                "provider_parked" => $"{Display(Read("role"))} · {Display(Read("provider"))}\n{Brief(Read("issue"))}",
+                "worker_stalled" => $"Attempt {Read("attempt")} · stall {Read("stall")} of {Read("stalls_allowed")} · retry in {Read("seconds")} seconds",
+                "review_unparseable" => $"Attempt {Read("attempt")} · unreadable answer {Read("count")} of 2",
                 "queued" => $"Starting from {ShortCommit(Read("base"))}",
                 "worktree_ready" => "Milestone workspace prepared",
                 "worker_started" => $"{Display(Read("adapter"))} · Attempt {Read("attempt")}",
@@ -428,8 +483,31 @@ public partial class MainWindow : Window
                     .Select(property => $"{Display(property.Name)}  {property.Value}")),
             };
             string time = DateTimeOffset.Parse(Get(data, "time")).ToLocalTime().ToString("HH:mm:ss");
-            return new(data.GetProperty("seq").GetInt64(), time, Display(kind), detail);
+            return new(data.GetProperty("seq").GetInt64(), time, label, detail);
         }
+    }
+
+    private static string Plural(int count, string noun) => $"{count} {noun}{(count == 1 ? "" : "s")}";
+
+    private static string StopReason(string reason) => reason switch
+    {
+        "wave_limit" => "wave limit reached",
+        "plateau" => "score plateau",
+        "milestone_limit" => "milestone limit reached",
+        _ => reason.Replace('_', ' '),
+    };
+
+    // Mirrors checks.observed_pass: only a completed, evidenced check scores.
+    private static bool? Observed(JsonElement receipt)
+    {
+        bool Set(string key) => receipt.TryGetProperty(key, out var value) &&
+            value.ValueKind is not (JsonValueKind.Null or JsonValueKind.False) &&
+            !(value.ValueKind == JsonValueKind.String && value.GetString()!.Length == 0);
+        if (!receipt.TryGetProperty("exit", out var exit) || !exit.TryGetInt32(out int code) || Set("artifact_error") || Set("source_error"))
+            return null;
+        bool junit = !(receipt.TryGetProperty("junit", out var report) && report.ValueKind == JsonValueKind.Object &&
+            report.TryGetProperty("passed", out var passed) && passed.ValueKind == JsonValueKind.False);
+        return code == 0 && junit;
     }
 
     private static string Brief(string value)

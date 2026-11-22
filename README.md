@@ -1,6 +1,35 @@
 # Nightweaver
 
-**Version 0.18** can restart a crashed Windows runner at its saved milestone. Give a dedicated run a restart allowance, inspect its accepted commit, and trace a crash from the dashboard or offline report. [The 40 ranked changes, recent research and Windows recovery trials](docs/v0.18-research.md)
+An autonomous workshop for your code, built for Windows.
+
+Windows-native orchestration for coding agents. Give Nightweaver a goal with checked milestones. It hands off work between agents, sends failed checks back for repair, and advances after the result passes verification. With `--pursue`, an independent judge then scores the finished build against the goal and a planner adds further waves of milestones until the goal is met or progress stops. Close the desktop dashboard whenever you need to. The runner keeps its place in SQLite.
+
+## What's new in 0.19 — goal pursuit
+
+Until 0.19 a run ended when its fixed milestone list was accepted, and a person decided what came next. Version 0.19 adds that outer loop. After the last planned milestone is accepted, the controller re-runs every distinct check from every milestone on the finished build and collects screenshots. This is the evidence ledger. An independent, read-only judge then returns `MET` or `NOT_MET`, a 0–100 score, a result for each criterion and a ranked list of gaps. The run is done only when the judge says `MET` at or above `target_score` and every ledger check passes. Otherwise a read-only planner turns the gaps into the next wave of milestones, which inherit the last milestone's checks, scope and workers.
+
+A pursuit stops when the goal is met, when the score stops improving (`plateau`), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped at the judge.
+
+```powershell
+nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
+nightweaver pursuit RUN_ID
+nightweaver pursuit RUN_ID --add-waves 2
+```
+
+The release also fixes what an audit of 118 runs on one machine, 13 of them real work, showed about unattended work:
+
+- A provider usage limit parks the run until the provider's reset time and resumes it automatically. Before, the run blocked within seconds.
+- Failure identity is the phase, the failed checks and the build tree, not the wording of a message. The repeated-failure stop that never fired in those runs now does, and a worker that changes nothing after a review rejection is stopped without a new review.
+- A reviewer receives the full staged diff, the attempt's screenshots, its own earlier findings and the local model's advice. Approvals with prose before the JSON verdict are no longer read as rejections.
+- A worker that goes silent for 900 seconds is retried in a fresh session without costing an attempt. Resumed Codex sessions count only their own tokens.
+- Browser gates fall back to Edge or Chrome when the bundled Chromium is missing, and web repositories without tests get a browser smoke gate.
+- Claude can run unattended with a long-lived token. A run warns when its reviewer or judge shares the worker's vendor.
+
+Those same runs found no matched evidence that a OneShot beats standalone Codex or Claude Code. The one matched pair was parity on acceptance at about 2.8 times the time and 4.8 times the tokens, on a trivial task. Version 0.19 targets the gap the field data supports, a missing outer loop, and does not claim a measured advantage. [The 30 ranked changes, field evidence, research sources and what is not yet built](docs/v0.19-research.md)
+
+## Earlier releases
+
+Version 0.18 can restart a crashed Windows runner at its saved milestone. Give a dedicated run a restart allowance, inspect its accepted commit, and trace a crash from the dashboard or offline report. [The 40 ranked changes, recent research and Windows recovery trials](docs/v0.18-research.md)
 
 ```powershell
 nightweaver oneshot C:\src\my-project "Fix the broken share link" --guard-restarts 2 --wait
@@ -50,17 +79,13 @@ Run a [head-to-head benchmark of AGTX OneShot, Codex and Claude Code](docs/head-
 
 Version 0.4 adds owned application servers for browser checks, direct standalone CLI comparisons, complete standalone task handoffs, per-task matched outcomes, and explicit account/environment blockers. See the [0.4 guide and comparison starter](docs/v0.4-guide.md). Version 0.3 introduced the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md); its [guide](docs/v0.3-guide.md) remains applicable except where superseded.
 
-An autonomous workshop for your code, built for Windows.
-
-Windows-native orchestration for coding agents. Give Nightweaver a goal with checked milestones. It hands off work between agents, sends failed checks back for repair, and advances after the result passes verification. Close the desktop dashboard whenever you need to. The runner keeps its place in SQLite.
-
 ## What runs on Windows
 
 - A WPF dashboard for starting a plan or OneShot, watching attempts, opening evidence, and pausing or resuming runs.
 - Native Codex, Claude Code, and DeepSeek adapters. Use your existing CLI logins or select a specific installed profile for a role. DeepSeek runs through Claude Code's tools with a separate API key and configuration directory. An optional local Ollama model supplies advisory feedback. You can also plug in a custom executable.
 - A pinned Git baseline and a separate worktree per milestone. Accepted commits land on `nightweaver/<run-id>` for inspection or integration.
 - Independent operator-defined checks, with optional required screenshots or other files and a separate reviewer. Check receipts bind artifacts and decisions to a Git tree. Failed checks feed the next attempt automatically.
-- A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair.
+- A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair. In a pursuit run, the judge decides whether the whole goal is met and the final-milestone reviewer checks only that milestone.
 - A background runner with Windows Job Objects for child process cleanup. Relaunch a failed or interrupted runner against the same durable state, worktree, and recorded provider session where available.
 - A persistent queue with run prerequisites, recovery after interruption, and an optional dispatcher launched by Windows Task Scheduler at sign-in.
 
@@ -110,6 +135,8 @@ dotnet run --project Nightweaver.Desktop -c Release
 
 The compiled desktop app accepts `--home <runtime-directory>` and `--python <python.exe>` for shortcuts that need explicit paths.
 
+The activity list names goal pursuit and unattended-run events in plain words, for example "Goal judged 72/100", "Waiting for usage reset until 18:40", "Worker stalled; retrying fresh" and "Reviewer shares the worker's vendor". The New OneShot dialog does not offer pursuit yet. Start a pursuit from the command line and watch it in the dashboard.
+
 ## Use it on a project
 
 Choose the repository root with the committed base you want. Set `repository`, `title`, `objective`, `worker`, `gates`, and ordered `milestones` in a local JSON plan. A milestone can specify a different `worker`, its own extra `gates`, and its allowed `paths`. `protected_paths` defends tracked checks and project boundaries during promotion. Run with trusted plans and projects. Custom commands run with your Windows permissions, and provider tool calls use the provider's permissions.
@@ -144,6 +171,70 @@ Set `effort` on a Claude, Codex or DeepSeek worker or reviewer. Use `--effort` f
 
 The command exits with status 3 if a required model route is blocked or a live request could not be verified. On a run, a missing CLI, missing selected profile, or recognized account, model, or usage-limit error blocks with the affected role and profile. Correct that route and retry the existing run. [Claude profile settings](https://code.claude.com/docs/en/settings) · [Ollama model listing](https://docs.ollama.com/api/tags)
 
+## Pursue a goal until it is met
+
+A OneShot normally ends when its planned milestones are accepted. Add `--pursue` to keep going until an independent judge accepts the result.
+
+```powershell
+nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
+```
+
+`--judge` chooses the judging provider. The default is a different model family from the worker: Claude, unless the worker is Claude. `--judge-model`, `--judge-effort` and `--judge-profile` pick its model, reasoning effort and signed-in profile. The judge also plans each wave unless `--planner-kind` names another provider, with `--planner-model`, `--planner-effort` and `--planner-profile`. `--waves` sets the additional waves allowed after the initial plan (1–20, default 3). `--target-score` sets the score that counts as done (default 85). `--reference IMAGE` gives the judge a target to compare screenshots with, repeated up to six times. `--reviewer` adds a reviewer for each milestone. These flags require `--pursue`. Each wave costs a planner call, a worker call for each milestone and a judge call, so set `budgets` in a template when spend matters.
+
+### The `pursue` block
+
+Plans and OneShot templates take the same settings in a `pursue` block beside `worker` and `gates`. Only `judge` is required. The judge, its fallbacks and the planner take the same provider settings as a worker or reviewer: `kind`, `model`, `effort` and `profile_dir`.
+
+```json
+"pursue": {
+  "judge": {"kind": "claude", "model": "claude-opus-5-5", "effort": "xhigh"},
+  "judge_fallbacks": [{"kind": "codex"}],
+  "planner": {"kind": "claude"},
+  "max_waves": 3,
+  "wave_size": 3,
+  "target_score": 85,
+  "plateau": 2,
+  "regression_margin": 5,
+  "references": ["reference/pricing-target.png"],
+  "criteria": [
+    "Three pricing tiers are readable at 390 px width",
+    "The recommended tier is visually distinct"
+  ]
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `judge` | required | The independent, read-only judge. A judge from the worker's own vendor works but is recorded as less independent. |
+| `judge_fallbacks` | none | Up to five other routes tried in order when the judge's provider fails. |
+| `planner` | the judge | Plans each wave from the judged gaps. It stays read-only. |
+| `max_waves` | 3 (1–20) | Additional waves after the initial plan. |
+| `wave_size` | 3 (1–5) | Most milestones one wave may add. |
+| `target_score` | 85 (0–100) | The score a `MET` verdict must reach. Every ledger check must also pass. |
+| `plateau` | 2 (1–5) | Consecutive judgments that fail to beat the best score before the pursuit stops. |
+| `regression_margin` | 5 (0–50) | A wave scoring this far below the best build is discarded and the best build restored. |
+| `references` | none | Up to six `.png`, `.jpg`, `.jpeg` or `.webp` images, relative to the plan file. |
+| `criteria` | the plan's `acceptance` | What defines done. The judge answers each one. |
+
+The judge reads the source, the check logs and up to eight distinct screenshots from the ledger checks, plus any reference images. A pursuit stops with `wave_limit` when `max_waves` is spent, `plateau` when progress stalls, or `milestone_limit` at 50 milestones. It leaves the best build on `nightweaver/<run-id>`.
+
+### Read and extend a pursuit
+
+```powershell
+nightweaver pursuit RUN_ID
+nightweaver pursuit RUN_ID --add-waves 2
+```
+
+`pursuit` prints each wave with its milestones, the judgment, the top gaps, any failed ledger checks and any revert. Add `--json` for the same data as JSON. `--add-waves N` raises `max_waves` by N (1–20). A run that stopped at the judge goes back there with a fresh plateau count, so resume it or let the dispatcher continue it. `report` adds a Goal pursuit section and `handoff` lists the scores and open gaps. `doctor` and `preflight` check the judge, its fallbacks and the planner.
+
+### Run unattended
+
+- **Usage limits.** When a provider reports a usage limit, Nightweaver reads its reset time, parks the run and retries 90 seconds after the reset. The worker attempt is refunded. If the message gives no time, the retry comes after 30 minutes, doubling up to 2 hours. `retry.max_parks` (default 8 consecutive waits, `0` turns waiting off) and `retry.max_park_seconds` (default 21600, range 60–604800) bound the waiting. A reset that falls after the run's time budget blocks with a clear message. Parked runs resume through the runner, the dispatcher and the guard. A parked inline runner keeps the repository lock while it waits.
+- **Silent workers.** Workers, reviewers, judges and planners get a `budgets.idle_timeout` of 900 seconds unless the plan sets one (1–14400). A worker that goes silent is retried in a fresh session and its attempt is refunded, at most twice in a row.
+- **Big repositories.** A top-level `git_timeout` (30–3600 seconds, default 90) governs git calls. `git worktree add` always gets at least 900 seconds, and a timed-out checkout is cleaned up and explained.
+- **Claude sign-in.** A Claude login can expire while a run is unattended. Run `claude setup-token` once. Keep the result in the user environment variable `CLAUDE_CODE_OAUTH_TOKEN`, which Nightweaver also reads from the registry when a process started before it was set, or in a file named by the route's `oauth_token_file`. The token goes only to Claude processes and is never logged or reported. `doctor` names the source in use. An expired login blocks with the `claude setup-token` remedy instead of quietly leaving review to the worker's own vendor.
+- **Independence and credentials.** When a reviewer or judge comes from the same vendor family as the worker, the run records `independence_degraded` once for that pair and continues. Codex and Gemini processes do not inherit Claude, Anthropic or DeepSeek credentials, and Claude processes drop `DEEPSEEK_API_KEY`.
+
 ## Queue and recover runs on Windows
 
 ```powershell
@@ -177,6 +268,8 @@ For static HTML, [check_static_page.py](examples/check_static_page.py) checks th
 
 Put this gate in `gates` or `final_gates`. For an app with a build step or interactions, supply a project-specific Playwright check that launches the candidate and exercises the relevant flows. Configure a reviewer that can inspect screenshots and describe the visual requirements in `acceptance`. A failed check, missing screenshot, or review requesting changes sends the issue back for repair.
 
+**Smoke gates and the Edge fallback.** A OneShot for a repository with no committed tests gets a `Browser smoke` gate when the repository is a static web project (an `index.html` at the root, in `public/` or in `docs/`) or a new repository holding only a README, license or ignore files. The gate loads the page at desktop and phone sizes and keeps the screenshots, so a goal can start from nothing. A repository whose `package.json` has a `dev`, `start`, `preview` or `serve` script is not given one, because a bare file server cannot render it. The failure message points to a browser gate that owns the server. When the bundled Chromium is missing, a browser gate that uses the default retries with Microsoft Edge and then Chrome. The channel that ran and the reason are recorded in `browser.json` and the gate receipt's `browser_runtime`. An explicit `channel` or a `PLAYWRIGHT_BROWSERS_PATH` pin still fails closed. A non-bundled browser takes one throwaway screenshot before the timed cases, and a missing favicon is not a page error. `doctor` reports `browser` as `ready`, `ready_fallback` or `unavailable` from the install folders without starting a browser.
+
 Run data, model output, and evidence live under `%LOCALAPPDATA%\Nightweaver` or the directory chosen through `--home` or `NIGHTWEAVER_HOME`. Treat them as local project data. The engine creates a result branch locally. Review its commits before merging them into your branch or pushing them to a remote.
 
 Upgrading from the original Rookline release preserves its existing runtime directory, run history, evidence, provider configuration, and result branches. New runs use `nightweaver/<run-id>`. The old `python -m rookline` command and `ROOKLINE_HOME` remain supported for existing scripts. No history or worktrees are moved automatically.
@@ -190,4 +283,10 @@ For local advice, set `think` to a value supported by the installed Ollama model
 ```powershell
 python -m unittest discover -s tests -v
 dotnet build Nightweaver.Desktop -c Release
+```
+
+The suite has 336 tests. Version 0.19 added 134 in four modules: `test_release_019_pursuit` (25), `test_release_019_browser` (30), `test_release_019_runtime` (55) and `test_release_019_repair` (24). To run only those:
+
+```powershell
+python -m unittest discover -s tests -p "test_release_019*.py"
 ```
