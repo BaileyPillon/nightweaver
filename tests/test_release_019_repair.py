@@ -232,7 +232,7 @@ class RepairTests(unittest.TestCase):
 
     # Tolerant parsing
 
-    def test_extract_object_finds_the_last_object_with_the_key(self):
+    def test_extract_object_finds_the_object_with_the_key_and_fails_closed_on_ambiguity(self):
         verdict = json.dumps({"verdict": "pass", "reason": "Fine {with} braces and a } stray"})
         for label, answer in {
             "prose around": f"I looked at everything. {verdict} Thanks for asking!",
@@ -240,17 +240,21 @@ class RepairTests(unittest.TestCase):
             "only the json": verdict,
             "brace in prose before": "Use { carefully with braces. " + verdict,
             "other object after": verdict + '\nFor reference {"note": 1}',
-            "earlier example": '{"verdict": "REVISE", "reason": "an example"} and now the real one: ' + verdict,
+            "same verdict twice": '{"verdict": "PASS", "reason": "draft"} and now the real one: ' + verdict,
         }.items():
             with self.subTest(label):
                 found = extract_verdict(answer, ("PASS", "REVISE"))
                 self.assertEqual((found["verdict"], found["reason"]), ("PASS", "Fine {with} braces and a } stray"))
         for label, answer in {"no json": "I approve of this change.", "no key": '{"result": "ok"}', "empty": "  ",
                               "unknown verdict": '{"verdict": "APPROVED", "reason": "x"}', "duplicate keys": '{"verdict": "PASS", "verdict": "REVISE"}',
-                              "nested only": '{"outer": {"verdict": "PASS"}}', "truncated": '{"verdict": "PASS", "reason": "cut off'}.items():
+                              "nested only": '{"outer": {"verdict": "PASS"}}', "truncated": '{"verdict": "PASS", "reason": "cut off',
+                              "earlier example": '{"verdict": "REVISE", "reason": "an example"} and now the real one: ' + verdict}.items():
             with self.subTest(label), self.assertRaises(ValueError):
                 extract_verdict(answer, ("PASS", "REVISE"))
-        self.assertEqual(extract_object('x {"a": 1} y {"a": 2, "b": 3} z {"c": 4}', "a"), {"a": 2, "b": 3})
+        self.assertEqual(extract_object('x {"a": 1} y {"a": 2, "b": 3} z {"c": 4}', "a"), {"a": 2, "b": 3},
+                         "a field that decides nothing keeps the rule that the last object wins")
+        with self.assertRaises(ValueError):
+            extract_object('x {"a": 1} y {"a": 2, "b": 3} z {"c": 4}', "a", fail_closed=True)
 
     def test_verdicts_read_case_insensitively(self):
         for value in ("pass", "Pass", " PASS "):
@@ -298,26 +302,26 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(self.events(run, "attempt_rejected"), [])
         self.assertEqual(self.state(run).get("review_parse_failures", 0), 0)
 
-    def test_a_second_unparseable_answer_rejects_with_an_excerpt(self):
+    def test_a_second_unparseable_answer_makes_the_reviewer_unavailable_instead_of_rejecting_the_worker(self):
         reviewer = self.script("reviewer", ["no json at all", "still no json at all"])
-        run = self.configured(fx("write", self.root / "worker.prompts", "ready"), reviewer=reviewer, attempts=1)
+        run = self.configured(fx("write", self.root / "worker.prompts", "ready"), reviewer=reviewer, attempts=1, retry=FAST)
         self.assertEqual(Run(self.store, run).run(), "blocked")
-        self.assertEqual(len(self.events(run, "review_unparseable")), 1)
-        self.assertEqual((self.calls(run, "reviewer"), self.calls(run, "worker")), (2, 1))
-        rejected = self.events(run, "attempt_rejected")
-        self.assertEqual([r["phase"] for r in rejected], ["review"])
-        self.assertIn("The reviewer's answer could not be parsed", rejected[0]["issue"])
-        self.assertIn("still no json at all", rejected[0]["issue"])
-        self.assertNotIn("finding", rejected[0], "an unreadable answer is not a finding to repeat to the reviewer")
+        self.assertEqual([e["count"] for e in self.events(run, "review_unparseable")], [1, 2, 1, 2, 1, 2])
+        self.assertEqual((self.calls(run, "reviewer"), self.calls(run, "worker")), (6, 1))
+        self.assertEqual(self.events(run, "attempt_rejected"), [], "an unreadable answer is neither feedback nor a rejection")
+        error = self.state(run)["last_error"]
+        self.assertTrue(error.startswith("Reviewer unavailable: its answer could not be read after two tries"), error)
+        self.assertIn("still no json at all", error)
+        self.assertEqual(self.state(run)["blocked_from"], "reviewing")
         self.assertEqual(self.state(run)["review_parse_failures"], 0)
 
     def test_an_unreadable_review_is_not_feedback_the_worker_can_be_blamed_for_ignoring(self):
         reviewer = self.script("reviewer", ["no json", "still no json", PASS])
         run = self.configured(fx("write", self.root / "worker.prompts", "ready"), reviewer=reviewer, attempts=3, retry=FAST)
         self.assertEqual(Run(self.store, run).run(), "done")
-        self.assertEqual([r["phase"] for r in self.events(run, "attempt_rejected")], ["review"])
-        self.assertEqual(len(self.events(run, "gate_started")), 2, "the unchanged build is checked and reviewed again")
-        self.assertEqual((self.calls(run, "reviewer"), self.calls(run, "worker")), (3, 2))
+        self.assertEqual(self.events(run, "attempt_rejected"), [])
+        self.assertEqual(len(self.events(run, "gate_started")), 1, "the build is checked once; only the review is retried")
+        self.assertEqual((self.calls(run, "reviewer"), self.calls(run, "worker")), (3, 1))
 
     # What the reviewer sees
 
@@ -412,7 +416,7 @@ class RepairTests(unittest.TestCase):
 
     def test_same_vendor_families_are_flagged_once_per_role_and_pair(self):
         self.assertEqual([family({"kind": k}) for k in ("codex", "claude", "deepseek", "gemini", "command")],
-                         ["openai", "anthropic", "deepseek", "google", "custom"])
+                         ["openai", "anthropic", "deepseek", "google", None])
 
         def invoke(config, mode, *args, **kwargs):
             if mode == "reviewer":
@@ -453,9 +457,8 @@ class RepairTests(unittest.TestCase):
         self.assertIn("Planner notes\nThe planner flagged", second)
         self.assertIn(f"- {LOADER}", second)
         self.assertIn('"conflicts"', self.prompts("planner")[0])
-        # The judge and the worker are both command providers here, which share the "custom" family.
-        degraded = self.events(run, "independence_degraded")
-        self.assertEqual([d["role"] for d in degraded], ["judge"], "two judgments, one warning")
+        # The judge and the worker are both command providers here, whose vendor is unknown, so nothing is claimed about them.
+        self.assertEqual(self.events(run, "independence_degraded"), [])
 
     # The one-shot planner
 

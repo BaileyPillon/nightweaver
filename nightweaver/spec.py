@@ -384,6 +384,7 @@ def validate(raw, relative_to=None, store=None):
     bounds = {"max_calls": (1, 10000), "max_seconds": (1, 604800), "max_observed_tokens": (1, 1000000000),
               "idle_timeout": (1, 14400), "max_log_bytes": (1024, 256 * 1024 * 1024)}
     out["budgets"] = {key: integer(value, key, *bounds[key]) for key, value in budgets.items()}
+    out["idle_default"] = True  # written by 0.19 only: the engine applies its idle watchdog to plans that carry this, never to saved older ones
     if "git_timeout" in raw:
         out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
     retry = raw.get("retry", {})

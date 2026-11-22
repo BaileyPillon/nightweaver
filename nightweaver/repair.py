@@ -4,7 +4,7 @@ import hashlib
 
 from .spec import fields, integer
 
-FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google", "command": "custom"}
+FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google"}
 
 
 def policy(raw):
@@ -103,7 +103,8 @@ def combined_failure(failures):
 
 
 def family(route):
-    return FAMILIES.get(route.get("kind"), route.get("kind"))
+    """The vendor family of a route, or None when it is not known: a command route may wrap any vendor or none."""
+    return FAMILIES.get(route.get("kind"))
 
 
 def fingerprint(phase, signature, failed_gates=(), exit_code=None, reason="", feedback=0):
@@ -129,6 +130,15 @@ def cause_line(phase, failed_gates, count, used, attempts, repeated):
     if repeated:
         return f"Stopped: the same {phase} failure happened {count} times on the same build"
     return f"Stopped: {used} of {attempts} attempts used"
+
+
+def droppings_note(droppings, step, attempt):
+    """What to tell a worker whose checks failed after tool droppings were deleted from its worktree, or "" when none were this attempt."""
+    if not droppings or (droppings.get("step"), droppings.get("attempt")) != (step, attempt) or not droppings.get("paths"):
+        return ""
+    names = ", ".join(droppings["paths"][:6]) + (" ..." if len(droppings["paths"]) > 6 else "")
+    return (f"Note: tool droppings were deleted before the checks ran (new debug.log, chrome_debug.log, *.dmp or .playwright-mcp/ files "
+            f"the milestone paths do not name): {names}. Name a path in the milestone paths to keep it.\n\n")
 
 
 def blocked_message(cause, reason, summary):

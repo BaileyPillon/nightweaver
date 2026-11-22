@@ -418,21 +418,26 @@ class WatchdogAndGit(unittest.TestCase):
                 validate({**base, "git_timeout": value})
         seen = []
         real = subprocess.run
+        real_owned = engine.run_owned
 
         def spy(argv, *args, **kwargs):
             if argv[0] == "git":
                 seen.append((tuple(argv[3:5]), kwargs["timeout"]))
             return real(argv, *args, **kwargs)
 
+        def spy_owned(argv, limit, env):  # `worktree add` runs under its own job object, so that a timeout can end its whole tree
+            seen.append((tuple(argv[3:5]), limit))
+            return real_owned(argv, limit, env)
+
         slow = self.configured(fixtures.fixture("good"), git_timeout=1200)
-        with patch.object(engine.subprocess, "run", spy):
+        with patch.object(engine.subprocess, "run", spy), patch.object(engine, "run_owned", spy_owned):
             self.assertEqual(Run(self.store, slow).run(), "done")
         added = seen.index((("worktree", "add"), 1200))
         self.assertEqual({timeout for _, timeout in seen[added:]}, {1200}, "every call after the worktree uses the plan's value")
         seen.clear()
         engine.GIT_TIMEOUT = 90
         quick = self.configured(fixtures.fixture("good"), git_timeout=40)
-        with patch.object(engine.subprocess, "run", spy):
+        with patch.object(engine.subprocess, "run", spy), patch.object(engine, "run_owned", spy_owned):
             self.assertEqual(Run(self.store, quick).run(), "done")
         added = seen.index((("worktree", "add"), 900))
         self.assertEqual({timeout for _, timeout in seen[added + 1:]}, {40}, "the worktree gets at least 900 s, the rest the plan's 40 s")
@@ -444,16 +449,16 @@ class WatchdogAndGit(unittest.TestCase):
 
     def test_a_worktree_that_times_out_is_cleaned_up_and_explained(self):
         run = self.configured(fixtures.fixture("good"), git_timeout=60)
-        real = subprocess.run
+        real = engine.run_owned
 
-        def spy(argv, *args, **kwargs):
-            if argv[0] == "git" and tuple(argv[3:5]) == ("worktree", "add"):
+        def spy(argv, limit, env):
+            if tuple(argv[3:5]) == ("worktree", "add"):
                 Path(argv[-2]).mkdir(parents=True)
                 (Path(argv[-2]) / "half.txt").write_text("partial", encoding="utf-8")
-                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-            return real(argv, *args, **kwargs)
+                raise subprocess.TimeoutExpired(argv, limit)
+            return real(argv, limit, env)
 
-        with patch.object(engine.subprocess, "run", spy):
+        with patch.object(engine, "run_owned", spy):
             self.assertEqual(Run(self.store, run).run(), "blocked")
         state = self.store.get(run)["state"]
         self.assertIn("took more than 900 seconds", state["last_error"])
@@ -489,7 +494,8 @@ class ToolDroppings(unittest.TestCase):
         snapshot = tree(path, self.head, ["result.txt"], [])
         self.assertEqual(self.names(path), ["result.txt"])
         self.assertEqual(git(path, "ls-tree", "-r", "--name-only", snapshot).splitlines(), [".gitignore", "result.txt"])
-        self.assertTrue((path / "debug.log").is_file(), "the files stay on disk, only out of the candidate")
+        self.assertFalse((path / "debug.log").exists(), "a dropping is deleted too, so no check can pass on a file the commit lacks")
+        self.assertTrue((path / "result.txt").is_file())
         self.assertEqual(tree(path, self.head, ["result.txt"], []), snapshot, "a second snapshot is identical")
 
     def test_only_droppings_means_no_tracked_changes(self):
