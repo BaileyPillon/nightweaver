@@ -374,6 +374,8 @@ class OneShotTests(unittest.TestCase):
             if role == "worker":
                 sessions.append(session)
                 (path / "result.txt").write_text("ready")
+                # A worker that changes nothing after a rejected review is stopped by the no-progress check.
+                (path / "notes.txt").write_text(f"attempt {len(sessions)}")
                 return 0, "worker-thread", ""
             reviews.append(config["kind"])
             if len(reviews) == 1:

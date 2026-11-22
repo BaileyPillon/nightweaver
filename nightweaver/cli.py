@@ -15,8 +15,10 @@ from .engine import Run, checkout, create_run, directory_identity, fork_run, pen
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
+from .repair import conflict_brief
 from .spec import IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
+from .verdicts import conflict_notes, extract_object
 from .safety import redact
 
 
@@ -132,6 +134,8 @@ def plan_goal(store, args, template=None):
         "The final milestone must also pass the final checks. If there are no per-milestone checks, return one milestone. "
         "If there is no way to split the work while passing the per-milestone checks, return one milestone. "
         'Return only JSON {"milestones":[{"title":"...","task":"..."}]}. '
+        "If any requirements contradict each other or cannot be satisfied as stated (including with the access and tools described), "
+        'list them as an additional "conflicts":["..."] array next to milestones; otherwise omit it. '
         "These checks were chosen by the operator, keep them as provided: "
         + json.dumps(gates) + "\nFinal checks: " + json.dumps(final_gates)
         + "\nAcceptance requirements: " + json.dumps(raw.get("acceptance", []))
@@ -180,8 +184,10 @@ def plan_goal(store, args, template=None):
             ) from error
         if code:
             raise ValueError(f"Planner exited {code}. See {log}")
-        response = json_response(answer)
-    fields(response, "milestones", "planner response")
+        response = extract_object(answer, "milestones")
+    fields(response, "milestones conflicts", "planner response")
+    conflicts = conflict_notes(response.get("conflicts"))
+    notes = "\n\n" + conflict_brief(conflicts) if conflicts else ""
     milestones = response.get("milestones", [])
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 5:
         raise ValueError("Planner did not return one to five milestones")
@@ -204,13 +210,13 @@ def plan_goal(store, args, template=None):
         text(item, "title")
         text(item, "task")
     if fixed:
-        raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"]}
+        raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"] + notes}
                              for original,proposed in zip(template_steps, milestones)]
     elif not gates and len(milestones) > 1:
         raw["milestones"] = [{"title": raw["title"], "task": "\n\n".join(
-            f"{s['title']}\n{s['task']}" for s in milestones)}]
+            f"{s['title']}\n{s['task']}" for s in milestones) + notes}]
     else:
-        raw["milestones"] = milestones
+        raw["milestones"] = [{**item, "task": item["task"] + notes} for item in milestones] if notes else milestones
     spec = validate(raw, store=store)
     if pin_source:
         current = source_info(store, spec)
@@ -219,7 +225,7 @@ def plan_goal(store, args, template=None):
         spec.update(git_directory_identity=identity, git_common_dir=source["git_common_dir"])
     if args.start or args.enqueue:
         result = register(store, spec, args)
-        return {**result, "milestones": raw["milestones"]}
+        return {**result, "milestones": raw["milestones"], **({"planner_conflicts": conflicts} if conflicts else {})}
     return raw
 
 

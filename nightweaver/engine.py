@@ -370,8 +370,8 @@ class Run:
     def evidence_dir(self, state):
         return self.root / "evidence" / f"{state['step'] + 1:02d}" / f"{state['attempt']:02d}"
 
-    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, **state):
-        from .repair import describe, next_worker
+    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, finding=None, **state):
+        from .repair import blocked_message, cause_line, describe, fingerprint, next_worker
         current = self.store.get(self.id)["state"]
         reason = redact(reason)
         path = self.root / "worktrees" / f"{current['step'] + 1:02d}"
@@ -383,14 +383,15 @@ class Run:
             changed = [n for n in names.split("\0") if n]
         except (ValueError, OSError):
             signature = "unknown"
-        fingerprint = hashlib.sha256(f"{phase}\n{reason}\n{signature}".encode()).hexdigest()
-        count = current.get("failure_count", 0) + 1 if fingerprint == current.get("failure_fingerprint") else 1
+        # The identity of a failure is what failed on which build, never how it was worded.
+        identity = fingerprint(phase, signature, failed_gates, exit_code, reason, current.get("feedback_version", 0))
+        count = current.get("failure_count", 0) + 1 if identity == current.get("failure_fingerprint") else 1
         limit = self.spec.get("retry", {}).get("repeated_failure_limit", 3)
         step = self.spec["milestones"][current["step"]]
         active = current.get("worker_route", 0)
         used = current.get("attempts_used", current["attempt"])
         repair = self.spec.get("repair", {})
-        eligible = repairable and phase in ("worker", "snapshot", "check", "review")
+        eligible = repairable and phase in ("worker", "snapshot", "check", "review", "no_progress")
         streak = current.get("route_rejections", 0) + int(eligible)
         target = next_worker(step, active) if eligible and repair.get("switch_after") and streak >= repair["switch_after"] else None
         handoff = target is not None and used < self.spec["attempts"]
@@ -398,25 +399,39 @@ class Run:
         exhausted = used >= self.spec["attempts"]
         blocked = repeated or exhausted
         location = {"step": current["step"] + 1, "attempt": current["attempt"]}
-        event = None
+        event = cause = None
+        message = reason
+        if blocked:
+            # An operator reads the cause first, then the last failure, then the worker's own account.
+            cause = cause_line(phase, list(failed_gates), count, used, self.spec["attempts"], repeated)
+            message = blocked_message(cause, reason, state.get("worker_summary", current.get("worker_summary", "")))
         if handoff:
             routes = [step["worker"], *step["worker_fallbacks"]]
             event = ("repair_handoff", {**location, "from": describe(routes[active]), "to": describe(routes[target]),
                      "from_route": active, "to_route": target, "tree": signature, "phase": phase, "failed_gates": list(failed_gates)})
             state.update(worker_route=target, worker_session=None)
         elif repeated:
-            event = ("repeated_failure_stopped", {"issue": reason, "count": count})
+            event = ("repeated_failure_stopped", {"issue": reason, "count": count, "cause": cause})
         elif exhausted:
-            event = ("blocked", {"issue": reason})
+            event = ("blocked", {"issue": reason, "cause": cause})
         elif eligible and repair.get("fresh_session_after") and streak >= repair["fresh_session_after"]:
             state["worker_session"] = None
+        # Remember this milestone's rejected builds so work() can tell when the worker changed nothing.
+        trees = current.get("rejected_trees", []) if current.get("rejected_step") == current["step"] else []
+        remembered = trees[-1].get("issue", reason) if phase == "no_progress" and trees else reason
+        # A review that gave no readable feedback is not feedback the worker could have ignored.
+        kept = "review_unreadable" if phase == "review" and not finding else phase
+        older = [{"tree": item["tree"], "phase": item["phase"]} for item in trees]
+        state.update(rejected_trees=[*older, {"tree": signature, "phase": kept, "issue": remembered[:3000]}][-4:],
+                     rejected_step=current["step"])
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
         self.set("attempt_rejected", {**location, "phase": phase, "issue": reason, "same_failure_count": count, "exit": exit_code,
                  "tree": signature, "route": active, "failed_gates": list(failed_gates), "worker": describe(self.route(current, step, "worker")),
-                 "changed_paths": changed[:12], "changed_path_count": len(changed), "diagnostic_log": current.get("log")},
-                 following_event=event, phase="blocked" if blocked else "ready", last_error=reason,
-                 failure_fingerprint=None if handoff else fingerprint, route_rejections=0 if handoff else streak,
+                 "changed_paths": changed[:12], "changed_path_count": len(changed), "diagnostic_log": current.get("log"),
+                 **({"finding": redact(finding)[:3000]} if finding else {})},
+                 following_event=event, phase="blocked" if blocked else "ready", last_error=message,
+                 failure_fingerprint=None if handoff else identity, route_rejections=0 if handoff else streak,
                  failure_count=0 if handoff else count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
 
     def worker_prompt(self, state, step):
@@ -440,6 +455,12 @@ class Run:
         history = failure_brief(self.store, self.id, state, self.spec.get("repair", {}).get("history", 0))
         from .pursuit import worker_brief
         pursuit = worker_brief(self.spec, state)
+        from .repair import conflict_brief
+        notes = conflict_brief(state.get("pursuit_conflicts"))
+        advice = state.get("advice_note")
+        if advice and state.get("advice_step") in (state["step"], state["step"] - 1):
+            which = "this milestone's previous review" if state.get("advice_step") == state["step"] else "the previous milestone"
+            notes += f"{chr(10) * bool(notes)}Local reviewer note from {which}: {advice}"
         return (
             f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}{chr(10) + pursuit if pursuit else ''}\n"
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
@@ -453,6 +474,7 @@ class Run:
             f"{checks}\n\n{context.brief(self.store, self.id)}\n\n"
             f"Budget remaining before this call: {budget_status(self.spec, state)['remaining']}\n"
             f"Operator updates\n{self.store.feedback_text(self.id) or 'None'}\n\n"
+            f"{notes + chr(10) + chr(10) if notes else ''}"
             f"{history}Last observed failure (if any)\n{state['last_error'] or 'None'}\n"
             f"Previous diagnostic log: {state.get('log') if state.get('last_error') else 'None'}"
         )
@@ -475,12 +497,41 @@ class Run:
                  worker_feedback_version=state.get("feedback_version", 0))
         code, session, answer = self.call_provider(config, "worker", path, log, self.worker_prompt(state, step),
                                                    state.get("worker_session"))
+        summary = redact(answer or "").strip()[:1500]
+        stalls = state.get("worker_stalls", 0)
+        if code == 125 and stalls < 2:
+            # A stalled worker is a transient, not a product failure: refund the attempt and start a fresh session.
+            policy = self.spec.get("retry", {})
+            delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** stalls)
+            self.set("worker_stalled", {"attempt": next_state["attempt"], "stall": stalls + 1, "stalls_allowed": 2, "exit": code,
+                     "log": str(log), "seconds": delay}, phase="ready", attempts_used=used, worker_session=None,
+                     worker_stalls=stalls + 1, log=state.get("log"),
+                     retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat())
+            return
         if code:
             label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None)
+            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None,
+                        worker_stalls=0, worker_summary=summary)
             return
         self.set("worker_finished", {"exit": code, "session": session, "log": str(log)},
-                 phase="checking", worker_session=session, transient_failures=0)
+                 phase="checking", worker_session=session, transient_failures=0, worker_stalls=0, review_parse_failures=0,
+                 worker_summary=summary)
+        previous = self.unchanged_since_rejection(state, path)
+        if previous:
+            self.reject("The worker made no change after the previous rejection. The same build was already rejected, so the "
+                        "checks and the reviewer were not run again.\nPrevious rejection:\n" + previous.get("issue", "")[:3000],
+                        "no_progress")
+
+    def unchanged_since_rejection(self, state, path):
+        """The previous rejected build of this milestone if a reviewer turned it down and the worker left it untouched."""
+        trees = state.get("rejected_trees") or []
+        if state.get("rejected_step") != state["step"] or not trees or trees[-1].get("phase") not in ("review", "no_progress"):
+            return None
+        try:
+            git(path, "add", "-A", "--", ".")
+            return trees[-1] if git(path, "write-tree") == trees[-1]["tree"] else None
+        except (ValueError, OSError):
+            return None
 
     def verify(self, state, step, path):
         try:
@@ -661,64 +712,65 @@ class Run:
         if checks is None:
             return
         diff = git(path, "diff", "--cached", "--stat", state["accepted"])
+        note = None
+        if self.spec.get("advisory_ollama"):
+            # The local model speaks first so the reviewer can use what it noticed.
+            note, stop = self.local_note(state, step, snapshot, evidence, diff, checks)
+            if stop:
+                return
+            self.check_budget()
         decision = (f"Goal: {self.spec['objective']}\n{self.acceptance_brief()}"
                     f"Budget remaining before review: {budget_status(self.spec, state)['remaining']}\nTask: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}\n"
                     f"{context.brief(self.store, self.id)}\nOperator updates\n{self.store.feedback_text(self.id) or 'None'}")
         if self.spec.get("reviewer"):
-            log = evidence / f"review-{state.get('provider_calls', 0) + 1:04d}.jsonl"
+            from .repair import prior_findings
+            from .verdicts import extract_verdict
             config = self.route(state, step, "reviewer")
-            self.set("review_started", {"adapter": config["kind"], "tree": snapshot}, log=str(log), retry_at=None)
+            self.independence(state, "reviewer", config, self.route(state, step, "worker"))
+            material, images = self.review_material(path, state, evidence)
+            findings = prior_findings(self.store, self.id, state)
             prompt = (
                 "Independently review these uncommitted, already tested changes. Read actual source and review "
                 "the supplied check logs and artifacts, including screenshots when UI is part of the task. "
                 "If required evidence cannot be read or has not been inspected, return REVISE and explain. Remain read-only. "
-                'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision
+                'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision + "\n\n" + material
             )
+            if note:
+                prompt += f"\n\nA local model suggested checking: {note}. Verify it if relevant."
+            if findings:
+                prompt += ("\n\nYour own earlier findings on this milestone\n" + "\n".join(findings)
+                           + "\nVerify these earlier findings were addressed. Return REVISE only for defects that matter for the task, "
+                           "the acceptance requirements or the goal; mention minor polish inside the reason of a PASS. "
+                           "Do not raise new nitpicks about code that did not change.")
             if state["step"] + 1 == len(self.spec["milestones"]) and not self.spec.get("pursue"):
                 prompt += ("\nThis is the final milestone. Also check the complete project objective against the current "
                            "worktree and supplied evidence. Return REVISE for any unfulfilled part of that objective.")
-            code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence)
-            try:
-                review = json_response(answer) if code == 0 else {}
-                accepted = review.get("verdict") == "PASS" and bool(review.get("reason", "").strip())
-            except (ValueError, AttributeError):
-                accepted, review = False, {}
-            if not accepted:
-                self.reject("Independent review requested changes or returned no valid PASS.\n"
-                            + str(review.get("reason") or answer or tail(log))[:3600], "review")
-                return
-            self.set("review_passed", {"reason": review["reason"], "tree": snapshot, "log": str(log)})
-        if self.spec.get("advisory_ollama"):
-            self.check_budget(call=True)
-            current = self.store.get(self.id)["state"]
-            pending = {"call": current.get("provider_calls", 0) + 1, "role": "advisory", "provider": "ollama",
-                       "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
-                       "step": state["step"] + 1, "attempt": state["attempt"],
-                       "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
-            if "think" in self.spec["advisory_ollama"]:
-                pending["think"] = self.spec["advisory_ollama"]["think"]
-            self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
-            try:
-                config = dict(self.spec["advisory_ollama"])
-                if self.spec.get("budgets", {}).get("max_seconds"):
-                    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
-                    config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
-                summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
-                inference = {}
-                note = advisory(config,
-                                f"In one sentence, suggest any missing validation.\n"
-                                f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}", receipt=inference)
-                self.set("local_advice", {"note": note, "tree": snapshot, "inference": inference})
-                write_json(Path(pending["log"]), {"note": redact(note), "inference": inference})
-            except (OSError, ValueError) as error:
-                self.set("local_advice_unavailable", {"reason": str(error)})
-                if self.spec["advisory_ollama"].get("required"):
-                    self.set("local_advice_required", {"model": self.spec["advisory_ollama"]["model"]},
-                             phase="blocked", blocked_from="reviewing", last_error=f"Required local review failed: {error}")
+            failures = state.get("review_parse_failures", 0)
+            while True:
+                log = evidence / f"review-{self.store.get(self.id)['state'].get('provider_calls', 0) + 1:04d}.jsonl"
+                self.set("review_started", {"adapter": config["kind"], "tree": snapshot}, log=str(log), retry_at=None)
+                code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence, images=images)
+                try:
+                    review = extract_verdict(answer, ("PASS", "REVISE")) if code == 0 else None
+                except ValueError:
+                    review = None
+                if code or review:
+                    break
+                # The reviewer answered but gave no verdict we can read. That is not a rejection of the work: ask once more.
+                failures += 1
+                excerpt = redact(answer or tail(log)).strip()[:1200]
+                if failures >= 2:
+                    self.reject(f"The reviewer's answer could not be parsed. Excerpt:\n{excerpt}", "review", review_parse_failures=0)
                     return
-            finally:
-                self.finish_call(pending)
-            self.check_budget()
+                self.set("review_unparseable", {"attempt": state["attempt"], "count": failures, "log": str(log), "excerpt": excerpt[:600]},
+                         review_parse_failures=failures)
+            reason = review.get("reason") if review and isinstance(review.get("reason"), str) else ""
+            if not review or review["verdict"] != "PASS" or not reason.strip():
+                text = str(reason.strip() or answer or tail(log))[:3600]
+                self.reject("Independent review requested changes or returned no valid PASS.\n" + text, "review",
+                            finding=text if review and review["verdict"] == "REVISE" else None, review_parse_failures=0)
+                return
+            self.set("review_passed", {"reason": reason, "tree": snapshot, "log": str(log)}, review_parse_failures=0)
         if self.snapshot(path, state, step) != snapshot:
             self.set("snapshot_changed", {"previous": snapshot}, phase="checking")
             return
@@ -728,6 +780,74 @@ class Run:
         commit = git(path, "commit-tree", snapshot, "-p", state["accepted"], "-m", step["title"])
         self.set("promotion_prepared", {"commit": commit, "tree": snapshot},
                  phase="promoting", candidate=commit)
+
+    def local_note(self, state, step, snapshot, evidence, diff, checks):
+        """One sentence from the loopback model. Returns (note, stop); stop means a required local review failed."""
+        self.check_budget(call=True)
+        current = self.store.get(self.id)["state"]
+        pending = {"call": current.get("provider_calls", 0) + 1, "role": "advisory", "provider": "ollama",
+                   "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
+                   "step": state["step"] + 1, "attempt": state["attempt"],
+                   "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
+        if "think" in self.spec["advisory_ollama"]:
+            pending["think"] = self.spec["advisory_ollama"]["think"]
+        self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
+        note = None
+        try:
+            config = dict(self.spec["advisory_ollama"])
+            if self.spec.get("budgets", {}).get("max_seconds"):
+                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
+                config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
+            summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
+            inference = {}
+            note = advisory(config,
+                            f"In one sentence, suggest any missing validation.\n"
+                            f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}", receipt=inference)
+            self.set("local_advice", {"note": note, "tree": snapshot, "inference": inference},
+                     advice_note=redact(note)[:1500], advice_step=state["step"])
+            write_json(Path(pending["log"]), {"note": redact(note), "inference": inference})
+        except (OSError, ValueError) as error:
+            note = None
+            self.set("local_advice_unavailable", {"reason": str(error)})
+            if self.spec["advisory_ollama"].get("required"):
+                self.set("local_advice_required", {"model": self.spec["advisory_ollama"]["model"]},
+                         phase="blocked", blocked_from="reviewing", last_error=f"Required local review failed: {error}")
+                return None, True
+        finally:
+            self.finish_call(pending)
+        return note and redact(note)[:1500], False
+
+    def review_material(self, path, state, evidence):
+        """The real change as a saved patch with an inline excerpt, and the screenshots this attempt produced."""
+        from .pursuit import screenshots
+        raw = git_bytes(path, "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", state["accepted"])
+        cap = 400 * 1024
+        body = raw[:cap]
+        notice = f"\n[Diff truncated at 400 KB; {len(raw) - cap} bytes omitted.]\n".encode() if len(raw) > cap else b""
+        patch = evidence / "review-diff.patch"
+        atomic_write(patch, body + notice)
+        excerpt = body[:16 * 1024].decode("utf-8", "replace")
+        text = (f"Full change: the complete staged diff is saved at {patch} ({len(raw)} bytes"
+                f"{'; truncated to 400 KB' if notice else ''}). Read that file for anything beyond the first 16 KB shown here.\n"
+                + excerpt + ("\n[Excerpt truncated.]" if len(body) > 16 * 1024 else ""))
+        images = screenshots(evidence)
+        if images:
+            text += ("\n\nScreenshots produced by this attempt's checks. OPEN each image file listed here with your file-reading tool "
+                     "and judge what you actually see, not what any log claims:\n" + "\n".join(f"- {image}" for image in images))
+        return text, images
+
+    def independence(self, state, role, config, worker):
+        """Warn once per role and pair when the checker is the same vendor family as the worker."""
+        from .repair import describe, family
+        if family(config) != family(worker):
+            return
+        pair = f"{role}:{json.dumps(describe(worker), sort_keys=True)}>{json.dumps(describe(config), sort_keys=True)}"
+        warned = self.store.get(self.id)["state"].get("independence_warned", [])
+        if pair not in warned:
+            self.set("independence_degraded", {"role": role, "worker": {**describe(worker), "family": family(worker)},
+                     "reviewer_or_judge": {**describe(config), "family": family(config)},
+                     "issue": f"The {role} comes from the same vendor family as the worker, so its verdict is less independent."},
+                     independence_warned=[*warned, pair])
 
     def snapshot(self, path, state, step):
         return tree(path, state["accepted"], step["paths"], self.spec.get("protected_paths", []))
