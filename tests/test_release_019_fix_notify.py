@@ -112,14 +112,14 @@ class TerminalBlocks(Base):
     def test_a_dispatcher_failure_reaches_the_notifier_without_paths(self):
         self.enable()
         run = self.configured(fixtures.fixture("good"), enqueue=True, title="Queued job")
-        with patch("nightweaver.cli.Run.run", side_effect=OSError(r"C:\Users\Bailey\private plans\notes.txt: access denied")):
+        with patch("nightweaver.cli.Run.run", side_effect=OSError(r"C:\Users\Robin\private plans\notes.txt: access denied")):
             self.assertEqual(dispatch(self.store, False), [{"run_id": run, "phase": "blocked"}])
         (post,) = self.ntfy.of("POST")
         body = post["body"].decode()
         self.assertEqual(self.store.get(run)["state"]["phase"], "blocked")
         self.assertEqual((post["headers"]["title"], post["headers"]["priority"]), ("Queued job", "4"))
         self.assertTrue(body.startswith("Stopped: the dispatcher could not run this: "), body)
-        for leak in ("Bailey", "private plans", "notes.txt", "C:\\"):
+        for leak in ("Robin", "private plans", "notes.txt", "C:\\"):
             self.assertNotIn(leak, body)
 
     def test_a_guard_that_gives_up_notifies_and_the_digest_calls_the_run_stuck(self):
@@ -170,20 +170,20 @@ class BlockedCause(Base):
 
     def test_a_judge_failure_keeps_the_exit_code_and_drops_the_log_tail(self):
         self.enable()
-        tail = 'ool_use","name":"Read","input":{"file_path":"C:\\\\Users\\\\Bailey\\\\secret plans\\\\notes.txt"}} ' + "z" * 500
+        tail = 'ool_use","name":"Read","input":{"file_path":"C:\\\\Users\\\\Robin\\\\secret plans\\\\notes.txt"}} ' + "z" * 500
         line = self.blocked(issue=f"The judge exited 1: {tail}")
         self.assertEqual(line, "Blocked: The judge exited 1.")
 
     def test_paths_and_token_like_words_never_leave_the_machine(self):
         self.enable()
-        line = self.blocked(issue="git failed: fatal: unable to access 'C:/Users/Bailey/repo/.git/index.lock': denied, then "
-                                  "/home/bailey/.ssh/id_rsa and src\\app\\main.py with a3f9c2e1b4d5a6f7a3f9c2e1b4d5a6f7 left over")
+        line = self.blocked(issue="git failed: fatal: unable to access 'C:/Users/Robin/repo/.git/index.lock': denied, then "
+                                  "/home/robin/.ssh/id_rsa and src\\app\\main.py with a3f9c2e1b4d5a6f7a3f9c2e1b4d5a6f7 left over")
         self.assertEqual(line, "Blocked: a git command failed.", "git's own text is replaced by a fixed phrase")
         notify.forget()
         self.ntfy.requests.clear()
-        line = self.blocked(issue="could not read C:/Users/Bailey/repo/notes.txt then /home/bailey/.ssh/id_rsa and src\\app\\main.py "
+        line = self.blocked(issue="could not read C:/Users/Robin/repo/notes.txt then /home/robin/.ssh/id_rsa and src\\app\\main.py "
                                   "with a3f9c2e1b4d5a6f7a3f9c2e1b4d5a6f7 left over")
-        for leak in ("Bailey", "bailey", "notes.txt", "id_rsa", "main.py", "a3f9c2e1"):
+        for leak in ("Robin", "robin", "notes.txt", "id_rsa", "main.py", "a3f9c2e1"):
             self.assertNotIn(leak, line)
         self.assertEqual(line, "Blocked: could not read <path>.")
 
@@ -203,12 +203,12 @@ class BlockedCause(Base):
     def test_the_digest_and_the_hold_are_just_as_clean(self):
         self.enable(max_per_night=0, quiet_hours="23:00-07:00")
         run = self.run_row(title="Leaky")
-        self.store.transition(run.id, "blocked", {"issue": "x"}, phase="blocked", last_error=r"open C:\Users\Bailey\vault\keys.txt failed")
+        self.store.transition(run.id, "blocked", {"issue": "x"}, phase="blocked", last_error=r"open C:\Users\Robin\vault\keys.txt failed")
         with at(NIGHT):
-            self.run_row().set("blocked", {"issue": r"open C:\Users\Bailey\vault\keys.txt failed"})
+            self.run_row().set("blocked", {"issue": r"open C:\Users\Robin\vault\keys.txt failed"})
             notify.flush()
         text = (self.store.root / "notify-state.json").read_text(encoding="utf-8") + notify.digest(self.store, 12)["message"]
-        self.assertNotIn("Bailey", text)
+        self.assertNotIn("Robin", text)
         self.assertNotIn("keys.txt", text)
 
 
@@ -759,7 +759,7 @@ class RawErrorText(unittest.TestCase):
                  ({"issue": "The judge terminated with code 1: customer_ssn=123-45-6789 in data.csv"}, "Blocked: The judge terminated with code 1."),
                  ({"issue": "could not read data.csv today"}, "Blocked: could not read <redacted>."),
                  ({"issue": 'The worker could not open "my private notes" for reading'}, "Blocked: The worker could not open <redacted>."),
-                 ({"issue": r"[WinError 5] Access is denied: 'C:\Users\Bailey\vault'"}, "Blocked: access was denied."),
+                 ({"issue": r"[WinError 5] Access is denied: 'C:\Users\Robin\vault'"}, "Blocked: access was denied."),
                  ({"issue": "Review kept asking for changes"}, "Blocked: Review kept asking for changes."),
                  ({"issue": "Pause naïve"}, "Blocked: Pause naïve."),
                  ({"issue": "Crashed with api_key=sk-abcdefghijklmnop1234 set"}, "Blocked: Crashed with api_key=[REDACTED] set."),
