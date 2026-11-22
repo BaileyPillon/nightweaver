@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from nightweaver import browser, discovery, pursuit, sweep
+from nightweaver import browser, discovery, pursuit, stall, sweep
 from nightweaver.checks import evidence_folder, read_browser_evidence, run_gate, verify_saved_sample
 from nightweaver.diagnostics import probe_browser_channels
 from nightweaver.engine import Run, git
@@ -57,6 +57,16 @@ def repository(root, files):
     git(root, "add", "-A")
     git(root, "commit", "-m", "fixture", "--allow-empty")
     return root
+
+
+def impl_page_class():
+    """Playwright's own Page class, the one whose coroutines the sync wrapper waits on. Its module was renamed between releases."""
+    for name in ("playwright._impl._page", "playwright._impl.page"):
+        try:
+            return importlib.import_module(name).Page
+        except ImportError:
+            continue
+    raise unittest.SkipTest("Playwright keeps its Page class somewhere this test does not know")
 
 
 def browser_ready():
@@ -996,30 +1006,105 @@ class SweepRunTests(unittest.TestCase):
 
     def test_a_popup_whose_event_arrives_late_is_still_this_controls_and_is_not_the_next_ones(self):
         from playwright.sync_api import Page
-        on, wait, held, delivered = Page.on, Page.wait_for_timeout, [], []
+        page = (HEAD + "<body><button onclick=\"window.open('about.html')\">Popup</button><button " + mode("dawn") + ">Paint</button><button "
+                + mode("noon") + ">Paint2</button></body></html>")
+        # 1.5 s is a loaded machine; 3.5 s is longer than the sweep waits for a popup's event, so the next control is already being clicked
+        # when it comes (the sweep used to credit it to that control, and at 5 s to the one after).
+        for delay in (1.5, 3.5):
+            with self.subTest(delay=delay):
+                on, wait, held, delivered = Page.on, Page.wait_for_timeout, [], []
 
-        def late_on(self, event, handler):
-            # The popup event reaches its handlers 1.5 s late, far past the settle, as it can on a loaded machine.
-            return on(self, event, (lambda popup: held.append((time.monotonic() + 1.5, handler, popup))) if event == "popup" else handler)
+                def late_on(self, event, handler):
+                    # The popup event reaches its handlers late, far past the settle.
+                    return on(self, event, (lambda popup: held.append((time.monotonic() + delay, handler, popup))) if event == "popup" else handler)
 
-        def wait_then_deliver(self, timeout):
-            # The main thread's own waits deliver what has come due. A Playwright object belongs to the thread that started it: a timer
-            # thread (as this test once used) that calls into one writes to the driver's pipe from a second thread, and that can leave
-            # asyncio's proactor waiting for ever to close the loop, which hung a CI shard for an hour.
-            wait(self, timeout)
-            for item in [h for h in held if h[0] <= time.monotonic()]:
-                held.remove(item)
-                delivered.append(item[0])
-                item[1](item[2])
+                def wait_then_deliver(self, timeout):
+                    # The main thread's own waits deliver what has come due. A Playwright object belongs to the thread that started it: a timer
+                    # thread (as this test once used) that calls into one writes to the driver's pipe from a second thread, and that can leave
+                    # asyncio's proactor waiting for ever to close the loop, which hung a CI shard for an hour.
+                    wait(self, timeout)
+                    for item in [h for h in held if h[0] <= time.monotonic()]:
+                        held.remove(item)
+                        delivered.append(item[0])
+                        item[1](item[2])
 
-        page = (HEAD + "<body><button onclick=\"window.open('about.html')\">Popup</button><button " + mode("dawn") + ">Paint</button></body></html>")
-        with patch.object(Page, "on", late_on), patch.object(Page, "wait_for_timeout", wait_then_deliver):
-            report, _ = self.direct({"index.html": page}, {})
+                with patch.object(Page, "on", late_on), patch.object(Page, "wait_for_timeout", wait_then_deliver):
+                    report, _ = self.direct({"index.html": page}, {})
+                self.assertTrue(report["passed"], [v["errors"] for v in report["viewports"]])
+                self.assertTrue(delivered and not held, "the popup event was held back and then delivered, not dropped")
+                rows = self.swept(report)
+                self.assertEqual([rows[n]["opened"] for n in ("Popup", "Paint", "Paint2")], [["popup"], [], []])
+                self.assertFalse(any(rows[n]["navigated"] for n in rows))
+
+    def test_a_popup_the_page_opens_seconds_after_the_click_is_still_that_controls_and_is_not_the_next_ones(self):
+        later = lambda body: HEAD + "<body>" + body + "<button " + mode("dawn") + ">Paint</button><button " + mode("noon") + ">Paint2</button></body></html>"
+        pages = {
+            # The page's own timer, longer than the sweep's settle and its wait for a popup.
+            "timer": "<button onclick=\"setTimeout(() => window.open('about.html'), 3000)\">Popup</button>",
+            # The code after an await runs in a microtask of the timer's callback.
+            "await": "<button onclick=\"(async () => { await new Promise(done => setTimeout(done, 2500)); window.open('about.html'); })()\">Popup</button>",
+        }
+        for label, body in pages.items():
+            with self.subTest(label):
+                report, _ = self.direct({"index.html": later(body)}, {})
+                self.assertTrue(report["passed"], [v["errors"] for v in report["viewports"]])
+                rows = self.swept(report)
+                self.assertEqual([rows[n]["opened"] for n in ("Popup", "Paint", "Paint2")], [["popup"], [], []], "this control's, not whichever was being clicked")
+                self.assertTrue(all(r["screenshot"] and not r.get("skipped") for r in report["sweep"]))
+
+    def test_a_page_that_keeps_opening_popups_after_one_click_is_blamed_on_that_click_and_not_on_every_later_one(self):
+        steps = [{"action": "visible", "selector": "#anchor"}]  # Steps mean the sweep never reloads, so nothing else stops the interval.
+        page = (HEAD + "<body><h1 id=anchor>Anchor</h1><button onclick=\"setInterval(() => window.open('about.html'), 100)\">Popup</button><button "
+                + mode("dawn") + ">Paint</button><button " + mode("noon") + ">Paint2</button></body></html>")
+        report, _ = self.direct({"index.html": page}, {}, steps=steps)
         self.assertTrue(report["passed"], [v["errors"] for v in report["viewports"]])
-        self.assertTrue(delivered and not held, "the popup event was held back and then delivered, not dropped")
         rows = self.swept(report)
-        self.assertEqual((rows["Popup"]["opened"], rows["Paint"]["opened"]), (["popup"], []))
-        self.assertFalse(rows["Popup"]["navigated"] or rows["Paint"]["navigated"])
+        self.assertEqual([rows[n]["opened"] for n in ("Popup", "Paint", "Paint2")], [["popup"], [], []])
+        self.assertIsNone(report.get("sweep_truncated"))
+
+    def test_popups_that_open_popups_do_not_pass_quietly_as_controls_that_could_not_be_clicked(self):
+        steps = [{"action": "visible", "selector": "#anchor"}]
+        page = (HEAD + "<body><h1 id=anchor>Anchor</h1><button onclick=\"window.open('nest.html')\">Popup</button><button "
+                + mode("dawn") + ">Paint</button><button " + mode("noon") + ">Paint2</button></body></html>")
+        nest = "<!doctype html><title>Nest</title><link rel=icon href=data:,><script>setInterval(() => window.open('nest.html'), 30)</script>"
+        started = time.monotonic()
+        report, _ = self.direct({"index.html": page, "nest.html": nest}, {}, steps=steps)
+        self.assertLess(time.monotonic() - started, 75)
+        rows = self.swept(report)
+        self.assertEqual(rows["Popup"]["opened"], ["popup"])
+        self.assertTrue(all(rows[n]["opened"] == [] for n in rows if n != "Popup"), "the storm is the first control's")
+        if report["passed"]:
+            self.assertTrue(all(r["screenshot"] for r in report["sweep"]), "every control was clicked, because every popup was closed")
+        else:  # The popups could not be closed as fast as they came: that is a failure, with the reason on record.
+            self.assertEqual(report["sweep_truncated"], sweep.STOPS["popups"])
+            self.assertIn("keeps opening popups", " ".join(report["viewports"][0]["errors"]))
+
+    def test_a_browser_that_never_answers_a_question_ends_the_sweep_instead_of_hanging_it(self):
+        """What a page that ran out of memory left behind: the renderer never died and never answered, the driver's own timeout never
+        fired, and the sweep waited on the answer for ever (the 20-minute module limit was the only thing that ended it)."""
+        import asyncio
+        PageImpl = impl_page_class()
+        real, looks = PageImpl.wait_for_function, []
+
+        async def never_answers(self, *args, **kwargs):
+            if "performance.timeOrigin" in kwargs.get("expression", ""):
+                looks.append(1)
+                if len(looks) == 3:  # The look after the first click.
+                    await asyncio.Event().wait()
+            return await real(self, *args, **kwargs)
+
+        page = HEAD + "<body><button " + mode("dawn") + ">Dawn</button><button " + mode("noon") + ">Noon</button></body></html>"
+        started = time.monotonic()
+        with patch.object(PageImpl, "wait_for_function", never_answers), patch.object(sweep, "GRACE", 1):
+            report, out = self.direct({"index.html": page}, {})
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["sweep_truncated"], "page unresponsive")
+        row = report["sweep"][0]
+        self.assertEqual((row["name"], row["screenshot"], row["skipped"]), ("Dawn", None, "Not completed: the page stopped responding"))
+        self.assertTrue(stall.watch.stalled)
+        self.assertEqual(report["viewports"][0]["errors"], ["After clicking 'Dawn': The page stopped responding"])
+        self.evidence(report, out)  # The evidence reader accepts what the stopped sweep left.
 
     def test_a_popup_in_its_own_process_that_never_stops_running_script_is_closed_and_the_sweep_goes_on(self):
         page = (HEAD + "<body><button onclick=\"window.open('spin.html', '_blank', 'noopener')\">Popup</button><button " + mode("dawn") + ">Paint</button></body></html>")
@@ -1066,6 +1151,48 @@ class SweepRunTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
         self.assertIn("did not shut down within 2 seconds", done.stderr)
         self.assertLess(int(done.stdout.split()[-1]), 60)
+
+    def test_a_call_the_interrupt_cannot_free_is_ended_by_stopping_the_driver(self):
+        """The deadline's last resort, with the real driver: the call is waiting on an answer that never comes, and the interrupt that
+        would free it never arrives. Stopping the driver is what makes the waiting call fail, and the verifier shut down afterwards."""
+        code = textwrap.dedent("""
+            import _thread, asyncio, faulthandler, importlib, time
+            faulthandler.dump_traceback_later(100, exit=True)
+            for name in ("playwright._impl._page", "playwright._impl.page"):  # Renamed between releases.
+                try:
+                    PageImpl = importlib.import_module(name).Page
+                    break
+                except ImportError:
+                    pass
+            from nightweaver import browser, stall
+
+            async def never_answers(self, *args, **kwargs):
+                await asyncio.Event().wait()
+
+            _thread.interrupt_main = lambda *args: None  # The interrupt is lost.
+            stall.KILL_AFTER = 1
+            PageImpl.wait_for_function = never_answers
+            started = time.monotonic()
+            try:
+                with browser.browser_runtime(None) as instance:
+                    page = instance.new_page()
+                    try:
+                        with stall.watch.limit(2):
+                            page.wait_for_function("() => true")
+                    except Exception as error:
+                        print("failed", type(error).__name__, round(time.monotonic() - started))
+            except Exception as error:
+                print("shutdown", type(error).__name__)
+            print("ended", round(time.monotonic() - started))
+        """)
+        root = str(Path(__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))}
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=150, cwd=root, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        failed = [line for line in done.stdout.splitlines() if line.startswith("failed ")]
+        self.assertTrue(failed, done.stdout + done.stderr[-2000:])
+        self.assertLess(int(failed[0].split()[-1]), 30, "the driver was stopped shortly after the deadline")
+        self.assertLess(int(done.stdout.split()[-1]), 90)
 
     @unittest.skipUnless(importlib.util.find_spec("PIL"), "Pillow reads the photographs")
     def test_a_script_driven_transition_is_photographed_finished(self):

@@ -21,7 +21,7 @@ from urllib.parse import quote, urlparse
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nightweaver import journeys, sweep as interaction
+from nightweaver import journeys, stall, sweep as interaction
 from nightweaver.spec import strict_json
 from nightweaver.safety import redact, write_json
 from nightweaver.server import CandidateStartupFailure
@@ -366,6 +366,7 @@ def launch_browser(driver, channel, timeout, allow_fallback=True):
         raise RuntimeError(f"{error}\nInstalled browser fallbacks also failed: {'; '.join(failures)}") from error
 
 
+NEW_CONTEXT_SECONDS, CLOSE_CONTEXT_SECONDS = 60, 30  # What a context may take to open and to close before the browser counts as wedged.
 TEARDOWN_SECONDS = 30  # What closing the browser and stopping Playwright's driver may take before the verifier stops waiting for them.
 
 
@@ -396,6 +397,13 @@ def kill_tree(pid):
         pass  # Already gone, or not ours to kill.
 
 
+def kill_driver(driver):
+    """Stop Playwright's driver, and the browser under it, so that every call waiting for them fails instead of waiting for ever."""
+    pid = driver_pid(driver_manager(driver))
+    if pid is not None:
+        kill_tree(pid)
+
+
 def enforce(driver, done, seconds, forced):
     """Watch the teardown from a thread that never calls Playwright: past the deadline it kills the driver (and the browser under
     it), which fails any call still waiting for them, and drops the operations asyncio's Windows proactor still lists. Closing the
@@ -405,9 +413,7 @@ def enforce(driver, done, seconds, forced):
         return
     forced.append(seconds)
     manager = driver_manager(driver)
-    pid = driver_pid(manager)
-    if pid is not None:
-        kill_tree(pid)
+    kill_driver(driver)
     pending = getattr(getattr(getattr(manager, "_loop", None), "_proactor", None), "_cache", None)
     for _ in range(30):
         if done.wait(2):
@@ -442,6 +448,7 @@ def browser_runtime(channel, *, timeout=None, info=None, allow_fallback=True):
 
             driver = stack.enter_context(sync_playwright())
             started.append(driver)
+            stall.watch.bind(lambda: kill_driver(driver))  # A call the browser never answers ends here, not at the job's timeout.
             browser, used, fallback = launch_browser(driver, channel, timeout, allow_fallback)
             stack.callback(browser.close)
         except Exception as error:
@@ -452,6 +459,7 @@ def browser_runtime(channel, *, timeout=None, info=None, allow_fallback=True):
             info.update(requested=channel or "bundled", used=used, fallback=fallback)
         yield browser
     finally:
+        stall.watch.unbind()
         close_bounded(stack, started[0] if started else None)
 
 
@@ -496,20 +504,21 @@ def run_case(
 
     case = journeys.case_prefix(scenario.get("name"), viewport["name"])
     timeout, offline = config["timeout_ms"], config.get("offline", False)
-    context = browser.new_context(
-        viewport={k: viewport[k] for k in ("width", "height")},
-        **{
-            "reduced_motion": "reduce",
+    with stall.watch.limit(NEW_CONTEXT_SECONDS):  # A browser that cannot make a context is stuck, not slow.
+        context = browser.new_context(
+            viewport={k: viewport[k] for k in ("width", "height")},
             **{
-                k: v
-                for k, v in viewport.items()
-                if k not in ("name", "width", "height")
+                "reduced_motion": "reduce",
+                **{
+                    k: v
+                    for k, v in viewport.items()
+                    if k not in ("name", "width", "height")
+                },
             },
-        },
-        offline=offline,
-        storage_state=journeys.storage_state(url, scenario),
-        service_workers="block" if offline else "allow",
-    )
+            offline=offline,
+            storage_state=journeys.storage_state(url, scenario),
+            service_workers="block" if offline else "allow",
+        )
     result = {
         "viewport": viewport["name"],
         "passed": False,
@@ -727,7 +736,11 @@ def run_case(
                 except Exception as error:
                     issue("sweep", f"Interaction sweep failed: {interaction.brief(error)}")
     finally:
-        context.close()
+        try:
+            with stall.watch.limit(CLOSE_CONTEXT_SECONDS):
+                context.close()
+        except stall.Stall:
+            pass  # A wedged browser: the shutdown that follows stops it.
     result["network_summary"] = base_traffic or traffic.summary()
     total = result["network_summary"]["requests"]
     network = config.get("network", {})
