@@ -1,6 +1,7 @@
 """Advance approved milestones through independent, content-addressed checks."""
 
 from contextlib import ExitStack
+import ctypes
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 import time
 
-from .process import BusyRun, PausedRun, run_lock
+from .process import BusyRun, ExtendedLimits, PausedRun, WindowsJob, run_lock
 from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
@@ -27,6 +28,7 @@ class BudgetExceeded(ValueError):
 
 GIT_TIMEOUT = 90
 WORKTREE_ADD_TIMEOUT = 900
+SETTLE_POLL, SETTLE_QUIET = 1.0, 5  # seconds between looks at an unfinished checkout; looks with no index lock before git is given up on
 IDLE_DEFAULT = 900
 PARK_MARGIN, PARK_UNPARSED, PARK_UNPARSED_MAX = 90, 1800, 7200
 
@@ -37,14 +39,25 @@ def use_git_timeout(spec):
     GIT_TIMEOUT = spec.get("git_timeout", 90)
 
 
+class SurvivingJob(WindowsJob):
+    """A Job that ends its processes when terminate() says so and not when its handle closes. A runner that dies during a checkout
+    (a killed console, a crash) leaves git to finish it and release its lock, rather than cutting it in half."""
+
+    def __enter__(self):
+        super().__enter__()
+        if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(ExtendedLimits()), ctypes.sizeof(ExtendedLimits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.kernel.CloseHandle(self.handle)
+            raise error
+        return self
+
+
 def run_owned(argv, limit, env):
     """subprocess.run for a git command that starts children, such as `worktree add`, which runs `reset --hard`.
 
     The command and what it starts live in one Job. A timeout ends them all and returns at once, where subprocess.run
     kills only the parent and then waits for an orphaned child to release the pipes, which can take as long as the checkout."""
-    from .process import WindowsJob
-
-    with tempfile.TemporaryDirectory(prefix="nw-git-", ignore_cleanup_errors=True) as temp, WindowsJob() as job:
+    with tempfile.TemporaryDirectory(prefix="nw-git-", ignore_cleanup_errors=True) as temp, SurvivingJob() as job:
         out, err = Path(temp, "out"), Path(temp, "err")
         with out.open("wb") as stdout, err.open("wb") as stderr:
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
@@ -83,6 +96,57 @@ def abandon_worktree(repo, args):
         git(repo, "worktree", "prune", "--expire", "now", timeout=60)
     except (ValueError, subprocess.TimeoutExpired, OSError):
         pass
+
+
+def initializing(path):
+    """The admin folder of a worktree whose `git worktree add` has not finished (git keeps it locked as 'initializing'), else None."""
+    try:
+        link = Path(path, ".git").read_text(encoding="utf-8").strip()
+        admin = Path(link.partition(":")[2].strip())
+        return admin if link.startswith("gitdir:") and (admin / "locked").read_text(encoding="utf-8").strip() == "initializing" else None
+    except OSError:
+        return None
+
+
+def settle_worktree(repo, path, wait=None):
+    """Whether `path`, if anything is there, is a finished checkout that can be reused. False means it was cleared away (or never
+    existed) and the caller makes it again.
+
+    A runner that died during `git worktree add` leaves the entry locked while git, which outlives it, finishes the checkout: wait for
+    that. If git died too (a reboot, a killed process tree) nothing ever releases the lock or its index.lock: the checkout is taken out
+    for good once no process holds the index lock, or after `wait` seconds (the add timeout by default)."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    if not (path / ".git").is_file():
+        if path.is_dir() and not any(path.iterdir()):  # git died before it linked the checkout
+            abandon_worktree(repo, ("worktree", "add", str(path)))
+            return False
+        return True  # not ours to judge: the caller reports the missing link
+    admin = initializing(path)
+    if admin is None:
+        return True
+    deadline = time.monotonic() + (WORKTREE_ADD_TIMEOUT if wait is None else wait)
+    unheld = 0
+    while admin is not None:
+        lock = admin / "index.lock"
+        stale = False
+        if lock.exists():
+            unheld = 0
+            try:
+                lock.unlink()  # a running git has it open and Windows refuses; a dead one's lock is just a file
+                stale = True
+            except OSError:
+                pass
+        else:
+            unheld += 1
+            stale = unheld >= SETTLE_QUIET
+        if stale or time.monotonic() >= deadline:
+            abandon_worktree(repo, ("worktree", "add", str(path)))
+            return False
+        time.sleep(SETTLE_POLL)
+        admin = initializing(path)
+    return True
 
 
 def git_bytes(repo, *args, attributes_from=None, timeout=None):
@@ -223,13 +287,18 @@ def stage(path, base, keep=()):
 
     Returns (changes, dropped): every (status, name) the worktree differs from base by, and the new files left out.
     tree(), reject() and the no-progress check all take their identity from here, so they always agree on the build.
-    A path the milestone names outright in `keep` is a deliverable, not a dropping."""
+    Only a new file can be a dropping, and never one that is a deliverable: a path inside what the milestone names in `keep`, or
+    one that tracked content moved to (a rename git can see, or the file name of a tracked dropping-shaped file the milestone deleted)."""
+    from .contracts import under
     git(path, "add", "-A", "--", ".")
     fields = git(path, "diff", "--cached", "--no-renames", "--name-status", "-z", base).split("\0")
     changes = list(zip(fields[0::2], fields[1::2]))
-    named = {name.casefold() for name in keep}
-    # Only paths absent from the base can be droppings; a tracked file with such a name stays a real change.
-    dropped = [name for status, name in changes if status == "A" and tool_dropping(name) and name.casefold() not in named]
+    dropped = [name for status, name in changes if status == "A" and tool_dropping(name) and not under(name, keep)]
+    if dropped:
+        # The content of a tracked file that moved is never lost: it is a rename, or it keeps the name of the dropping-shaped file it left.
+        renamed = set(git(path, "diff", "--cached", "-M", "--diff-filter=R", "--name-only", "-z", base).split("\0"))
+        left = {name.rpartition("/")[2].casefold() for status, name in changes if status == "D" and tool_dropping(name)}
+        dropped = [name for name in dropped if name not in renamed and name.rpartition("/")[2].casefold() not in left]
     for start in range(0, len(dropped), 100):
         git(path, "--literal-pathspecs", "reset", "-q", "--", *dropped[start:start + 100])
     return changes, dropped
@@ -483,7 +552,7 @@ class Run:
     def worktree(self, state):
         use_git_timeout(self.spec)
         path = self.root / "worktrees" / f"{state['step'] + 1:02d}"
-        if not path.exists():
+        if not settle_worktree(self.repository, path):
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 git(self.repository, "worktree", "add", "--detach", str(path), state["accepted"])
@@ -505,10 +574,14 @@ class Run:
         """Whether milestone 1 starts with the design-direction tournament that this run has not yet held."""
         return bool(self.spec.get("pursue", {}).get("explore")) and state["step"] == 0 and not state.get("explored")
 
-    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, finding=None, **state):
-        from .repair import blocked_message, cause_line, describe, fingerprint, next_worker
+    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, finding=None, seen=None, **state):
+        """`seen` is the operator-feedback version the judgment of this build was made with (a reviewer's REVISE), which can be older
+        than the one in the store when the operator spoke while the reviewer was working."""
+        from .repair import blocked_message, cause_line, describe, droppings_note, fingerprint, next_worker
         current = self.store.get(self.id)["state"]
         reason = redact(reason)
+        if phase in ("check", "snapshot", "artifact", "review"):
+            reason = droppings_note(current.get("droppings"), current["step"] + 1, current["attempt"]) + reason
         path = self.root / "worktrees" / f"{current['step'] + 1:02d}"
         changed = []
         try:
@@ -556,9 +629,11 @@ class Run:
         remembered = trees[-1].get("issue", reason) if phase == "no_progress" and trees else reason
         # A review that gave no readable feedback is not feedback the worker could have ignored.
         kept = "review_unreadable" if phase == "review" and not finding else phase
-        older = [{"tree": item["tree"], "phase": item["phase"]} for item in trees]
-        state.update(rejected_trees=[*older, {"tree": signature, "phase": kept, "issue": remembered[:3000],
-                                              "feedback": current.get("feedback_version", 0)}][-4:],
+        older = [{"tree": item["tree"], "phase": item["phase"], "feedback": item.get("feedback", 0)} for item in trees]
+        # The feedback version a rejection answers is the one its judge worked from. A no-progress rejection judges nothing new.
+        asked = (trees[-1].get("feedback", 0) if phase == "no_progress" and trees else
+                 current.get("feedback_version", 0) if seen is None else seen)
+        state.update(rejected_trees=[*older, {"tree": signature, "phase": kept, "issue": remembered[:3000], "feedback": asked}][-4:],
                      rejected_step=current["step"])
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
@@ -663,8 +738,8 @@ class Run:
         trees = state.get("rejected_trees") or []
         if state.get("rejected_step") != state["step"] or not trees or trees[-1].get("phase") not in ("review", "no_progress"):
             return None
-        if trees[-1].get("feedback", 0) != state.get("feedback_version", 0):
-            return None  # the operator has said something since; the reviewer must be asked again about this build
+        if trees[-1].get("feedback", 0) != self.store.get(self.id)["state"].get("feedback_version", 0):
+            return None  # the operator has said something since (maybe during the call just made); the reviewer must be asked again
         try:
             stage(path, state["accepted"], self.spec["milestones"][state["step"]]["paths"])
             return trees[-1] if git(path, "write-tree") == trees[-1]["tree"] else None
@@ -919,7 +994,8 @@ class Run:
                     self.reviewer_unavailable("its answer could not be read after two tries", excerpt)
             if review["verdict"] != "PASS":
                 text = str(reason.strip() or answer or tail(log))[:3600]
-                self.reject("Independent review requested changes.\n" + text, "review", finding=text, review_parse_failures=0)
+                self.reject("Independent review requested changes.\n" + text, "review", finding=text, review_parse_failures=0,
+                            seen=state.get("feedback_version", 0))
                 return
             self.set("review_passed", {"reason": reason, "tree": snapshot, "log": str(log)}, review_parse_failures=0)
         if self.snapshot(path, state, step) != snapshot:
@@ -1015,8 +1091,13 @@ class Run:
             return tree(path, state["accepted"], step["paths"], self.spec.get("protected_paths", []), removed)
         finally:
             if removed:  # deleted from the worktree so that no check can pass on a file the accepted commit will not contain
+                known = self.store.get(self.id)["state"].get("droppings") or {}
+                kept = known["paths"] if (known.get("step"), known.get("attempt")) == (state["step"] + 1, state["attempt"]) else []
+                paths = [*kept, *(name for name in removed if name not in kept)][:20]
+                # Kept in the state too, so a rejection can tell the worker why a file its checks want is gone.
                 self.set("tool_droppings_removed", {"step": state["step"] + 1, "attempt": state["attempt"], "count": len(removed),
-                                                    "paths": removed[:20]})
+                                                    "paths": removed[:20]},
+                         droppings={"step": state["step"] + 1, "attempt": state["attempt"], "paths": paths})
 
     def promote(self, state):
         if state.get("feedback_version", 0) != state.get("worker_feedback_version", 0):

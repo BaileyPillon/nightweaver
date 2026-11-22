@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -29,8 +30,10 @@ from pathlib import Path
 
 mode = sys.argv[1]
 if mode == "worker":
-    sys.stdin.read()
+    prompt = sys.stdin.read()
     counter = Path(sys.argv[2])
+    with counter.with_suffix(".prompts").open("a", encoding="utf-8") as record:
+        record.write(prompt + chr(10) + "=====" + chr(10))
     count = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(count))
     Path("result.txt").write_text(sys.argv[3], encoding="utf-8")
@@ -140,6 +143,12 @@ class ToolDroppingsReachNeitherGatesNorCommits(FixRepairBase):
         self.assertTrue(removed and all(r["paths"] == ["tests/golden.dmp"] for r in removed), removed)
         self.assertFalse((self.store.directory(run) / "worktrees" / "01" / "tests" / "golden.dmp").exists())
         self.assertEqual(git(self.repo, "branch", "--list", "nightweaver/*"), "")
+        # Nothing is a silent dead end: the rejection and the next worker's prompt name the deleted file and the way to keep it.
+        self.assertTrue(all("tool droppings were deleted" in r["issue"] and "tests/golden.dmp" in r["issue"] for r in rejected), rejected)
+        self.assertIn("tool droppings were deleted", self.state(run)["last_error"])
+        second = self.prompts("worker")[1]
+        self.assertIn("tests/golden.dmp", second.partition("Last observed failure")[2])
+        self.assertIn("Name a path in the milestone paths to keep it", second)
 
     def test_a_dropping_the_milestone_names_is_a_deliverable_and_stays(self):
         run = self.configured(self.worker("worker", "ready", "tests/golden.dmp"), attempts=1,
@@ -148,6 +157,57 @@ class ToolDroppingsReachNeitherGatesNorCommits(FixRepairBase):
         self.assertEqual(Run(self.store, run).run(), "done")
         self.assertEqual(self.head_names(run), [".gitignore", "result.txt", "tests/golden.dmp"])
         self.assertEqual(self.events(run, "tool_droppings_removed"), [])
+
+    def test_a_dropping_inside_a_folder_the_milestone_names_is_a_deliverable_and_stays(self):
+        run = self.configured(self.worker("worker", "ready", "tests/golden.dmp", "tests/fixtures/sample.dmp", "debug.log"), attempts=1,
+                              milestones=[{"title": "Fixture", "task": "Write it", "paths": ["result.txt", "tests", "debug.log"]}],
+                              gates=[{"name": "fixture present", "argv": self.fx("exists", "tests/golden.dmp"), "timeout": 20}])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual(self.head_names(run), [".gitignore", "debug.log", "result.txt", "tests/fixtures/sample.dmp", "tests/golden.dmp"])
+        self.assertEqual(self.events(run, "tool_droppings_removed"), [])
+        self.assertEqual(self.events(run, "attempt_rejected"), [])
+
+    def test_droppings_outside_the_named_folders_are_still_deleted(self):
+        base = self.head
+        path = self.worktree(base)
+        for name in ("tests/golden.dmp", "elsewhere/crash.dmp", ".playwright-mcp/x.png", "tests/.playwright-mcp/y.png", "debug.log"):
+            self.write(path, name)
+        removed = []
+        snapshot = tree(path, base, ["tests", "result.txt"], [], removed)
+        self.assertEqual(sorted(removed), [".playwright-mcp/x.png", "debug.log", "elsewhere/crash.dmp"])
+        self.assertEqual(git(path, "ls-tree", "-r", "--name-only", snapshot).splitlines(),
+                         [".gitignore", "result.txt", "tests/.playwright-mcp/y.png", "tests/golden.dmp"])
+
+    def test_a_tracked_dropping_the_milestone_moves_is_a_deliverable_not_a_dropping(self):
+        for name, body in {"fixtures/crash.dmp": "MDMP one", "fixtures/debug.log": "expected log sample", "old/chrome_debug.log": "before",
+                           "keep/dump.dmp": "same bytes", "gone.dmp": "deleted outright",
+                           "samples/crash-sample.bin": "".join(f"line {n} of a recorded crash\n" for n in range(12))}.items():
+            self.write(self.repo, name, body)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "Tracked fixtures")
+        base = git(self.repo, "rev-parse", "HEAD")
+        path = self.worktree(base)
+        moves = {"fixtures/crash.dmp": ("tests/data/crash.dmp", "MDMP one"), "fixtures/debug.log": ("tests/data/debug.log", "expected log sample"),
+                 "old/chrome_debug.log": ("tests/data/chrome_debug.log", "edited while moving"),
+                 "keep/dump.dmp": ("tests/data/renamed-dump.dmp", "same bytes"),
+                 "samples/crash-sample.bin": ("tests/data/crash-sample.dmp",
+                                              "".join(f"line {n} of a recorded crash\n" for n in range(11)) + "line 11, edited\n")}
+        for old, (new, body) in moves.items():
+            (path / old).unlink()
+            self.write(path, new, body)
+        (path / "gone.dmp").unlink()
+        self.write(path, "result.txt", "ready")
+        self.write(path, "trace.dmp", "a real dropping")
+        self.write(path, ".playwright-mcp/page.yml", "another")
+        removed = []
+        snapshot = tree(path, base, [], [], removed)
+        self.assertEqual(sorted(removed), [".playwright-mcp/page.yml", "trace.dmp"], "only the new files nothing moved from are droppings")
+        committed = git(path, "ls-tree", "-r", "--name-only", snapshot).splitlines()
+        for new, _ in moves.values():
+            self.assertIn(new, committed)
+            self.assertTrue((path / new).is_file(), new)
+        self.assertEqual((path / "tests" / "data" / "chrome_debug.log").read_text(encoding="utf-8"), "edited while moving")
+        self.assertNotIn("gone.dmp", committed)
 
     def test_droppings_are_deleted_with_their_empty_folders_and_tracked_files_are_never_touched(self):
         self.write(self.repo, "debug.log", "v1")
@@ -246,6 +306,56 @@ class VerdictsFailClosed(FixRepairBase):
             with self.subTest(label), self.assertRaises(ValueError):
                 extract_verdict(answer, VERDICTS)
 
+    def test_a_malformed_verdict_is_not_outvoted_by_a_readable_one_wherever_it_stands(self):
+        passing = json.dumps(PASS)
+        then = " If I were satisfied I would answer " + passing + "."
+        for label, answer in {
+            "unescaped quotes in the reason": '{"verdict":"REVISE","reason":"The "forbidden" rows are loaded."}' + then,
+            "a trailing comma": '{"verdict":"REVISE","reason":"Rows are lost.",}' + then,
+            "a literal newline in the reason": '{"verdict":"REVISE","reason":"Rows are lost.\nSee the loader."}' + then,
+            "a duplicate key": '{"verdict":"REVISE","verdict":"REVISE","reason":"Rows are lost."}' + then,
+            "a truncated body": '{"verdict":"REVISE","reason":"missing tests for the loader' + then,
+            "single quotes": "{'verdict': 'REVISE', 'reason': 'Rows are lost.'}" + then,
+            "an unquoted key": '{verdict: "REVISE", reason: "Rows are lost."}' + then,
+            "a revise cut off inside the object it nests": '{"verdict":"REVISE","reason":"x","details":' + passing,
+            "a malformed pass before a readable revise": '{"verdict":"PASS","reason":"a "quoted" word"} Then: ' + json.dumps({"verdict": "REVISE", "reason": "no"}),
+            "curly quotes": passing + ' {\u201cverdict\u201d: \u201cREVISE\u201d}',
+        }.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                extract_verdict(answer, VERDICTS)
+
+    def test_a_fragment_dangling_after_the_verdict_is_unreadable_whatever_it_started_with(self):
+        passing = json.dumps(PASS)
+        for label, tail in {
+            "cut off before its verdict key": '\nFinal: {"reason": "The loader drops rows and misses',
+            "cut off inside a nested object": '\nFinal: {"reason": "x", "details": {"a": 1}, "ver',
+            "single-quoted": "\nActually: {'verdict': 'REVISE', 'reason': 'no'}",
+            "unquoted keys": '\nActually: {verdict: "REVISE", reason: "no"}',
+            "a trailing comma": '\nActually: {"verdict": "REVISE", "reason": "no",}',
+            "a comment inside": '\nActually: {"verdict": "REVISE", /* why */ "reason": "no"}',
+            "nothing but a key": '\nFinal: {"details"',
+            "prose braces first, then a cut-off object": ' See `{ x }`. Final: {"reason": "cut',
+            "an object-shaped snippet": " I also changed {mode: 1}.",
+        }.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                extract_verdict(passing + tail, VERDICTS)
+
+    def test_format_reminders_and_agreeing_fragments_do_not_make_an_answer_unreadable(self):
+        revise = json.dumps({"verdict": "REVISE", "reason": "Fix the loader."})
+        passing = json.dumps(PASS)
+        judged = json.dumps({"verdict": "NOT_MET", "score": 40, "reason": "gaps remain"})
+        for label, answer, allowed, verdict in (
+            ("the format after the answer", revise + '\nThe format was {"verdict":"PASS" or "REVISE","reason":"x"}.', VERDICTS, "REVISE"),
+            ("the judge format with a range", '{"verdict":"MET" or "NOT_MET","score":0-100,"gaps":[]} ' + judged, ("MET", "NOT_MET"), "NOT_MET"),
+            ("the judge format after the answer", judged + ' (format {"verdict":"MET" or "NOT_MET","score":0-100})', ("MET", "NOT_MET"), "NOT_MET"),
+            ("a malformed object that says the same thing", '{"verdict":"REVISE","reason":"a "b" c"} Again: ' + revise, VERDICTS, "REVISE"),
+            ("a malformed duplicate of the same pass", passing + ' {"verdict":"PASS","reason":"x",}', VERDICTS, "PASS"),
+            ("code braces in the explanation after", passing + " I also fixed `if (ok) { return }`.", VERDICTS, "PASS"),
+            ("code braces before", "In `def f() { x }` I see no issue. " + passing, VERDICTS, "PASS"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(extract_verdict(answer, allowed)["verdict"], verdict)
+
     def test_unambiguous_answers_still_read(self):
         revise = json.dumps({"verdict": "REVISE", "reason": "Fix the loader."})
         passing = json.dumps({"verdict": "pass", "reason": "Looks right."})
@@ -279,10 +389,15 @@ class VerdictsFailClosed(FixRepairBase):
             parse_wave(f"{real}\nThe template was {template}", 3)
         with self.assertRaises(ValueError):
             extract_object(f"{real} {template}", "milestones")
+        broken = '{"milestones":[{"title":"Build the "loader"","task":"Write loader.py"}]}'
+        with self.assertRaises(ValueError):
+            parse_wave(f"{broken}\nThe format is {template}", 3)  # the malformed real plan must not lose to the echoed template
+        with self.assertRaises(ValueError):
+            parse_wave(f"{template}\nThe plan: {broken}", 3)
         self.assertEqual([m["title"] for m in parse_wave(f"Plan:\n{real}", 3)[0]], ["Build the loader"])
 
     def test_an_ambiguous_review_never_promotes_a_build(self):
-        answer = ('{"verdict":"REVISE","reason":"The forbidden rows are loaded."} If I were satisfied I would answer '
+        answer = ('{"verdict":"REVISE","reason":"The "forbidden" rows are loaded."} If I were satisfied I would answer '
                   '{"verdict":"PASS","reason":"ok"}.')
         run = self.configured(self.worker(), reviewer=self.script("reviewer", [answer]), attempts=1, retry=FAST)
         self.assertEqual(Run(self.store, run).run(), "blocked")
@@ -382,6 +497,175 @@ class GitTimeouts(FixRepairBase):
             self.assertEqual(Run(self.store, run).run(), "blocked")
         self.assertIn("took more than 900 seconds", self.state(run)["last_error"])
         self.assertEqual(Run(self.store, run).run(retry=True), "done", "--retry works without a manual git worktree unlock")
+
+
+HOLDER = """
+import sys, time
+from pathlib import Path
+admin = Path(sys.argv[1])
+(admin / "locked").write_text("initializing")
+held = open(admin / "index.lock", "w")
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+held.close()
+(admin / "index.lock").unlink()
+(admin / "locked").unlink()
+"""
+
+
+def reap(process):
+    process.kill()
+    process.wait(timeout=20)
+    if process.stdout:
+        process.stdout.close()
+
+
+class WorktreeAddSurvivesACrash(FixRepairBase):
+    def slow_checkout(self, files=4, pause=2):
+        """Commit files whose checkout is slow, as a huge repository's is: each one waits in a smudge filter."""
+        slow = self.root / "slow.py"
+        slow.write_text(f"import sys, time\ntime.sleep({pause})\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n", encoding="utf-8")
+        (self.repo / ".gitattributes").write_text("*.big filter=slow\n", encoding="utf-8")
+        for number in range(files):
+            (self.repo / f"f{number}.big").write_text(f"data {number}", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "Slow files")
+        git(self.repo, "config", "filter.slow.smudge", f'"{Path(sys.executable).as_posix()}" "{slow.as_posix()}"')
+        git(self.repo, "config", "filter.slow.clean", "cat")
+
+    def admin(self, path):
+        return Path(path.joinpath(".git").read_text(encoding="utf-8").partition(":")[2].strip())
+
+    def half_made(self, path, *, index_lock=True):
+        """A checkout the way a dead git leaves it: locked as initializing, an index lock nobody holds, files missing."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(self.repo, "worktree", "add", "--detach", str(path), self.head)
+        admin = self.admin(path)
+        (admin / "locked").write_text("initializing", encoding="utf-8")
+        if index_lock:
+            (admin / "index.lock").write_text("", encoding="utf-8")
+        (path / "result.txt").unlink()
+        return admin
+
+    def listed(self):
+        return [Path(line[9:]).resolve() for line in git(self.repo, "worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ")]
+
+    def test_a_killed_runner_leaves_git_to_finish_its_checkout_and_the_resume_completes(self):
+        self.slow_checkout()
+        run = self.configured(self.worker())
+        env = {**os.environ, "PYTHONPATH": str(Path(engine.__file__).resolve().parents[1])}
+        runner = subprocess.Popen([sys.executable, "-m", "nightweaver", "--home", str(self.store.root), "run", run], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        lock = self.repo / ".git" / "worktrees" / "01" / "locked"
+        try:
+            deadline = time.monotonic() + 60
+            while not lock.exists() and runner.poll() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.assertTrue(lock.exists(), "the checkout started")
+            time.sleep(1)  # git is in the middle of it
+            subprocess.run(["taskkill", "/F", "/PID", str(runner.pid)], capture_output=True)
+        finally:
+            runner.kill()
+            runner.wait(timeout=20)
+        deadline = time.monotonic() + 60
+        while lock.exists() and time.monotonic() < deadline:
+            time.sleep(.2)
+        self.assertFalse(lock.exists(), "git finished its checkout and released its lock after the runner died")
+        path = self.store.directory(run) / "worktrees" / "01"
+        self.assertEqual(sorted(name for name in os.listdir(path) if name.endswith(".big")), [f"f{n}.big" for n in range(4)])
+        self.assertEqual(Run(self.store, run).run(), "done", "the resume used the finished checkout")
+        self.assertEqual(self.head_names(run), [".gitattributes", ".gitignore", "f0.big", "f1.big", "f2.big", "f3.big", "result.txt", "untouched.txt"])
+
+    def test_closing_the_checkout_job_does_not_kill_git_but_terminating_it_does(self):
+        sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
+        survivor = subprocess.Popen(sleeper, creationflags=subprocess.CREATE_NO_WINDOW)
+        victim = subprocess.Popen(sleeper, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.addCleanup(reap, survivor)
+        self.addCleanup(reap, victim)
+        with engine.SurvivingJob() as job:
+            job.attach(survivor.pid)
+        time.sleep(.5)
+        self.assertIsNone(survivor.poll(), "the runner dying closes the handle; git is left alone to finish")
+        with engine.SurvivingJob() as job:
+            job.attach(victim.pid)
+            job.terminate()
+            victim.wait(timeout=20)
+        self.assertIsNotNone(victim.poll(), "a timeout still ends everything in the job")
+
+    def test_a_checkout_that_nothing_is_making_is_cleared_and_made_again_by_the_run(self):
+        run = self.configured(self.worker())
+        controller = Run(self.store, run)
+        controller.gitdir = common_dir(controller.repository)
+        path = self.store.directory(run) / "worktrees" / "01"
+        admin = self.half_made(path)
+        self.assertEqual(engine.initializing(path), admin)
+        with patch.object(engine, "SETTLE_POLL", .05):
+            self.assertEqual(controller.worktree(self.state(run)), path)
+        self.assertIsNone(engine.initializing(path))
+        self.assertTrue((path / "result.txt").is_file(), "a whole checkout, not the half-made one")
+        self.assertEqual(self.listed().count(path.resolve()), 1)
+        self.assertEqual(len(self.events(run, "worktree_ready")), 1)
+        self.assertEqual(Run(self.store, run).run(), "done")
+
+    def test_a_locked_checkout_with_no_index_lock_is_given_up_on_after_a_few_looks(self):
+        path = self.root / "worktrees" / "01"
+        admin = self.half_made(path, index_lock=False)
+        with patch.object(engine, "SETTLE_POLL", .01), patch.object(engine, "SETTLE_QUIET", 3):
+            self.assertFalse(engine.settle_worktree(self.repo, path))
+        self.assertFalse(path.exists())
+        self.assertFalse(admin.exists())
+        self.assertEqual(self.listed(), [self.repo.resolve()])
+        engine.git(self.repo, "worktree", "add", "--detach", str(path), self.head)
+        self.assertTrue((path / "result.txt").is_file(), "the same path can be checked out again")
+
+    def test_a_checkout_that_git_is_still_making_is_waited_for_not_cleared(self):
+        path = self.root / "worktrees" / "01"
+        path.parent.mkdir()
+        git(self.repo, "worktree", "add", "--detach", str(path), self.head)
+        (path / "sentinel.txt").write_text("still here", encoding="utf-8")
+        holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(self.admin(path)), "3"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(reap, holder)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = time.monotonic()
+        with patch.object(engine, "SETTLE_POLL", .2):
+            self.assertTrue(engine.settle_worktree(self.repo, path, wait=60))
+        self.assertGreater(time.monotonic() - started, 1.5, "it waited for the holder to finish")
+        holder.wait(timeout=20)
+        self.assertEqual((path / "sentinel.txt").read_text(encoding="utf-8"), "still here", "nothing was cleared")
+        self.assertIsNone(engine.initializing(path))
+
+    def test_a_checkout_that_never_finishes_is_cleared_when_the_wait_runs_out(self):
+        path = self.root / "worktrees" / "01"
+        path.parent.mkdir()
+        git(self.repo, "worktree", "add", "--detach", str(path), self.head)
+        admin = self.admin(path)
+        holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(admin), "60"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(reap, holder)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with patch.object(engine, "SETTLE_POLL", .1):
+            self.assertFalse(engine.settle_worktree(self.repo, path, wait=1))
+        self.assertFalse(path.exists())
+
+    def test_a_finished_or_absent_checkout_is_left_alone(self):
+        path = self.root / "worktrees" / "01"
+        self.assertFalse(engine.settle_worktree(self.repo, path))
+        path.parent.mkdir()
+        git(self.repo, "worktree", "add", "--detach", str(path), self.head)
+        self.assertTrue(engine.settle_worktree(self.repo, path))
+        self.assertTrue((path / "result.txt").is_file())
+        with patch.object(engine, "time", SimpleNamespace(sleep=lambda _seconds: None)):  # tests that fake the clock must not need it here
+            self.assertTrue(engine.settle_worktree(self.repo, path))
+
+    def test_an_empty_folder_git_never_linked_is_cleared_and_a_folder_with_files_is_not(self):
+        path = self.root / "worktrees" / "01"
+        path.mkdir(parents=True)
+        self.assertFalse(engine.settle_worktree(self.repo, path))
+        self.assertFalse(path.exists())
+        other = path.parent / "02"
+        other.mkdir()
+        (other / "work.txt").write_text("someone's files", encoding="utf-8")
+        self.assertTrue(engine.settle_worktree(self.repo, other), "a folder with files is not ours to clear")
+        self.assertTrue((other / "work.txt").is_file())
 
 
 class IdleDefault(FixRepairBase):
@@ -518,6 +802,60 @@ class FeedbackReopensTheReview(FixRepairBase):
         second = self.prompts("reviewer")[1]
         self.assertIn("Keep the name; the reviewer must not ask for a rename.", second)
         self.assertEqual(self.calls(run, "reviewer"), 2)
+
+    def test_feedback_that_arrives_while_the_reviewer_is_working_is_not_taken_as_seen(self):
+        run = self.configured(self.worker(), reviewer={"kind": "command", "argv": fixtures.fixture("review")},
+                              attempts=6, retry={**FAST, "repeated_failure_limit": 3})
+        prompts = []
+
+        def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, **kwargs):
+            if mode != "reviewer":
+                return real_invoke(config, mode, cwd, log, prompt, timeout, paused, session, **kwargs)
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                self.store.feedback(run, "Keep the name; do not ask for a rename.")  # said while the reviewer reads the build
+                return 0, None, json.dumps({"verdict": "REVISE", "reason": "Rename the helper."})
+            return 0, None, json.dumps(PASS)
+
+        with patch("nightweaver.engine.invoke", side_effect=invoke):
+            self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual([r["phase"] for r in self.events(run, "attempt_rejected")], ["review"], "no no_progress rejection")
+        self.assertEqual(len(prompts), 2, "the reviewer was asked again, with the new instructions")
+        self.assertNotIn("Keep the name", prompts[0])
+        self.assertIn("Keep the name; do not ask for a rename.", prompts[1])
+        self.assertIn("Keep the name; do not ask for a rename.", self.prompts("worker")[1], "the worker was told too")
+
+    def test_feedback_that_arrives_while_a_worker_call_is_in_flight_reopens_the_review_too(self):
+        reviewer = self.script("reviewer", [{"verdict": "REVISE", "reason": "Rename the helper."}, PASS])
+        run = self.configured(self.worker(), reviewer=reviewer, attempts=6, retry={**FAST, "repeated_failure_limit": 3})
+        workers = []
+
+        def invoke(config, mode, *args, **kwargs):
+            if mode == "worker":
+                workers.append(mode)
+                if len(workers) == 2:
+                    self.store.feedback(run, "Keep the name; the reviewer must not ask for a rename.")  # the prompt is already built
+            return real_invoke(config, mode, *args, **kwargs)
+
+        with patch("nightweaver.engine.invoke", side_effect=invoke):
+            self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertNotIn("no_progress", [r["phase"] for r in self.events(run, "attempt_rejected")])
+        self.assertEqual(len(self.prompts("reviewer")), 2, "the reviewer judged the unchanged build again")
+        self.assertIn("Keep the name; the reviewer must not ask for a rename.", self.prompts("reviewer")[1])
+
+    def test_a_rejection_records_the_feedback_its_judge_worked_from(self):
+        run = self.configured(self.worker(), attempts=6, retry={**FAST, "repeated_failure_limit": 9})
+        controller = Run(self.store, run)
+        controller.gitdir = common_dir(controller.repository)
+        controller.worktree(self.state(run))
+        self.store.transition(run, "fixture_review", {}, phase="reviewing", attempt=1, attempts_used=1)
+        self.store.feedback(run, "First instruction.")
+        self.store.feedback(run, "Second instruction.")
+        controller.reject("Rename.", "review", finding="Rename.", seen=0)
+        controller.reject("Rename again.", "review", finding="Rename again.")
+        controller.reject("Nothing changed.", "no_progress")
+        recorded = [(item["phase"], item["feedback"]) for item in self.state(run)["rejected_trees"]]
+        self.assertEqual(recorded, [("review", 0), ("review", 2), ("no_progress", 2)])
 
     def test_without_feedback_the_unchanged_build_is_still_short_circuited(self):
         reviewer = self.script("reviewer", [{"verdict": "REVISE", "reason": "Rename the helper."}, PASS])

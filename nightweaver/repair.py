@@ -132,6 +132,15 @@ def cause_line(phase, failed_gates, count, used, attempts, repeated):
     return f"Stopped: {used} of {attempts} attempts used"
 
 
+def droppings_note(droppings, step, attempt):
+    """What to tell a worker whose checks failed after tool droppings were deleted from its worktree, or "" when none were this attempt."""
+    if not droppings or (droppings.get("step"), droppings.get("attempt")) != (step, attempt) or not droppings.get("paths"):
+        return ""
+    names = ", ".join(droppings["paths"][:6]) + (" ..." if len(droppings["paths"]) > 6 else "")
+    return (f"Note: tool droppings were deleted before the checks ran (new debug.log, chrome_debug.log, *.dmp or .playwright-mcp/ files "
+            f"the milestone paths do not name): {names}. Name a path in the milestone paths to keep it.\n\n")
+
+
 def blocked_message(cause, reason, summary):
     """What an operator reads first: the cause, the last failure, then the worker's own account."""
     parts = [cause, reason[:3600]]
