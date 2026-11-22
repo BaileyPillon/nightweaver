@@ -15,7 +15,7 @@ from .store import default_home
 from .safety import json_events, redact
 
 
-READ_ONLY = ("reviewer", "judge", "replanner")
+READ_ONLY = ("reviewer", "judge", "replanner", "brief")
 JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["verdict", "score", "criteria", "gaps", "reason"],
                 "properties": {"verdict": {"enum": ["MET", "NOT_MET"]}, "score": {"type": "integer", "minimum": 0, "maximum": 100},
                                "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": False,
