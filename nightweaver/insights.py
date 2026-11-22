@@ -134,6 +134,7 @@ def diagnosis(store, run_id):
         "plan_invalid",
         "independence_degraded",
         "blocked",
+        "model_mismatch",
     }
     failures = [e for e in events if e["kind"] in kinds]
     counts = Counter(e["details"].get("phase", e["kind"]) for e in failures if e["kind"] != "blocked")
@@ -168,6 +169,7 @@ def export_trace(store, run_id, output, after=0, until=None):
         "provider",
         "adapter",
         "model",
+        "served_model",
         "exit",
         "tree",
         "commit",

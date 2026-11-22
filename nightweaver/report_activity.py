@@ -40,6 +40,7 @@ def category(event):
         "judge_invalid",
         "plan_invalid",
         "independence_degraded",
+        "model_mismatch",
     ):
         return "Problems"
     if kind.startswith("provider_call"):
