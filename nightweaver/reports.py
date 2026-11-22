@@ -128,10 +128,13 @@ def _metrics(store, run_id):
                        "position_bias_pairs": len(chosen["position_bias_pairs"]) if chosen else 0,
                        "outcome": "chosen" if chosen else "failed" if "exploration_failed" in kinds else
                                   "skipped" if "exploration_skipped" in kinds else "in progress"}
+    from .rescue import summary as rescue_summary
+    rescue = rescue_summary(events) if {"rescue_started", "rescue_skipped"} & set(kinds) else None
     return {
         **recovery_metrics(events),
         **({"pursuit": pursuit} if pursuit else {}),
         **({"exploration": exploration} if exploration else {}),
+        **({"rescue": rescue} if rescue else {}),
         "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
@@ -207,6 +210,10 @@ def _run_report(store, run_id, output, include_images):
                      f"{value['comparisons']} judge comparisons"
                      + (f", direction {value['winner']} chosen by {value['chosen_by']}" if value["winner"] else "")
                      + (f", position bias in {value['position_bias_pairs']} pairs" if value["position_bias_pairs"] else ""))
+        elif key == "rescue":
+            value = (f"{value['attempted']} attempted, {value['won']} won, {value['failed']} failed, {value['skipped']} skipped; latest {value['outcome']}"
+                     + (f", strategy {value['winner']}" if value["winner"] else "") + f", best score before {value['score_before']}"
+                     + (f", next judgment {value['score_after']}" if value["score_after"] is not None else ""))
         elif key == "provider_usage":
             value = " · ".join(f"{r['role']} / {r['provider']} ({r['model'] or 'default'}), "
                                f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
@@ -241,6 +248,27 @@ def _run_report(store, run_id, output, include_images):
                 body += (f'<tr><td>{row["index"]}. {escape(row["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
                          f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
                          f'<td>{"" if row["score"] is None else format(row["score"], "g")}</td><td>{"Winner" if row["winner"] else ""}</td></tr>')
+            body += '</tbody></table></div>'
+        for wave, rescue in ((w, r) for w in data["waves"] for r in w.get("rescues", [])):
+            status = {"chosen": f"strategy {rescue['winner_name']} chosen", "failed": "no strategy beat the best build", "skipped": "skipped",
+                      "in_progress": "in progress"}[rescue["status"]]
+            again = f" (rescue {rescue['n']})" if rescue["n"] > 1 else ""
+            body += (f'<h2>Plateau rescue after wave {wave["wave"]}{again}</h2><p>{escape(status[0].upper() + status[1:])} · best score before {rescue["best_score"]}/100'
+                     + (f' · next judgment {rescue["next_score"]}/100' if rescue["next_score"] is not None else "")
+                     + f' · {rescue["judge_calls"]} judge calls'
+                     + (' · position bias in pairs ' + escape(", ".join(f"{'best build' if a == 0 else a} vs {b}" for a, b in rescue["position_bias_pairs"]))
+                        if rescue["position_bias_pairs"] else "")
+                     + (f' · {escape(str(rescue["reason"]))}' if rescue["reason"] and rescue["status"] == "skipped" else "") + '</p>'
+                     + (f'<p>{escape(rescue["diagnosis"])}</p>' if rescue["diagnosis"] else "")
+                     + '<div class="table"><table><thead><tr><th>Strategy</th><th>Worker</th><th>Checks</th><th>Score</th><th>Result</th></tr></thead><tbody>')
+            for item in rescue["strategies"]:
+                worker = item["worker"] or {}
+                checks = "Not built yet" if item["passed"] is None else "Passed" if item["passed"] else "Failed: " + str(item["reason"] or "")[:160]
+                read = item["readable"]
+                result = "Winner" if item["winner"] else f"Judge read {read} of 2 orders" if read is not None and read < 2 else ""
+                body += (f'<tr><td>{item["index"]}. {escape(item["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
+                         f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
+                         f'<td>{"" if item["score"] is None else format(item["score"], "g")}</td><td>{result}</td></tr>')
             body += '</tbody></table></div>'
     from .junit import history
     observations = history(store, run_id)["observations"]

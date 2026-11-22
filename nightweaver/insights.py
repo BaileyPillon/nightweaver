@@ -137,6 +137,10 @@ def diagnosis(store, run_id):
         "comparison_invalid",
         "exploration_failed",
         "exploration_skipped",
+        "rescue_diagnosis_invalid",
+        "rescue_comparison_invalid",
+        "rescue_failed",
+        "rescue_skipped",
         "blocked",
         "model_mismatch",
     }

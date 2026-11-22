@@ -45,6 +45,10 @@ def category(event):
         "comparison_invalid",
         "exploration_failed",
         "exploration_skipped",
+        "rescue_diagnosis_invalid",
+        "rescue_comparison_invalid",
+        "rescue_failed",
+        "rescue_skipped",
     ):
         return "Problems"
     if kind.startswith("provider_call"):
@@ -121,6 +125,19 @@ LABELS = {
     "worker_stalled": lambda d: "Worker stalled; retrying fresh",
     "review_unparseable": lambda d: "Reviewer answer unreadable; asking again",
     "independence_degraded": lambda d: f"{str(d['role']).capitalize()} shares the worker's vendor",
+    "rescue_started": lambda d: f"Progress stalled at {d['best_score']}/100; starting a plateau rescue",
+    "rescue_diagnosis_started": lambda d: f"Diagnosing the stall (attempt {d['attempt']} of 2)",
+    "rescue_diagnosis_invalid": lambda d: f"Diagnosis unreadable (attempt {d['attempt']} of 2)",
+    "rescue_diagnosed": lambda d: f"Diagnosis ready: {len(d['strategies'])} strategies",
+    "rescue_incumbent_checked": lambda d: f"Best build checked for the comparison ({_plural(d['screenshots'], 'screenshot')})",
+    "rescue_candidate_started": lambda d: f"Building rescue strategy {d['index']} of {d['count']}: {d['name']}",
+    "rescue_candidate_built": lambda d: f"Rescue strategy {d['index']} passed its checks: {d['name']}",
+    "rescue_candidate_failed": lambda d: f"Rescue strategy {d['index']} failed its checks: {d['name']}",
+    "rescue_compared": lambda d: f"Rescue comparison {d['number']} judged",
+    "rescue_comparison_invalid": lambda d: f"Rescue comparison unreadable (attempt {d['attempt']} of 2)",
+    "rescue_chosen": lambda d: f"Rescue strategy {d['name']} beat the best build" if d.get("winner") is not None else "No rescue strategy beat the best build",
+    "rescue_failed": lambda d: "Plateau rescue failed: " + str(d.get("reason") or "no winner"),
+    "rescue_skipped": lambda d: "Plateau rescue skipped: " + ("not enough budget left" if d.get("stage") == "budget" else "no valid diagnosis"),
 }
 
 
