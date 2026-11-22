@@ -108,18 +108,25 @@ def text(obj, key):
 
 
 def provider(value, choices, label, relative_to=None):
-    fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code", label)
+    fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code inherit_credentials", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
     if value["kind"] == "command":
-        if set(value) - {"kind", "argv", "unavailable_exit_code"}:
+        if set(value) - {"kind", "argv", "unavailable_exit_code", "inherit_credentials"}:
             raise ValueError("Unsupported command provider field")
         out["argv"] = command(value.get("argv"), label)
+        if "inherit_credentials" in value:
+            if type(value["inherit_credentials"]) is not bool:
+                raise ValueError("inherit_credentials must be true or false")
+            if value["inherit_credentials"]:
+                out["inherit_credentials"] = True
         if "unavailable_exit_code" in value:
             out["unavailable_exit_code"] = integer(value["unavailable_exit_code"], "unavailable_exit_code", 1, 123)
     elif "unavailable_exit_code" in value:
         raise ValueError("Only command providers support unavailable_exit_code")
+    elif "inherit_credentials" in value:
+        raise ValueError("Only command providers support inherit_credentials")
     elif "argv" in value:
         raise ValueError("Only command providers accept argv")
     elif value.get("executable"):

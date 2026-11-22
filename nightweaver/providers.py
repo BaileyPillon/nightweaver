@@ -1,7 +1,9 @@
 """Use native authenticated CLIs and an optional loopback model."""
 
+from collections import deque
 from contextlib import ExitStack
 from datetime import datetime, time, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,9 +12,9 @@ import shutil
 import tempfile
 from urllib.request import Request, urlopen
 
-from .process import execute
+from .process import CONTROLLER_EXITS, execute
 from .store import default_home
-from .safety import json_events, redact
+from .safety import CREDENTIALS, json_events, redact, scrub_env
 
 
 READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking")
@@ -152,8 +154,11 @@ def reset_after(message, now=None):
 
 
 OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
-# Credentials of another vendor's route never belong in a child that does not use them.
-FOREIGN_CREDENTIALS = (OAUTH_VARIABLE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY")
+
+
+def own_credentials(kind):
+    """The credential variables a route of this kind may keep, with their *_FILE pointers. Every other vendor's is scrubbed."""
+    return tuple(name + suffix for name in CREDENTIALS.get(kind, ()) for suffix in ("", "_FILE"))
 
 
 def user_environment(name):
@@ -180,15 +185,24 @@ def token_from_file(path):
 
 
 def claude_auth(config=None):
-    """(long-lived token or None, source) for a Claude route. The token is never logged or returned to a report."""
+    """(long-lived token or None, source) for a Claude route. The token is never logged or returned to a report.
+
+    Precedence: the route's oauth_token_file; then the user environment variable. An explicit profile_dir means the operator
+    chose that profile's own login, so neither variable applies to it. A token in the process environment is only a snapshot:
+    a dispatcher or guard started before `claude setup-token` was repeated keeps the old one for good, while the registry
+    value is current. When the two differ the registry wins, so a rotated token reaches Claude children without restarting
+    long-lived processes. A route that must use one specific token sets oauth_token_file."""
     config = config or {}
     if config.get("oauth_token_file"):
         return token_from_file(config["oauth_token_file"]), "oauth_token_file"
-    if os.environ.get(OAUTH_VARIABLE, "").strip():
-        return os.environ[OAUTH_VARIABLE].strip(), "oauth_token_env"
-    if token := user_environment(OAUTH_VARIABLE):
-        return token, "oauth_token_user_env"
-    profile = Path(profile_override({**config, "kind": "claude"}) or Path.home() / ".claude").expanduser()
+    if not config.get("profile_dir"):
+        inherited = os.environ.get(OAUTH_VARIABLE, "").strip()
+        current = user_environment(OAUTH_VARIABLE)
+        if current and current != inherited:
+            return current, "oauth_token_user_env"
+        if inherited:
+            return inherited, "oauth_token_env"
+    profile = Path(profile_override({**config, "kind": "claude"}) or default_claude()).expanduser()
     return None, "cli_login" if (profile / ".credentials.json").is_file() else "none"
 
 
@@ -197,6 +211,39 @@ def isolated_claude(config):
     if config.get("profile_dir") or os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("NIGHTWEAVER_CLAUDE_SHARED_CONFIG") == "1":
         return None
     return default_home() / "profiles" / "claude"
+
+
+def config_tag(directory):
+    """A short stable name for a Claude config directory, kept beside a session id so a resume never crosses directories."""
+    return hashlib.sha256(os.path.normcase(str(Path(directory).expanduser().resolve())).encode("utf-8")).hexdigest()[:12]
+
+
+def default_claude():
+    try:
+        return Path.home() / ".claude"
+    except RuntimeError:  # no home directory is known, so there is no shared profile to confuse with
+        return Path(".claude")
+
+
+def claude_directory(env):
+    return env.get("CLAUDE_CONFIG_DIR") or default_claude()
+
+
+def tag_file(log):
+    return log.with_name(log.name + ".config")
+
+
+def resumable(config, env, session):
+    """The Claude session id to resume, or None when the session lives under another CLAUDE_CONFIG_DIR than this call uses.
+
+    Claude Code keeps conversations under its config directory and cannot find them in another one. metadata() stores the
+    directory a session was created under as id@tag. An untagged id comes from before this was recorded (0.18) and is taken
+    to live where that version looked: the route's profile_dir, the CLAUDE_CONFIG_DIR of this process, or ~/.claude."""
+    if not session:
+        return None
+    name, _, made = session.partition("@")
+    made = made or config_tag(profile_override({**config, "kind": "claude"}) or default_claude())
+    return name if name and made == config_tag(claude_directory(env)) else None
 
 
 def provider_executable(config):
@@ -297,16 +344,14 @@ def configure_deepseek_key(path):
 
 def adapter(config, mode, session=None, images=()):
     kind = config["kind"]
-    env = os.environ.copy()
     if kind == "command":
-        return config["argv"], env
+        # Operator-approved programs get no credential unless the route says inherit_credentials.
+        return config["argv"], dict(os.environ) if config.get("inherit_credentials") else scrub_env(os.environ)
+    env = scrub_env(os.environ, own_credentials(kind))
     exe = provider_executable(config)
     model = config.get("model")
-    if kind in ("codex", "gemini"):
-        for variable in FOREIGN_CREDENTIALS:
-            env.pop(variable, None)
-    elif kind == "claude":
-        env.pop("DEEPSEEK_API_KEY", None)
+    if kind == "claude":
+        env.pop(OAUTH_VARIABLE, None)  # an inherited token never overrides a profile or token file the route chose
         token, _ = claude_auth(config)
         if token:
             env[OAUTH_VARIABLE] = token
@@ -325,8 +370,7 @@ def adapter(config, mode, session=None, images=()):
                     "ANTHROPIC_DEFAULT_OPUS_MODEL": model, "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL": model, "CLAUDE_CODE_SUBAGENT_MODEL": model,
                     "CLAUDE_CONFIG_DIR": str(profile), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
-        for variable in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
-                         "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+        for variable in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
             env.pop(variable, None)
     if config.get("profile_dir"):
         env[{"codex": "CODEX_HOME", "gemini": "GEMINI_CLI_HOME"}.get(kind, "CLAUDE_CONFIG_DIR")] = config["profile_dir"]
@@ -373,12 +417,15 @@ def adapter(config, mode, session=None, images=()):
                  "without commentary or tool-call markup. Each milestone must be self-contained and testable."]
     if model:
         argv += ["--model", model]
+    if kind == "claude":
+        session = resumable(config, env, session)
     if session:
         argv += ["--resume", session]
     return argv, env
 
 
 def metadata(path, kind, mode=None):
+    """(session id, last answer) of one provider call's log. A Claude id carries its config directory as id@tag; see resumable()."""
     session, last = None, ""
     if not path.exists():
         return session, last
@@ -406,6 +453,12 @@ def metadata(path, kind, mode=None):
             item = event.get("item", {})
             if isinstance(item, dict) and event.get("type") == "item.completed" and item.get("type") == "agent_message":
                 last = item.get("text") or last
+    if kind == "claude" and isinstance(session, str) and session:
+        try:
+            tag = tag_file(path).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            tag = ""  # an untagged id is taken to live in the directory an older version used
+        session = f"{session}@{tag}" if tag else session
     return session if isinstance(session, str) else None, last if isinstance(last, str) else ""
 
 
@@ -454,6 +507,7 @@ def usage(path, kind):
 SYNTHETIC = "<synthetic>"  # Claude Code's own placeholder for messages it wrote itself, such as API errors
 FAMILIES = ("opus", "sonnet", "haiku")
 UNVERIFIABLE = ("", "default", "best", "opusplan", "auto")
+GEMINI_ALIASES = ("pro", "flash", "flash-lite")
 DATE_SUFFIX = re.compile(r"[-@](?:\d{8}|\d{4}-\d{2}-\d{2}|(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))$")
 ANNOUNCES = ("thread.started", "turn.started", "turn.completed", "session.configured", "session_configured")
 
@@ -466,10 +520,22 @@ def canonical_model(name):
     return re.sub(r"[._\s]+", "-", name).strip("-")
 
 
+def gemini_alias(name):
+    """The family a Gemini CLI alias (pro, flash, flash-lite) or a canonical Gemini id stands for, else None."""
+    name = canonical_model(name)
+    if name in GEMINI_ALIASES:
+        return name
+    found = re.fullmatch(r"gemini-(?:\d+(?:-\d+)?-)?(.+)", name)
+    return re.sub(r"-(?:preview|exp|experimental|latest|\d{3})(?:-.*)?$", "", found.group(1)) if found else None
+
+
 def same_model(requested, served):
-    """Whether a reported model id is the one a route asked for. A bare family alias such as sonnet matches claude-sonnet-5-5."""
+    """Whether a reported model id is the one a route asked for. A bare family alias such as sonnet matches claude-sonnet-5-5,
+    and a Gemini alias such as pro matches gemini-2.5-pro. auto and auto-gemini-* routes name no model to check."""
     asked, got = canonical_model(requested), canonical_model(served)
-    return asked == got or asked in UNVERIFIABLE or (asked in FAMILIES and asked in got.split("-"))
+    if asked == got or asked in UNVERIFIABLE or asked.startswith("auto-") or (asked in FAMILIES and asked in got.split("-")):
+        return True
+    return asked in GEMINI_ALIASES and gemini_alias(got) == asked
 
 
 def codex_rollout_model(thread, profile_dir=None):
@@ -507,18 +573,41 @@ def codex_rollout_model(thread, profile_dir=None):
     return model
 
 
+def main_model(models):
+    """The model that did a Gemini call's main work, from the per-model stats of its result event, or None when that cannot be told.
+
+    The CLI lists its helper and router calls (flash-lite and the like) beside the main model, so a model counts only when it is
+    the sole one listed or carries more tokens than all the others together. Names that are aliases or routing modes never count."""
+    weights = {}
+    for name, entry in models.items():
+        if not isinstance(name, str) or not name.strip() or canonical_model(name) in GEMINI_ALIASES or canonical_model(name).startswith("auto"):
+            continue
+        entry = entry if isinstance(entry, dict) else {}
+        tokens = entry.get("total_tokens", (entry.get("tokens") or {}).get("total") if isinstance(entry.get("tokens"), dict) else None)
+        weights[name.strip()] = tokens if type(tokens) is int and tokens >= 0 else None
+    if len(weights) == 1:
+        return next(iter(weights))
+    if not weights or None in weights.values():
+        return None
+    top = max(weights, key=weights.get)
+    return top if weights[top] > sum(weights.values()) - weights[top] else None
+
+
 def served_models(config, log):
     """The model ids a provider reported for one call, most used first, and where they came from.
 
     Claude and DeepSeek name the model on every main-thread assistant message (a field of the API response; subagents and the
     CLI's synthetic messages are skipped), and the CLI repeats its own choice in the init event, which is only a fallback.
-    Gemini names it at init. Codex's --json stream names none, so the model it recorded for the thread comes from its session
-    rollout. Returns {"models": [...], "source": "response" | "init" | "stream" | "codex_rollout" | None}."""
+    Gemini names it at init, and its result stats name the model that carried the call (see main_model). Codex's --json stream
+    names none, so the model it recorded for the thread comes from its session rollout.
+    Returns {"models": [...], "source": "response" | "init" | "stream" | "codex_rollout" | None}."""
     kind = config.get("kind")
-    replies, announced, thread = {}, {}, None
+    replies, announced, thread, main = {}, {}, None, None
 
     def note(into, name):
         if isinstance(name, str) and name.strip() and name.strip() != SYNTHETIC:
+            if kind == "gemini" and (canonical_model(name) in GEMINI_ALIASES or canonical_model(name).startswith("auto")):
+                return  # an alias or a routing mode names no model
             into[name.strip()] = into.get(name.strip(), 0) + 1
 
     if kind in ("claude", "deepseek", "gemini", "codex"):
@@ -533,13 +622,15 @@ def served_models(config, log):
                 if label == "init":
                     note(announced, event.get("model"))
                 elif label == "result" and isinstance(event.get("stats"), dict) and isinstance(event["stats"].get("models"), dict):
-                    for name in event["stats"]["models"]:
-                        note(announced, name)
+                    main = main_model(event["stats"]["models"]) or main
             else:
                 thread = event.get("thread_id") or thread if label == "thread.started" else thread
                 for part in (event, event.get("msg")):
                     if isinstance(part, dict) and part.get("type") in ANNOUNCES:
                         note(announced, part.get("model"))
+    if main:
+        announced = {}
+        note(announced, main)
     if replies:
         return {"models": sorted(replies, key=lambda name: -replies[name]), "source": "response"}
     if announced:
@@ -549,6 +640,55 @@ def served_models(config, log):
         if model:
             return {"models": [model], "source": "codex_rollout"}
     return {"models": [], "source": None}
+
+
+LIMIT = re.compile(r"usage limit|hit your limit|rate.limit|quota exceeded|too many requests|(?:HTTP|status|API error)[: ]+429\b", re.I)
+
+
+def texts(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return texts(value.get("message")) if isinstance(value, dict) else []
+
+
+def failure_parts(event):
+    """The words in one stream event that a provider uses to report how a call ended or failed, or nothing for ordinary events."""
+    label = event.get("type")
+    if label == "result":  # the call's verdict; this is only read for a call that failed
+        return [*texts(event.get("result")), *texts(event.get("errors")), *texts(event.get("error"))]
+    if label in ("error", "turn.failed", "thread.error"):
+        return [*texts(event.get("message")), *texts(event.get("error"))]
+    if label == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict) and event["rate_limit_info"].get("status") == "rejected":
+        return ["rate limit rejected " + json.dumps(event["rate_limit_info"])]
+    if label == "assistant" and event.get("error"):  # Claude Code flags the messages it writes about its own failures
+        content = event.get("message", {}).get("content") if isinstance(event.get("message"), dict) else None
+        return [str(event["error"]), *(block["text"] for block in content or () if isinstance(block, dict) and isinstance(block.get("text"), str))]
+    return []
+
+
+def provider_errors(log, limit=12000):
+    """What a provider reported about a failed call, oldest first: its error, failed-turn and result events, a rejected rate limit,
+    assistant messages the CLI flagged as errors, and the CLI's own non-JSON lines (stderr shares the log). The assistant's prose,
+    its last message, tool output and file contents never count, so text that merely mentions a limit cannot classify a call."""
+    found = deque(maxlen=400)
+    with Path(log).open("rb") as stream:
+        while raw := stream.readline(2 * 1024 * 1024 + 1):
+            if len(raw) > 2 * 1024 * 1024:
+                while raw and not raw.endswith(b"\n"):
+                    raw = stream.readline(2 * 1024 * 1024 + 1)
+                continue
+            try:
+                event = json.loads(raw)
+            except (ValueError, UnicodeError):
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    found.append(line[:2000])
+                continue
+            if isinstance(event, dict):
+                found.extend(failure_parts(event))
+    return "\n".join(found)[-limit:]
 
 
 def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None, images=()):
@@ -584,6 +724,14 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
             scratch = resources.enter_context(tempfile.TemporaryDirectory(dir=scratch_root, prefix="codex-",
                                                                          ignore_cleanup_errors=True))
             env.update(TEMP=scratch, TMP=scratch, TMPDIR=scratch)
+        if config["kind"] == "claude":
+            # Written before the call so that a runner killed mid-call still leaves the directory its session lives in.
+            try:
+                log.parent.mkdir(parents=True, exist_ok=True)
+                tag_file(log).unlink(missing_ok=True)
+                tag_file(log).write_text(config_tag(claude_directory(env)), encoding="ascii")
+            except OSError:
+                pass
         code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
     current, answer = metadata(log, config["kind"], mode)
     if config["kind"] == "command" and code == config.get("unavailable_exit_code"):
@@ -592,12 +740,10 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         for event in json_events(log):
             if (event.get("type") == "result" and (event.get("is_error") is True or event.get("status") == "error")) or event.get("type") == "turn.failed":
                 code = 1
-    if code and config["kind"] in {"claude", "codex", "deepseek", "gemini"}:
-        detail = answer.strip()
-        if not detail:
-            with log.open("rb") as stream:
-                stream.seek(max(0, log.stat().st_size - 8000))
-                detail = stream.read().decode("utf-8", "replace")
+    if code and config["kind"] in {"claude", "codex", "deepseek", "gemini"} and code not in CONTROLLER_EXITS:
+        # Only what the provider itself reported as a failure is classified, never the worker's own prose or its tool output.
+        # A call the controller ended (time, idle or output limit) was not a provider failure at all.
+        detail = provider_errors(log)
         if config["kind"] == "deepseek" and re.search(
                 r"invalid.*api.?key|authentication_error|authentication.fail|insufficient.balance|invalid.authentication", detail, re.I):
             raise ProviderUnavailable("DeepSeek reported an API credential or balance error. "
@@ -620,22 +766,20 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if re.search(r"credit balance.*(?:low|insufficient)|billing.hard.limit|insufficient credits", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a billing or credit balance problem. Check the selected account.",
                                       "billing")
-        if re.search(r"usage limit|hit your limit|rate.limit|quota exceeded|too many requests|(?:HTTP|status|API error)[: ]+429\b", detail, re.I):
+        if LIMIT.search(detail):
             now = datetime.now(timezone.utc)
-            with log.open("rb") as stream:
-                stream.seek(max(0, log.stat().st_size - 16000))
-                tail = stream.read().decode("utf-8", "replace")
-            reset = reset_after(detail, now) or reset_after(tail, now)
             quote = re.search(r"[^\n\"{}]{0,120}(?:usage limit|hit your limit|rate.?limit|quota exceeded|too many requests|\b429\b)[^\n\"{}]{0,200}",
                               detail, re.I)
             note = f" Provider said: {redact(' '.join(quote.group(0).split()))}" if quote else ""
             raise ProviderUnavailable(f"{config['kind']} reached a rate or usage limit. Retry after the limit resets.{note}",
-                                      "usage_limit", reset)
+                                      "usage_limit", reset_after(detail, now))
         if re.search(r"ECONNRESET|ETIMEDOUT|temporarily unavailable|service unavailable|(?:HTTP|status|API error)[: ]+50[234]\b", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a temporary network or service failure.", "transient")
         if re.search(r"model_not_found|unsupported model|model .*?(?:not found|does not exist|not supported|not available)", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} could not use the selected model. Check model access for this profile.",
                                       "model_access")
+    if config["kind"] == "claude" and not resumable(config, env, session):
+        session = None  # a session this call could not resume is not one it continued
     return code, current or session, answer
 
 

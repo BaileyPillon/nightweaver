@@ -11,6 +11,11 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 
+from .safety import scrub_env
+
+# The exit codes execute() returns when the controller, not the program, ended the call: time, idle and output limits.
+CONTROLLER_EXITS = (124, 125, 126)
+
 
 class BusyRun(ValueError):
     pass
@@ -116,7 +121,10 @@ class ProcessLimit(RuntimeError):
 
 def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: False,
             idle_timeout=None, max_log_bytes=16 * 1024 * 1024, heartbeat=None, raise_on_limit=False):
-    """Run an operator-approved program using files for I/O and a native Job for ownership."""
+    """Run an operator-approved program using files for I/O and a native Job for ownership.
+
+    A caller that passes no env gets the process environment without provider credentials."""
+    env = scrub_env(os.environ) if env is None else env
     log.parent.mkdir(parents=True, exist_ok=True)
     prompt_path = log.with_suffix(".input.txt")
     if prompt is not None:

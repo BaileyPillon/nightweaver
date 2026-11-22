@@ -552,12 +552,14 @@ class ClaudeAuthTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_the_process_environment_wins_over_the_registry(self):
+    def test_a_rotated_registry_token_wins_over_the_stale_process_value(self):
         self.registry.return_value = "from-registry"
         os.environ[OAUTH_VARIABLE] = "from-process"
-        self.assertEqual(claude_auth({"kind": "claude"}), ("from-process", "oauth_token_env"))
+        self.assertEqual(claude_auth({"kind": "claude"}), ("from-registry", "oauth_token_user_env"))
         _, env = adapter({"kind": "claude"}, "worker")
-        self.assertEqual(env[OAUTH_VARIABLE], "from-process")
+        self.assertEqual(env[OAUTH_VARIABLE], "from-registry")
+        self.registry.return_value = "from-process"
+        self.assertEqual(claude_auth({"kind": "claude"}), ("from-process", "oauth_token_env"), "equal values keep the process source")
 
     def test_a_missing_variable_is_read_from_the_user_environment(self):
         self.registry.return_value = FAKE_TOKEN
@@ -633,13 +635,16 @@ class ClaudeAuthTests(unittest.TestCase):
     def test_child_environments_only_carry_the_credentials_they_use(self):
         os.environ.update({OAUTH_VARIABLE: "oauth", "ANTHROPIC_API_KEY": "anthropic-key", "ANTHROPIC_AUTH_TOKEN": "anthropic-token",
                            "DEEPSEEK_API_KEY": "deepseek-key", "OPENAI_API_KEY": "openai-key", "GEMINI_API_KEY": "gemini-key"})
-        for kind in ("codex", "gemini"):
-            _, env = adapter({"kind": kind}, "worker")
-            self.assertEqual([k for k in (OAUTH_VARIABLE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY") if k in env], [], kind)
-            self.assertEqual((env["OPENAI_API_KEY"], env["GEMINI_API_KEY"]), ("openai-key", "gemini-key"))
+        others = (OAUTH_VARIABLE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY")
+        _, env = adapter({"kind": "codex"}, "worker")
+        self.assertEqual([k for k in (*others, "GEMINI_API_KEY") if k in env], [], "codex")
+        self.assertEqual(env["OPENAI_API_KEY"], "openai-key")
+        _, env = adapter({"kind": "gemini"}, "worker")
+        self.assertEqual([k for k in (*others, "OPENAI_API_KEY") if k in env], [], "gemini")
+        self.assertEqual(env["GEMINI_API_KEY"], "gemini-key")
         _, env = adapter({"kind": "claude"}, "worker")
         self.assertEqual((env[OAUTH_VARIABLE], env["ANTHROPIC_API_KEY"], env["ANTHROPIC_AUTH_TOKEN"]), ("oauth", "anthropic-key", "anthropic-token"))
-        self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertEqual([k for k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY") if k in env], [])
         key = self.root / "deepseek.key"
         key.write_text("deepseek-key", encoding="utf-8")
         with patch("nightweaver.providers.default_home", return_value=self.root / "home"):
@@ -648,8 +653,9 @@ class ClaudeAuthTests(unittest.TestCase):
         self.assertNotIn(OAUTH_VARIABLE, env)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         _, env = adapter({"kind": "command", "argv": ["tool"]}, "worker")
-        self.assertEqual([env[k] for k in (OAUTH_VARIABLE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY")],
-                         ["oauth", "anthropic-key", "anthropic-token", "deepseek-key"], "command providers are left alone")
+        self.assertEqual([k for k in (*others, "OPENAI_API_KEY", "GEMINI_API_KEY") if k in env], [], "command providers get no credentials")
+        _, env = adapter({"kind": "command", "argv": ["tool"], "inherit_credentials": True}, "worker")
+        self.assertEqual([env[k] for k in others], ["oauth", "anthropic-key", "anthropic-token", "deepseek-key"], "unless the route opts in")
 
     def test_provider_validation_accepts_oauth_token_file_for_claude_only(self):
         route = provider({"kind": "claude", "oauth_token_file": "secrets/claude.token"}, {"claude", "codex"}, "worker", self.root)

@@ -1,5 +1,6 @@
 """Native suite adapters used by repository OneShots. Invoked as a standalone script."""
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -7,6 +8,19 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from xml.etree import ElementTree
+
+
+def scrub_environment():
+    """Drop provider credentials from this process, so the suite and every child it starts never inherit them.
+
+    The gate that started this script already scrubbed them; this covers a direct launch. safety.py is loaded by path because
+    this script runs standalone, and importing the nightweaver package would shadow the copy in a repository that contains one."""
+    spec = importlib.util.spec_from_file_location("_nightweaver_safety", Path(__file__).with_name("safety.py"))
+    safety = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(safety)
+    clean = safety.scrub_env(os.environ)
+    for name in [name for name in os.environ if name not in clean]:
+        del os.environ[name]
 
 
 def unittest_suite(folder):
@@ -63,6 +77,7 @@ def dotnet_suite(executable, project):
 
 
 if __name__ == "__main__":
+    scrub_environment()
     if sys.argv[1] == "unittest":
         sys.exit(unittest_suite(sys.argv[2]))
     if sys.argv[1] == "dotnet":
