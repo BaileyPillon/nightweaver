@@ -160,6 +160,19 @@ class FallbackTests(unittest.TestCase):
         self.assertIn("chrome:", errors[0])
 
 
+class ConsoleContractTests(unittest.TestCase):
+    def message(self, text, url):
+        return SimpleNamespace(text=text, location={"url": url})
+
+    def test_only_a_failed_favicon_fetch_is_exempt_from_the_console_contract(self):
+        failed = "Failed to load resource: the server responded with a status of 404 (File not found)"
+        self.assertTrue(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/favicon.ico")))
+        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/app.js")))
+        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/img/favicon.ico.map")))
+        self.assertFalse(browser.favicon_failure(self.message("TypeError: favicon.ico", "http://127.0.0.1:8080/favicon.ico")))
+        self.assertFalse(browser.favicon_failure(SimpleNamespace(text=failed)))
+
+
 class DoctorBrowserTests(unittest.TestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -396,6 +409,10 @@ class SmokeGateRunTests(unittest.TestCase):
             self.assertEqual((fallback["requested"], fallback["used"]), ("bundled", runtime["channel"]))
             self.assertIn("Executable doesn't exist", fallback["reason"])
             self.assertEqual(runtime["browser_channel_fallback"], fallback)
+
+    def test_a_page_without_a_favicon_passes_on_every_channel(self):
+        receipt = self.run_smoke({"index.html": PAGE.replace('<link rel="icon" href="data:,">', "")})
+        self.assertEqual(receipt["exit"], 0, receipt.get("browser_failures"))
 
     def test_horizontal_overflow_fails_the_smoke_gate_with_a_repairable_diagnosis(self):
         wide = PAGE.replace("<h1>", '<div style="width:1600px">wide</div><h1>')

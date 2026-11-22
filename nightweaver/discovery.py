@@ -410,7 +410,6 @@ def discover(repository, objective, worker, rescue=None, python=None):
     if page:
         plan["acceptance"] = [
             f"{page} exists, loads over HTTP without console or page errors and has no horizontal overflow at "
-            "1440x900 (desktop) and 390x844 (phone). A missing favicon is logged as a console error, "
-            'so include <link rel="icon" href="data:,"> or a real icon.'
+            "1440x900 (desktop) and 390x844 (phone)."
         ]
     return plan

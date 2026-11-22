@@ -340,6 +340,26 @@ def browser_runtime(channel, *, timeout=None, info=None):
         yield browser
 
 
+def warm_up(browser):
+    """Installed Edge and Chrome draw their first screenshot slowly. Pay that once, outside the timed cases."""
+    try:
+        context = browser.new_context()
+        try:
+            page = context.new_page()
+            page.set_content("<!doctype html><title>Nightweaver warm-up</title>")
+            page.screenshot(timeout=30000)
+        finally:
+            context.close()
+    except Exception:
+        pass  # A browser that is really broken fails the first case with its own diagnosis.
+
+
+def favicon_failure(message):
+    """Installed Edge and Chrome fetch /favicon.ico on the first page. The headless shell never does, so it is not a page error."""
+    url = (getattr(message, "location", None) or {}).get("url", "")
+    return message.text.startswith("Failed to load resource") and urlparse(url).path == "/favicon.ico"
+
+
 def run_case(
     browser, config, scenario, viewport, steps, root, output, url, server_check
 ):
@@ -390,7 +410,7 @@ def run_case(
         page.on("pageerror", lambda err: issue("page_error", err))
         page.on(
             "console",
-            lambda msg: issue("console", msg.text) if msg.type == "error" else None,
+            lambda msg: issue("console", msg.text) if msg.type == "error" and not favicon_failure(msg) else None,
         )
         return page
 
@@ -545,6 +565,8 @@ def _verify_browser(config, root, output):
         }
         if channel["fallback"]:
             runtime["browser_channel_fallback"] = channel["fallback"]
+        if channel["used"] != "bundled":
+            warm_up(browser)
         with local_page(config, root, output) as (url, server_check):
             for scenario, viewport, steps in journeys.browser_cases(config):
                 results.append(
