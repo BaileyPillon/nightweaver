@@ -27,7 +27,8 @@ JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["v
                                "reason": {"type": "string"}}}
 WAVE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["milestones"],
                "properties": {"milestones": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False,
-                              "required": ["title", "task"], "properties": {"title": {"type": "string"}, "task": {"type": "string"}}}}}}
+                              "required": ["title", "task"], "properties": {"title": {"type": "string"}, "task": {"type": "string"}}}},
+                              "conflicts": {"type": "array", "items": {"type": "string"}}}}
 SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
                         "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}},
            "judge": JUDGE_SCHEMA, "replanner": WAVE_SCHEMA}

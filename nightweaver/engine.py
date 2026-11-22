@@ -936,10 +936,10 @@ class Run:
                 step = None if phase in ("judging", "planning") else self.spec["milestones"][state["step"]]
                 try:
                     self.check_budget()
-                    if state.get("retry_at") and datetime.fromisoformat(state["retry_at"]) > datetime.now(timezone.utc):
+                    if state.get("retry_at") and (wait := (datetime.fromisoformat(state["retry_at"]) - datetime.now(timezone.utc)).total_seconds()) > 0:
                         if defer_retries:
                             return "waiting"
-                        time.sleep(.2)
+                        time.sleep(min(2, max(.2, wait)))  # a parked run may wait hours; poll gently but still notice a pause
                         continue
                     if not context_checked:
                         if self.spec.get("context_sha256"):
