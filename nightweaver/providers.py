@@ -424,6 +424,106 @@ def usage(path, kind):
     return {"observed_tokens": total if seen else None, "token_channels": channels, "billing": "not_measured"}
 
 
+SYNTHETIC = "<synthetic>"  # Claude Code's own placeholder for messages it wrote itself, such as API errors
+FAMILIES = ("opus", "sonnet", "haiku")
+UNVERIFIABLE = ("", "default", "best", "opusplan", "auto")
+DATE_SUFFIX = re.compile(r"[-@](?:\d{8}|\d{4}-\d{2}-\d{2}|(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))$")
+ANNOUNCES = ("thread.started", "turn.started", "turn.completed", "session.configured", "session_configured")
+
+
+def canonical_model(name):
+    """A model id without the spellings that differ between routes: case, vendor prefix, context tag, dated snapshot, version tag."""
+    name = re.sub(r"\[[^\]]*\]$", "", str(name).strip().lower()).rsplit("/", 1)[-1]
+    name = re.sub(r"^(?:[a-z]{2}\.)?(?:anthropic|openai|deepseek|google|meta|amazon)\.", "", name)
+    name = DATE_SUFFIX.sub("", re.sub(r"[-:@]latest$", "", re.sub(r"-v\d+:\d+$", "", name)))
+    return re.sub(r"[._\s]+", "-", name).strip("-")
+
+
+def same_model(requested, served):
+    """Whether a reported model id is the one a route asked for. A bare family alias such as sonnet matches claude-sonnet-5-5."""
+    asked, got = canonical_model(requested), canonical_model(served)
+    return asked == got or asked in UNVERIFIABLE or (asked in FAMILIES and asked in got.split("-"))
+
+
+def codex_rollout_model(thread, profile_dir=None):
+    """The model Codex recorded for a thread's last turn. exec --json never prints it, but the session rollout does."""
+    from uuid import UUID
+    try:
+        identity = UUID(thread)
+        if identity.version != 7:
+            return None
+        thread = str(identity)
+        made = datetime.fromtimestamp(int(identity.hex[:12], 16) / 1000, timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    sessions = Path(profile_dir or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "sessions"
+    days = {(stamp + timedelta(days=shift)).date() for stamp in (made, made.astimezone()) for shift in (-1, 0, 1)}
+    model = None
+    try:
+        for day in sorted(days):
+            for rollout in (sessions / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}").glob(f"rollout-*-{thread}.jsonl"):
+                if rollout.stat().st_size > 512 * 1024 * 1024:
+                    continue
+                with rollout.open("rb") as stream:
+                    for line in stream:
+                        if b'"turn_context"' not in line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        payload = event.get("payload") if isinstance(event, dict) and event.get("type") == "turn_context" else None
+                        found = payload.get("model") if isinstance(payload, dict) else None
+                        model = found if isinstance(found, str) and found.strip() else model
+    except OSError:
+        return None
+    return model
+
+
+def served_models(config, log):
+    """The model ids a provider reported for one call, most used first, and where they came from.
+
+    Claude and DeepSeek name the model on every main-thread assistant message (a field of the API response; subagents and the
+    CLI's synthetic messages are skipped), and the CLI repeats its own choice in the init event, which is only a fallback.
+    Gemini names it at init. Codex's --json stream names none, so the model it recorded for the thread comes from its session
+    rollout. Returns {"models": [...], "source": "response" | "init" | "stream" | "codex_rollout" | None}."""
+    kind = config.get("kind")
+    replies, announced, thread = {}, {}, None
+
+    def note(into, name):
+        if isinstance(name, str) and name.strip() and name.strip() != SYNTHETIC:
+            into[name.strip()] = into.get(name.strip(), 0) + 1
+
+    if kind in ("claude", "deepseek", "gemini", "codex"):
+        for event in json_events(log):
+            label = event.get("type")
+            if kind in ("claude", "deepseek"):
+                if label == "assistant" and isinstance(event.get("message"), dict) and not event.get("parent_tool_use_id"):
+                    note(replies, event["message"].get("model"))
+                elif label == "system" and event.get("subtype") == "init":
+                    note(announced, event.get("model"))
+            elif kind == "gemini":
+                if label == "init":
+                    note(announced, event.get("model"))
+                elif label == "result" and isinstance(event.get("stats"), dict) and isinstance(event["stats"].get("models"), dict):
+                    for name in event["stats"]["models"]:
+                        note(announced, name)
+            else:
+                thread = event.get("thread_id") or thread if label == "thread.started" else thread
+                for part in (event, event.get("msg")):
+                    if isinstance(part, dict) and part.get("type") in ANNOUNCES:
+                        note(announced, part.get("model"))
+    if replies:
+        return {"models": sorted(replies, key=lambda name: -replies[name]), "source": "response"}
+    if announced:
+        return {"models": sorted(announced, key=lambda name: -announced[name]), "source": "init" if kind != "codex" else "stream"}
+    if kind == "codex" and isinstance(thread, str):
+        model = codex_rollout_model(thread, profile_override(config))
+        if model:
+            return {"models": [model], "source": "codex_rollout"}
+    return {"models": [], "source": None}
+
+
 def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None, images=()):
     executable = check_provider(config, cwd)
     argv, env = adapter(config, mode, session, images)

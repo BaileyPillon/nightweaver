@@ -12,10 +12,10 @@ import subprocess
 import time
 
 from .process import BusyRun, PausedRun, run_lock
-from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, usage
+from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
-from . import context
+from . import context, notify
 from .safety import atomic_write, redact, write_json
 from .store import timestamp
 
@@ -272,6 +272,38 @@ def park_plan(spec, state, error, now, kind):
             "reset": reset.isoformat(timespec="seconds") if parsed else None, "seconds": round(wait)}
 
 
+def call_served(run, pending, state):
+    """The model ids the provider's log reports for a finished call. A log that cannot be read never fails the call."""
+    try:
+        config = {"kind": pending["provider"]}
+        if pending["role"] in ("worker", "reviewer", "judge", "planner"):
+            try:
+                step = run.spec["milestones"][state["step"]] if pending["role"] in ("worker", "reviewer") else None
+                routed = run.route(state, step, pending["role"])
+                if routed.get("kind") == pending["provider"] and routed.get("model") == pending.get("model"):
+                    config = routed  # carries the profile directory a Codex rollout is looked up in
+            except (KeyError, IndexError, TypeError):
+                pass
+        return served_models(config, pending["log"])
+    except Exception:
+        return {"models": [], "source": None}
+
+
+def model_drift(pending, served, seen):
+    """model_mismatch events for reported ids that differ from the model a route asked for, once per route and id."""
+    requested = pending.get("model")
+    events, seen = [], list(seen)
+    for name in served["models"] if requested else ():
+        key = "|".join(str(part) for part in (pending.get("role"), pending["provider"], requested, name))
+        if key in seen or same_model(requested, name):
+            continue
+        seen.append(key)
+        events.append(("model_mismatch", {"provider": pending["provider"], "role": pending.get("role"), "requested": requested, "served": name,
+                       "source": served["source"], "call": pending.get("call"),
+                       "issue": f"{pending['provider']} {pending.get('role')} asked for {requested} but was served {name}"}))
+    return events, seen
+
+
 class Run:
     def __init__(self, store, run_id):
         self.store = store
@@ -283,7 +315,9 @@ class Run:
         self.ref = row["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
 
     def set(self, kind, details=None, **state):
-        return self.store.transition(self.id, kind, details, **state)
+        result = self.store.transition(self.id, kind, details, **state)
+        notify.on_transition(self.store, self.id, self.spec["title"], kind, details, state.get("following_event"), result)
+        return result
 
     def paused(self):
         self.check_budget()
@@ -311,11 +345,16 @@ class Run:
     def finish_call(self, pending, *, recovered=False, succeeded=False):
         state = self.store.get(self.id)["state"]
         receipt, sessions = counted_usage(usage(Path(pending["log"]), pending["provider"]), pending["log"], pending["provider"], state)
+        served = call_served(self, pending, state)
+        mismatches, seen = model_drift(pending, served, state.get("model_mismatches", []))
         self.set("provider_call_finished", {**pending, **receipt, "recovered": recovered,
-                 "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds())},
-                 pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
+                 "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds()),
+                 "served_model": served["models"][0] if served["models"] else None,
+                 **({"served_models": served["models"]} if len(served["models"]) > 1 else {}),
+                 **({"served_source": served["source"]} if served["source"] else {})},
+                 following_event=mismatches or None, pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
                  usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None), **sessions,
-                 **({"parks": 0} if succeeded and state.get("parks") else {}))
+                 **({"parks": 0} if succeeded and state.get("parks") else {}), **({"model_mismatches": seen} if mismatches else {}))
 
     def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None):
         self.check_budget(call=True)

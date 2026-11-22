@@ -284,6 +284,41 @@ def register(store, spec, args):
     return result
 
 
+def notify_command(store, args):
+    from . import notify
+    action = args.notify_action
+    if action == "setup":
+        events = [item for group in args.events or [] for item in group.split(",") if item] or None
+        quiet = None if args.quiet_hours is None else args.quiet_hours.strip()
+        print(notify.setup_text(notify.setup(store, server=args.server, events=events, quiet_hours=quiet, max_per_night=args.max_per_night,
+                                             images=False if args.no_images else None, rotate=args.rotate)))
+        return 0
+    if action == "status":
+        output(notify.status(store))
+    elif action == "off":
+        output(notify.off(store))
+    elif action == "test":
+        if not notify.configured(store):
+            raise ValueError("Notifications are not set up. Run nightweaver notify setup first")
+        sent, why = notify.send_test(store)
+        output({"sent": sent, **({} if sent else {"issue": why})})
+        return 0 if sent else 3
+    elif args.hours <= 0:
+        raise ValueError("--hours must be more than 0")
+    elif args.print:
+        report = notify.digest(store, args.hours)
+        text = report["title"] + "\n\n" + report["message"]
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, "replace").decode(encoding))  # a run title the console cannot show must not stop the digest
+    else:
+        if not notify.configured(store):
+            raise ValueError("Notifications are not set up. Run nightweaver notify setup first, or use --print")
+        report = notify.send_digest(store, args.hours)
+        output({key: report[key] for key in ("sent", "title", "counts", "held", "issue") if key in report})
+        return 0 if report["sent"] else 3
+    return 0
+
+
 def main(argv=None):
     app = argparse.ArgumentParser(prog="nightweaver")
     app.add_argument("--home", type=Path, help="Override private runtime data directory")
@@ -379,6 +414,22 @@ def main(argv=None):
     configure = commands.add_parser("configure", help="Configure a provider using an existing local key file")
     configure.add_argument("provider", choices=("deepseek",))
     configure.add_argument("--key-file", type=Path, required=True)
+    notify = commands.add_parser("notify", help="Opt-in phone notifications and morning digest over ntfy")
+    notify_actions = notify.add_subparsers(dest="notify_action", required=True)
+    setup = notify_actions.add_parser("setup", help="Write the configuration with fresh random topics and print how to subscribe. Sends nothing")
+    setup.add_argument("--server", help="ntfy server URL (default https://ntfy.sh, or your own)")
+    setup.add_argument("--events", nargs="+", metavar="EVENT", help="Events to send, space or comma separated (default: goal_met run_completed "
+                       "pursuit_stopped blocked provider_unavailable provider_parked model_mismatch)")
+    setup.add_argument("--quiet-hours", metavar="HH:MM-HH:MM", help="Local night window with a message allowance (default 23:00-07:00; '' disables)")
+    setup.add_argument("--max-per-night", type=int, metavar="N", help="Messages allowed in quiet hours before the rest wait for the digest (default 3)")
+    setup.add_argument("--no-images", action="store_true", help="Never attach screenshots")
+    setup.add_argument("--rotate", action="store_true", help="Replace existing topics with new random ones")
+    notify_actions.add_parser("test", help="Send one test message now")
+    notify_actions.add_parser("status", help="Show the configuration with topics partly masked")
+    notify_actions.add_parser("off", help="Remove the notification configuration")
+    digest = notify_actions.add_parser("digest", help="Send a summary of recent runs")
+    digest.add_argument("--hours", type=float, default=12, help="Look back this many hours (default 12)")
+    digest.add_argument("--print", action="store_true", help="Print the digest instead of sending it")
     for name in ("run", "start", "pause", "resume", "status", "events"):
         parser = commands.add_parser(name)
         parser.add_argument("id")
@@ -635,6 +686,8 @@ def main(argv=None):
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
+        if name == "notify":
+            return notify_command(store, args)
         if name in ("guard", "recovery", "restarts", "recovery-queue"):
             from .recovery import EXIT_CODES, GUARD_EVENTS, recovery_status, supervise
             if name == "guard":
