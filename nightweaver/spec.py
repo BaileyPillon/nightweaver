@@ -55,7 +55,7 @@ def anchor_provider_paths(raw, folder):
         routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5)]
         for route in routes:
             if isinstance(route, dict):
-                for key in ("profile_dir", "api_key_file"):
+                for key in ("profile_dir", "api_key_file", "oauth_token_file"):
                     if key in route:
                         route[key] = str((folder / Path(text(route, key)).expanduser()).resolve())
     for section in [raw, *array(raw.get("milestones", []), "milestones", 50)]:
@@ -66,7 +66,7 @@ def anchor_provider_paths(raw, folder):
             routes.extend(array(section.get(key, []), key, 5))
         for route in routes:
             if isinstance(route, dict):
-                for key in ("profile_dir", "api_key_file"):
+                for key in ("profile_dir", "api_key_file", "oauth_token_file"):
                     if key in route:
                         route[key] = str((folder / Path(text(route,key)).expanduser()).resolve())
 
@@ -106,7 +106,7 @@ def text(obj, key):
 
 
 def provider(value, choices, label, relative_to=None):
-    fields(value, "kind argv executable model effort api_key api_key_file profile_dir unavailable_exit_code", label)
+    fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
@@ -137,6 +137,10 @@ def provider(value, choices, label, relative_to=None):
         if value["kind"] != "deepseek":
             raise ValueError("api_key_file is supported by the DeepSeek adapter")
         out["api_key_file"] = str(((relative_to or Path.cwd()) / Path(text(value, "api_key_file")).expanduser()).resolve())
+    if value.get("oauth_token_file"):
+        if value["kind"] != "claude":
+            raise ValueError("oauth_token_file is supported by the Claude adapter")
+        out["oauth_token_file"] = str(((relative_to or Path.cwd()) / Path(text(value, "oauth_token_file")).expanduser()).resolve())
     if value.get("profile_dir"):
         profile = ((relative_to or Path.cwd()) / Path(text(value, "profile_dir")).expanduser()).resolve()
         if value["kind"] == "command":
@@ -267,7 +271,7 @@ def resolve_repository(raw, relative_to=None, store=None):
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
-           "reviewer_fallbacks context_files repository_map source_issue repair pursue", "plan")
+           "reviewer_fallbacks context_files repository_map source_issue repair pursue git_timeout", "plan")
     if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
         raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
@@ -336,12 +340,14 @@ def validate(raw, relative_to=None, store=None):
     bounds = {"max_calls": (1, 10000), "max_seconds": (1, 604800), "max_observed_tokens": (1, 1000000000),
               "idle_timeout": (1, 14400), "max_log_bytes": (1024, 256 * 1024 * 1024)}
     out["budgets"] = {key: integer(value, key, *bounds[key]) for key, value in budgets.items()}
+    if "git_timeout" in raw:
+        out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
     retry = raw.get("retry", {})
-    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit", "retry")
-    defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3}
-    out["retry"] = {key: integer(retry.get(key, value), key, 1 if key in ("initial_seconds", "max_seconds") else 0,
-                                  3600 if key in ("initial_seconds", "max_seconds") else 20)
-                    for key, value in defaults.items()}
+    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds", "retry")
+    defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3,
+                "max_parks": 8, "max_park_seconds": 21600}
+    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800)}
+    out["retry"] = {key: integer(retry.get(key, value), key, *limits.get(key, (0, 20))) for key, value in defaults.items()}
     if "repair" in raw:
         from .repair import policy
         out["repair"] = policy(raw["repair"])
