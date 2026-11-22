@@ -5,14 +5,16 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Timer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -994,19 +996,76 @@ class SweepRunTests(unittest.TestCase):
 
     def test_a_popup_whose_event_arrives_late_is_still_this_controls_and_is_not_the_next_ones(self):
         from playwright.sync_api import Page
-        original = Page.on
+        on, wait, held, delivered = Page.on, Page.wait_for_timeout, [], []
 
         def late_on(self, event, handler):
-            # The popup event is delivered 1.5 s late, far past the settle, as it can be on a loaded machine.
-            return original(self, event, (lambda popup: Timer(1.5, handler, [popup]).start()) if event == "popup" else handler)
+            # The popup event reaches its handlers 1.5 s late, far past the settle, as it can on a loaded machine.
+            return on(self, event, (lambda popup: held.append((time.monotonic() + 1.5, handler, popup))) if event == "popup" else handler)
+
+        def wait_then_deliver(self, timeout):
+            # The main thread's own waits deliver what has come due. A Playwright object belongs to the thread that started it: a timer
+            # thread (as this test once used) that calls into one writes to the driver's pipe from a second thread, and that can leave
+            # asyncio's proactor waiting for ever to close the loop, which hung a CI shard for an hour.
+            wait(self, timeout)
+            for item in [h for h in held if h[0] <= time.monotonic()]:
+                held.remove(item)
+                delivered.append(item[0])
+                item[1](item[2])
 
         page = (HEAD + "<body><button onclick=\"window.open('about.html')\">Popup</button><button " + mode("dawn") + ">Paint</button></body></html>")
-        with patch.object(Page, "on", late_on):
+        with patch.object(Page, "on", late_on), patch.object(Page, "wait_for_timeout", wait_then_deliver):
             report, _ = self.direct({"index.html": page}, {})
         self.assertTrue(report["passed"], [v["errors"] for v in report["viewports"]])
+        self.assertTrue(delivered and not held, "the popup event was held back and then delivered, not dropped")
         rows = self.swept(report)
         self.assertEqual((rows["Popup"]["opened"], rows["Paint"]["opened"]), (["popup"], []))
         self.assertFalse(rows["Popup"]["navigated"] or rows["Paint"]["navigated"])
+
+    def test_a_popup_in_its_own_process_that_never_stops_running_script_is_closed_and_the_sweep_goes_on(self):
+        page = (HEAD + "<body><button onclick=\"window.open('spin.html', '_blank', 'noopener')\">Popup</button><button " + mode("dawn") + ">Paint</button></body></html>")
+        spin = "<!doctype html><title>Spin</title><link rel=icon href=data:,><script>for(;;){}</script>"
+        started = time.monotonic()
+        receipt, folder = self.gate({"index.html": page, "spin.html": spin}, {})
+        self.assertLess(time.monotonic() - started, 75, "bounded by the sweep's own deadlines, not the gate's timeout")
+        self.assertEqual(receipt["exit"], 0, receipt.get("browser_failures"))
+        rows = {r["name"]: r for r in receipt["browser_sweep"]}
+        self.assertEqual((rows["Popup"]["opened"], rows["Paint"]["opened"]), (["popup"], []))
+        self.assertTrue(rows["Popup"]["screenshot"] and rows["Paint"]["screenshot"])
+
+    def test_a_popup_in_the_pages_own_process_that_never_stops_running_script_fails_the_gate_instead_of_hanging_it(self):
+        page = (HEAD + "<body><button onclick=\"window.open('spin.html')\">Popup</button><button " + mode("dawn") + ">Paint</button></body></html>")
+        spin = "<!doctype html><title>Spin</title><link rel=icon href=data:,><script>for(;;){}</script>"
+        started = time.monotonic()
+        receipt, folder = self.gate({"index.html": page, "spin.html": spin}, {}, timeout_ms=3000)
+        self.assertLess(time.monotonic() - started, 75, "bounded questions, not the gate's 120 s timeout")
+        self.assertEqual(receipt["exit"], 1)
+        self.assertFalse(receipt.get("execution_error"), receipt.get("artifact_error"))
+        report = json.loads(Path(receipt["receipt"]).read_text(encoding="utf-8"))
+        # Where the sweep notices depends on how soon the popup starts to spin: at the first question, or at the photograph.
+        self.assertIn(report["sweep_truncated"], ("page unresponsive", "sweep error"))
+        self.assertTrue(any(r["screenshot"] is None for r in report["sweep"]), "the control it stopped on is on record, unphotographed")
+
+    @unittest.skipUnless(sys.platform == "win32", "asyncio's Windows proactor is what can wedge")
+    def test_a_browser_shutdown_that_cannot_finish_is_cut_short_instead_of_hanging(self):
+        """Closing Playwright's event loop waits for every operation the proactor still lists. One whose completion was already
+        consumed (what a Playwright call from a second thread leaves behind) never reports, and the wait had no end."""
+        code = textwrap.dedent("""
+            import faulthandler, sys, time
+            faulthandler.dump_traceback_later(80, exit=True)
+            from nightweaver import browser
+            browser.TEARDOWN_SECONDS = 2
+            started = time.monotonic()
+            with browser.browser_runtime(None) as instance:
+                loop = instance._impl_obj._loop
+                loop._proactor._cache[0x7FFF0000] = (loop.create_future(), None, None, None)
+            print("closed", round(time.monotonic() - started))
+        """)
+        root = str(Path(__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))}
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, cwd=root, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertIn("did not shut down within 2 seconds", done.stderr)
+        self.assertLess(int(done.stdout.split()[-1]), 60)
 
     @unittest.skipUnless(importlib.util.find_spec("PIL"), "Pillow reads the photographs")
     def test_a_script_driven_transition_is_photographed_finished(self):

@@ -200,6 +200,17 @@ def capture(page, path, timeout, deadline):
     path.write_bytes(frame)  # The record names this file only after it exists.
 
 
+def shut(popups):
+    """Close popups, each on its own: one that will not close does not leave the others open. Page.close() takes no timeout, but it
+    goes through the browser, not the page, so a popup whose script never returns closes as promptly as any other."""
+    for popup in popups:
+        try:
+            if not popup.is_closed():
+                popup.close()
+        except Exception:
+            pass  # Already closed, or the browser is going away.
+
+
 def measure(page):
     try:
         return int(ask(page, OVERFLOW))
@@ -301,16 +312,13 @@ def run(page, out, *, limit, timeout, output, restore, events, mark, issue, writ
     def recover(gone, modal, since):
         """Return to the page the sweep started from. A reload would not replay the page's steps, so a stepped case stops instead."""
         nonlocal overflow, stop
-        for popup in popups[since["popups"]:]:
-            try:
-                popup.close()
-            except Exception:
-                pass
+        shut(popups[since["popups"]:])
         if not stepped:
             restore()
             overflow = base
         elif gone or modal:
             if not gone:
+                ask(page, ALIVE, timeout=2000)  # A key press takes no timeout: find out first that the page answers.
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(200)
             if gone or ask(page, OBSERVE)["modals"] > since["modals"]:
@@ -451,7 +459,7 @@ def run(page, out, *, limit, timeout, output, restore, events, mark, issue, writ
         mark({"action": "sweep"})
         # The route stays: the caller closes the context next, and unroute waits on the page, which hangs when the page is stuck.
         for cleanup in (lambda: page.remove_listener("popup", on_popup), lambda: page.remove_listener("dialog", on_dialog),
-                        lambda: [popup.close() for popup in popups if not popup.is_closed()]):
+                        lambda: shut(popups)):
             try:
                 cleanup()
             except Exception:

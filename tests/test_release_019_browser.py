@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
@@ -158,6 +159,68 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("Executable doesn't exist", errors[0])
         self.assertIn("chrome:", errors[0])
+
+
+class TeardownTests(unittest.TestCase):
+    """Closing the browser and stopping Playwright's driver take no timeout of their own, so the verifier supplies one."""
+
+    @staticmethod
+    def manager(*path, pid=4242, returncode=None):
+        process = SimpleNamespace(pid=pid, returncode=returncode)
+        for name in reversed(path):
+            process = SimpleNamespace(**{name: process})
+        return process
+
+    def test_the_driver_is_found_in_either_layout_and_only_while_it_runs(self):
+        for path in (("_client", "_transport", "_proc"), ("_connection", "_transport", "_proc")):
+            self.assertEqual(browser.driver_pid(self.manager(*path)), 4242, path)
+            self.assertIsNone(browser.driver_pid(self.manager(*path, returncode=0)), "an exited driver's id may be someone else's now")
+        for other in (None, SimpleNamespace(), self.manager("_client", "_other", "_proc"), FakeDriver()):
+            self.assertIsNone(browser.driver_pid(other))
+
+    def test_only_a_real_playwright_driver_has_a_manager_to_look_in(self):
+        class Manager:
+            def stop(self):
+                pass
+
+        owner = Manager()
+        self.assertIs(browser.driver_manager(SimpleNamespace(stop=owner.stop)), owner)
+        self.assertIsNone(browser.driver_manager(FakeDriver()))
+        self.assertIsNone(browser.driver_manager(None))
+
+    def test_a_teardown_that_finishes_in_time_is_left_alone(self):
+        calls = []
+        stack = SimpleNamespace(close=lambda: calls.append("closed"))
+        with patch.object(browser, "kill_tree", side_effect=AssertionError("nothing to kill")):
+            browser.close_bounded(stack, FakeDriver(), seconds=5)
+        self.assertEqual(calls, ["closed"])
+
+    def test_a_failure_of_the_teardown_is_still_reported_when_the_deadline_did_not_force_it(self):
+        def failing():
+            raise RuntimeError("driver exited with code 1")
+
+        with self.assertRaises(RuntimeError):
+            browser.close_bounded(SimpleNamespace(close=failing), FakeDriver(), seconds=5)
+
+    def test_a_teardown_past_its_deadline_is_forced_and_its_failure_is_not_the_verdict(self):
+        release, killed = threading.Event(), []
+        owner = SimpleNamespace(_client=SimpleNamespace(_transport=SimpleNamespace(_proc=SimpleNamespace(pid=4242, returncode=None))))
+        owner.stop = lambda: None
+        driver = SimpleNamespace(stop=SimpleNamespace(__self__=owner))
+
+        def stuck():
+            release.wait(30)  # Stands in for loop.close(): it ends when the watcher drops what asyncio waits for, or kills the driver.
+            raise RuntimeError("Playwright connection closed")
+
+        def kill(pid):
+            killed.append(pid)
+            release.set()
+
+        stderr = io.StringIO()
+        with patch.object(browser, "kill_tree", kill), patch("sys.stderr", stderr):
+            browser.close_bounded(SimpleNamespace(close=stuck), driver, seconds=0.2)
+        self.assertEqual(killed, [4242])
+        self.assertIn("did not shut down within 0.2 seconds", stderr.getvalue())
 
 
 class ConsoleContractTests(unittest.TestCase):

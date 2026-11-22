@@ -12,8 +12,9 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
 from time import monotonic
 from urllib.parse import quote, urlparse
 
@@ -365,14 +366,82 @@ def launch_browser(driver, channel, timeout, allow_fallback=True):
         raise RuntimeError(f"{error}\nInstalled browser fallbacks also failed: {'; '.join(failures)}") from error
 
 
+TEARDOWN_SECONDS = 30  # What closing the browser and stopping Playwright's driver may take before the verifier stops waiting for them.
+
+
+def driver_manager(driver):
+    """The context manager behind sync_playwright(): its stop() is the one the driver carries. None for anything else."""
+    return getattr(getattr(driver, "stop", None), "__self__", None)
+
+
+def driver_pid(manager):
+    """The process id of Playwright's driver while it is still running, looked up where its releases have kept the process
+    (1.64 and 1.65 differ). A driver that has exited is left alone: its id may belong to someone else by now."""
+    for path in (("_client", "_transport", "_proc"), ("_connection", "_transport", "_proc")):
+        found = manager
+        for name in path:
+            found = getattr(found, name, None)
+        if type(getattr(found, "pid", None)) is int and getattr(found, "returncode", 0) is None:
+            return found.pid
+    return None
+
+
+def kill_tree(pid):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=20)
+        else:
+            os.kill(pid, 9)
+    except Exception:
+        pass  # Already gone, or not ours to kill.
+
+
+def enforce(driver, done, seconds, forced):
+    """Watch the teardown from a thread that never calls Playwright: past the deadline it kills the driver (and the browser under
+    it), which fails any call still waiting for them, and drops the operations asyncio's Windows proactor still lists. Closing the
+    loop waits for every listed operation, and one whose completion was already consumed never reports again (a Playwright object
+    used from a second thread is enough to leave one behind), so without this the close has no end."""
+    if done.wait(seconds):
+        return
+    forced.append(seconds)
+    manager = driver_manager(driver)
+    pid = driver_pid(manager)
+    if pid is not None:
+        kill_tree(pid)
+    pending = getattr(getattr(getattr(manager, "_loop", None), "_proactor", None), "_cache", None)
+    for _ in range(30):
+        if done.wait(2):
+            return
+        if pending is not None:
+            pending.clear()
+
+
+def close_bounded(stack, driver, seconds=None):
+    """Unwind the runtime's ExitStack (close the browser, stop the driver) within `seconds`. Nothing in that sequence takes a
+    timeout of its own. Once the deadline has forced it, a failure of the unwinding is the shutdown's, not the verdict's."""
+    done, forced = Event(), []
+    Thread(target=enforce, args=(driver, done, TEARDOWN_SECONDS if seconds is None else seconds, forced), daemon=True).start()
+    try:
+        stack.close()
+    except Exception:
+        if not forced:
+            raise
+    finally:
+        done.set()
+    if forced:
+        print(f"Nightweaver: the browser did not shut down within {forced[0]} seconds and was stopped.", file=sys.stderr)
+
+
 @contextmanager
 def browser_runtime(channel, *, timeout=None, info=None, allow_fallback=True):
     """Start the verification browser. `info`, when given, receives the requested and used channel and any fallback."""
-    with ExitStack() as stack:
+    stack, started = ExitStack(), []
+    try:
         try:
             from playwright.sync_api import sync_playwright
 
             driver = stack.enter_context(sync_playwright())
+            started.append(driver)
             browser, used, fallback = launch_browser(driver, channel, timeout, allow_fallback)
             stack.callback(browser.close)
         except Exception as error:
@@ -382,6 +451,8 @@ def browser_runtime(channel, *, timeout=None, info=None, allow_fallback=True):
         if info is not None:
             info.update(requested=channel or "bundled", used=used, fallback=fallback)
         yield browser
+    finally:
+        close_bounded(stack, started[0] if started else None)
 
 
 def warm_up(browser):
