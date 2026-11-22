@@ -13,6 +13,7 @@ from nightweaver.benchmark import create_suite, paired_outcomes
 from nightweaver.browser import run_browser, validate_browser, visual_match
 from nightweaver.diagnostics import database_backup, database_check, preflight, replay_browser
 from nightweaver.engine import create_run, git
+from nightweaver.readiness import browser_readiness
 from nightweaver.reports import metrics, recovery_metrics
 from nightweaver.spec import validate
 from nightweaver.store import Store
@@ -236,6 +237,9 @@ class BrowserContracts(unittest.TestCase):
                       {"action": "aria", "locator": {"role": "main"}, "value": '- heading "Archive" [level=1]'},
                       {"action": "text", "selector": "#env", "value": "360/2/true/true/true"},
                       {"action": "visual_match", "locator": {"test_id": "chip"}, "value": contract}]}
+            state = browser_readiness()
+            if state["status"] == "ready_fallback":
+                config["channel"] = state["channel"]  # A visual gate never falls back on its own, so name the installed browser.
             result = run_browser(config, root, root / "pass")["viewports"][0]
             self.assertTrue(result["passed"], result["errors"])
             self.assertEqual(result["visual_matches"][0]["changed_pixels"], 0)

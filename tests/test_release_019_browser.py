@@ -166,11 +166,12 @@ class ConsoleContractTests(unittest.TestCase):
 
     def test_only_a_failed_favicon_fetch_is_exempt_from_the_console_contract(self):
         failed = "Failed to load resource: the server responded with a status of 404 (File not found)"
-        self.assertTrue(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/favicon.ico")))
-        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/app.js")))
-        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/img/favicon.ico.map")))
-        self.assertFalse(browser.favicon_failure(self.message("TypeError: favicon.ico", "http://127.0.0.1:8080/favicon.ico")))
-        self.assertFalse(browser.favicon_failure(SimpleNamespace(text=failed)))
+        page = "http://127.0.0.1:8080/index.html"
+        self.assertTrue(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/favicon.ico"), page))
+        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/app.js"), page))
+        self.assertFalse(browser.favicon_failure(self.message(failed, "http://127.0.0.1:8080/img/favicon.ico.map"), page))
+        self.assertFalse(browser.favicon_failure(self.message("TypeError: favicon.ico", "http://127.0.0.1:8080/favicon.ico"), page))
+        self.assertFalse(browser.favicon_failure(SimpleNamespace(text=failed), page))
 
 
 class DoctorBrowserTests(unittest.TestCase):
@@ -285,9 +286,9 @@ class SmokeDiscoveryTests(unittest.TestCase):
         self.root = Path(folder.name)
         self.count = 0
 
-    def discover(self, files, objective="Build the page"):
+    def discover(self, files, objective="Build the page", **kwargs):
         self.count += 1
-        return discovery.discover(repository(self.root / f"repo{self.count}", files), objective, {"kind": "codex"})
+        return discovery.discover(repository(self.root / f"repo{self.count}", files), objective, {"kind": "codex"}, **kwargs)
 
     def test_root_index_without_tests_gets_a_smoke_gate_with_unchanged_budgets(self):
         plan = self.discover({"index.html": PAGE, "style.css": "body{}", "README.md": "# Site"})
@@ -304,14 +305,15 @@ class SmokeDiscoveryTests(unittest.TestCase):
 
     def test_public_and_docs_pages_are_accepted_in_priority_order(self):
         self.assertEqual(self.discover({"public/index.html": PAGE, "docs/index.html": PAGE})["gates"][0]["browser"],
-                         {"page": "public/index.html", "sweep": {}})
-        self.assertEqual(self.discover({"docs/index.html": PAGE})["gates"][0]["browser"], {"page": "docs/index.html", "sweep": {}})
+                         {"page": "public/index.html", "root": "public", "sweep": {}})
+        self.assertEqual(self.discover({"docs/index.html": PAGE})["gates"][0]["browser"],
+                         {"page": "docs/index.html", "root": "docs", "sweep": {}})
         self.assertEqual(self.discover({"index.html": PAGE, "public/index.html": PAGE})["gates"][0]["browser"],
                          {"page": "index.html", "sweep": {}})
 
     def test_a_new_repository_targets_the_page_the_worker_will_create(self):
         for files in ({"README.md": "# New", "LICENSE": "MIT", ".gitignore": "node_modules/\n"}, {".gitkeep": ""}, {}):
-            plan = self.discover(files, "Create a landing page for a bakery")
+            plan = self.discover(files, "Create a landing page for a bakery", web=True)
             self.assertEqual(plan["gates"], [SMOKE], files)
             self.assertIn("index.html exists", plan["acceptance"][0])
 
@@ -384,7 +386,7 @@ class SmokeGateRunTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         root = Path(folder.name)
         repo = repository(root / "repo", files)
-        plan = discovery.discover(repo, "Build the page", {"kind": "codex"})
+        plan = discovery.discover(repo, "Build the page", {"kind": "codex"}, web=True)
         gate = gate_spec(plan["gates"][0])
         return run_gate(gate, repo, evidence_folder(root / "evidence", 1), git(repo, "rev-parse", "HEAD^{tree}"))
 
