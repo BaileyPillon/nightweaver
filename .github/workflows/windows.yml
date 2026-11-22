@@ -29,8 +29,19 @@ jobs:
           $failed = @()
           for ($i = 0; $i -lt $modules.Count; $i++) {
             if ($i % 4 -ne ${{ matrix.shard }}) { continue }
-            python -m unittest discover -s tests -p $modules[$i] -v
-            if ($LASTEXITCODE) { $failed += $modules[$i] }
+            $module = $modules[$i]
+            # Each module is its own process with its own 20 minutes. A module that stops answering is killed with everything it started
+            # (its browser included) and recorded as failed, instead of holding the shard until the job's 60 minutes cancel it. After 19
+            # minutes the runner writes every thread's stack to the log, so the hang names the call it is stuck in.
+            $process = Start-Process python -ArgumentList @('tests/_module_runner.py', $module, '1140') -NoNewWindow -PassThru
+            $null = $process.Handle  # Without this the exit code is empty after a WaitForExit with a timeout.
+            if (-not $process.WaitForExit(1200000)) {
+              taskkill /F /T /PID $process.Id | Out-Null
+              "::error title=Timed out::$module did not finish within 20 minutes and was killed"
+              $failed += "$module (timed out)"
+            } elseif ($process.ExitCode) {
+              $failed += $module
+            }
           }
           if ($failed) { "Failed modules: $($failed -join ', ')"; exit 1 }
 
