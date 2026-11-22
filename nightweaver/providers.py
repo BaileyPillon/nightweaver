@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 
 from .process import CONTROLLER_EXITS, execute
 from .store import default_home
-from .safety import CREDENTIALS, json_events, redact, scrub_env
+from .safety import json_events, own_credentials, redact, scrub_env
 
 
 READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking")
@@ -154,11 +154,6 @@ def reset_after(message, now=None):
 
 
 OAUTH_VARIABLE = "CLAUDE_CODE_OAUTH_TOKEN"
-
-
-def own_credentials(kind):
-    """The credential variables a route of this kind may keep, with their *_FILE pointers. Every other vendor's is scrubbed."""
-    return tuple(name + suffix for name in CREDENTIALS.get(kind, ()) for suffix in ("", "_FILE"))
 
 
 def user_environment(name):
@@ -342,12 +337,24 @@ def configure_deepseek_key(path):
     return {"provider": "deepseek", "configured": True, "api_key_file": str(path)}
 
 
+def renewal(config):
+    """What to do about an expired Claude login, for the route that hit it. A route with its own profile_dir never reads the
+    token variable, so the advice for it is that profile's login or a token file."""
+    if config.get("oauth_token_file"):
+        return f"Run claude setup-token and write the new token to this route's oauth_token_file ({config['oauth_token_file']})."
+    if config.get("profile_dir"):
+        return (f"This route uses the profile {config['profile_dir']}, which ignores {OAUTH_VARIABLE}: sign in again with claude "
+                "(CLAUDE_CONFIG_DIR set to that directory), or run claude setup-token and point this route's oauth_token_file at a file holding it.")
+    return (f"Run claude setup-token, set the user environment variable {OAUTH_VARIABLE} to the token (or point this route's "
+            "oauth_token_file at a file holding it).")
+
+
 def adapter(config, mode, session=None, images=()):
     kind = config["kind"]
     if kind == "command":
         # Operator-approved programs get no credential unless the route says inherit_credentials.
         return config["argv"], dict(os.environ) if config.get("inherit_credentials") else scrub_env(os.environ)
-    env = scrub_env(os.environ, own_credentials(kind))
+    env = scrub_env(os.environ, own_credentials(kind, os.environ))
     exe = provider_executable(config)
     model = config.get("model")
     if kind == "claude":
@@ -656,8 +663,9 @@ def texts(value):
 def failure_parts(event):
     """The words in one stream event that a provider uses to report how a call ended or failed, or nothing for ordinary events."""
     label = event.get("type")
-    if label == "result":  # the call's verdict; this is only read for a call that failed
-        return [*texts(event.get("result")), *texts(event.get("errors")), *texts(event.get("error"))]
+    if label == "result":  # the call's verdict; only a result that says it failed is the provider's error, otherwise it is the worker's answer
+        failed = event.get("is_error") is True or event.get("status") == "error"
+        return [*(texts(event.get("result")) if failed else ()), *texts(event.get("errors")), *texts(event.get("error"))]
     if label in ("error", "turn.failed", "thread.error"):
         return [*texts(event.get("message")), *texts(event.get("error"))]
     if label == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict) and event["rate_limit_info"].get("status") == "rejected":
@@ -749,9 +757,8 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
             raise ProviderUnavailable("DeepSeek reported an API credential or balance error. "
                                       "Check the configured key and API account, then resume with --retry.", "credentials_or_balance")
         if config["kind"] == "claude" and re.search(r"reached its time limit|cannot be renewed|setup-token", detail, re.I):
-            raise ProviderUnavailable("The Claude login on this machine expired and cannot be renewed. Run claude setup-token, "
-                                      f"set the user environment variable {OAUTH_VARIABLE} to the token (or point this route's "
-                                      "oauth_token_file at a file holding it), then resume this run with --retry.", "authentication")
+            raise ProviderUnavailable(f"The Claude login on this machine expired and cannot be renewed. {renewal(config)} "
+                                      "Then resume this run with --retry.", "authentication")
         if re.search(r"authentication_failed|failed to authenticate|not logged in|please (?:log|sign) in|refresh token.*expired|token.*(expired|revoked)", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} authentication needs renewal for the selected profile. "
                                       "Sign in with that CLI, then resume this run with --retry.", "authentication")

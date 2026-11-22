@@ -122,8 +122,12 @@ def main():
             model = args.claude_model if host == "claude" else args.codex_model
             if model:
                 argv.extend(["--model", model])
-            suite["contenders"].append({"name": f"AGTX OneShot ({host} coordinator, Codex workers)", "mode": "external",
-                                        "worker": {"kind": "command", "argv": argv, "unavailable_exit_code": 78}})
+            route = {"kind": "command", "argv": argv, "unavailable_exit_code": 78}
+            if host == "claude" and not args.claude_profile:
+                # Command routes get no credentials. The Claude coordinator signs in with CLAUDE_CODE_OAUTH_TOKEN unless a profile
+                # chose its own login, and agtx_contender.py passes on only Anthropic's.
+                route["inherit_credentials"] = True
+            suite["contenders"].append({"name": f"AGTX OneShot ({host} coordinator, Codex workers)", "mode": "external", "worker": route})
     for name, value in (("plan.json", plan), ("suite.json", suite)):
         (folder / name).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     print(folder / "suite.json")

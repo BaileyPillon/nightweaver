@@ -139,7 +139,7 @@ class DeepSeekTest(unittest.TestCase):
 
     def test_api_error_blocks_with_recovery_message(self):
         log = self.root / "worker.jsonl"
-        log.write_text('{"type":"result","result":"Authentication Fails (invalid API key)"}\n', encoding="utf-8")
+        log.write_text('{"type":"result","is_error":true,"result":"Authentication Fails (invalid API key)"}\n', encoding="utf-8")
         with patch("nightweaver.providers.execute", return_value=1):
             with self.assertRaisesRegex(ProviderUnavailable, "credential or balance"):
                 invoke({"kind": "deepseek", "api_key_file": str(self.key_file), "executable": sys.executable}, "worker",
