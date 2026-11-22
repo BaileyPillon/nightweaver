@@ -280,7 +280,7 @@ class WishTests(unittest.TestCase):
         self.assertEqual(template["milestones"], [{"title": "Deliver the goal", "task": OBJECTIVE}])
         self.assertEqual(template["expected_base"], git(self.repo, "rev-parse", "HEAD"))
         self.assertEqual(saved["conflicts"], brief()["conflicts"])
-        self.assertEqual(saved["notes"], [])
+        self.assertEqual([note[:32] for note in saved["notes"]], ["Visual goal, but no committed in"], "only the screenshots note, none about Ollama")
         self.assertIn("ollama qwen3.8:27b", out)
         # The saved template is a plan the rest of Nightweaver accepts, and it holds no credential fields.
         folder = self.wishes()[0]
@@ -343,7 +343,7 @@ class WishTests(unittest.TestCase):
         out, _ = self.cli("wish", self.repo, "Calm the page", "--preview")
         saved, template, _ = self.saved()
         self.assertNotIn("advisory_ollama", template)
-        self.assertEqual(len(saved["notes"]), 1)
+        self.assertEqual(len(saved["notes"]), 2, "the Ollama note, then the screenshots note for a visual brief on a repository without a page")
         self.assertIn("no Ollama answered", saved["notes"][0])
         self.assertIn("Note: advisory_ollama left out", out)
         with Ollama(models=("llama3:8b",)) as ollama, patch.object(wishing, "OLLAMA_TAGS_URL", ollama.url):
@@ -472,7 +472,7 @@ class WishTests(unittest.TestCase):
         self.assertEqual((args.planner, args.model, args.effort, args.start, args.enqueue, args.profile_dir),
                          ("deepseek", "deepseek-v4-pro", "max", True, False, None))
         run_id = re.search(r"^Run id: (\S+)$", out, re.M).group(1)
-        self.assertEqual(json.loads(out[out.index("{"):])["runner_pid"], 4242)
+        self.assertEqual(json.loads(out[re.search(r"^\{", out, re.M).start():])["runner_pid"], 4242)
         spawn.assert_called_once()
         self.assertEqual(spawn.call_args.args[1:], (run_id, False))
         spec = self.store.get(run_id)["spec"]

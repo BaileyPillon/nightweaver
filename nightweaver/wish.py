@@ -15,7 +15,7 @@ from uuid import uuid4
 from .engine import git, git_bytes
 from .providers import ProviderUnavailable, invoke
 from .safety import atomic_write, redact, write_json
-from .spec import provider, validate
+from .spec import provider, strict_json, validate
 from .store import timestamp
 from .verdicts import conflict_notes, extract_object
 
@@ -36,6 +36,13 @@ LIMITS = {"max_calls": 80, "max_seconds": 21600}
 # Tests only: replaces the named route wholesale (brief, worker, reviewer, judge, planner), for example with a scripted
 # `command` provider. Empty in production and never read from the environment or a flag.
 ROUTE_OVERRIDES = {}
+# A visual brief on a repository whose discovered checks have no browser gate gets one on the first of these tracked at HEAD, served from its folder.
+ENTRY_PAGES = ("index.html", "public/index.html", "docs/index.html", "dist/index.html", "build/index.html", "site/index.html", "www/index.html")
+VISUAL_GATE = "Visual smoke"
+VISUAL_LOADS = "{page} loads over HTTP without console or page errors and has no horizontal overflow at 1440x900 (desktop) and 390x844 (phone)."
+# One requirement that names both viewports and a clean load already says it.
+LOADS_IMPLIED = tuple(re.compile(pattern, re.I) for pattern in (r"1440|desktop", r"390|phone|mobile",
+                                                                r"console|page errors?|overflow|horizontal scroll|loads? (?:cleanly|without)"))
 
 
 def roster(name):
@@ -183,6 +190,53 @@ def ollama_advisory():
             "max_tokens": 4096}, None
 
 
+def entry_page(plan):
+    """(page, None) for the first of ENTRY_PAGES tracked at the discovered baseline, else (None, why not). A package.json script that
+    serves the project means a bare file server cannot render its pages, so that is no page either."""
+    from .discovery import served_by_script
+    root, base = plan["repository"], plan["expected_base"]
+    tracked = {}
+    for entry in git_bytes(root, "ls-tree", "-z", base, "--", "package.json", *ENTRY_PAGES).rstrip(b"\0").split(b"\0"):
+        if entry:
+            meta, name = entry.split(b"\t", 1)
+            mode, kind, oid = meta.decode("ascii").split()
+            if kind == "blob" and mode in ("100644", "100755"):
+                tracked[name.decode("utf-8", "replace")] = oid
+    scripts = {}
+    if "package.json" in tracked:
+        try:
+            package = strict_json(git_bytes(root, "cat-file", "blob", tracked["package.json"]).decode("utf-8-sig"))
+            scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+        except ValueError:
+            pass
+    if served_by_script(scripts):
+        return None, "a package.json script (dev, start, preview or serve) serves this project and a bare file server cannot render its pages"
+    page = next((name for name in ENTRY_PAGES if name in tracked), None)
+    return (page, None) if page else (None, "no committed index.html, public/, docs/, dist/, build/, site/ or www/ entry page was found")
+
+
+def with_visual_gate(plan, brief, notes):
+    """(plan, gate added or None). Only a browser gate gives the judge and the milestone reviewer screenshots, so a visual brief on a repository
+    whose discovered checks have none gets a "Visual smoke" gate on its entry page beside them, never instead of them."""
+    if not brief["visual"] or any(gate.get("kind") == "browser" for gate in plan["gates"]):
+        return plan, None
+    from .discovery import smoke_gate
+    page, why = entry_page(plan)
+    if page is None:
+        notes.append(f"Visual goal, but {why}, so no browser gate was added: the judge and the milestone reviewer will have no screenshots. "
+                     'Use a Nightweaver template with a browser check that owns the server, for example '
+                     '{"name": "Visual smoke", "kind": "browser", "browser": {"server": {"argv": ["<executable>", "<server script>", "{port}"]}, "sweep": {}}}.')
+        return plan, None
+    gate = {**smoke_gate(page), "name": VISUAL_GATE}
+    acceptance = list(plan.get("acceptance", []))
+    if not any(all(pattern.search(item) for pattern in LOADS_IMPLIED) for item in brief["acceptance"] + acceptance):
+        acceptance.append(VISUAL_LOADS.format(page=page))
+    root = gate["browser"].get("root")
+    notes.append(f"The discovered checks have no browser gate, so {VISUAL_GATE} was added beside them: {page} at desktop and phone sizes, "
+                 f"served with {root + '/' if root else 'the repository root'} as the web root, so the judge and the milestone reviewer get screenshots.")
+    return {**plan, "gates": [*plan["gates"], gate], "acceptance": acceptance}, gate
+
+
 def assemble(plan, brief, routes, args, advisory=None, project=None):
     """The discovered plan with the brief, the roster and the pursuit settings; exactly what `goal` accepts as a template."""
     template = deepcopy(plan)
@@ -260,7 +314,9 @@ def summary(wish_id, brief, template, notes, folder, args, writer, log, attempts
     lines += ["", "Visual goal: " + ("yes" if brief["visual"] else "no")]
     if brief["conflicts"]:
         lines += ["Conflicts resolved:", *(textwrap.fill(item, 96, initial_indent="  - ", subsequent_indent="    ") for item in brief["conflicts"])]
-    lines += ["", "Checks: " + "; ".join(describe_gate(g) for g in template["gates"]), f"Roster ({args.roster}):",
+    found, added = ([g for g in template["gates"] if (g["name"] == VISUAL_GATE) == flag] for flag in (False, True))
+    lines += ["", "Checks: " + "; ".join(describe_gate(g) for g in found) + "".join(f" + {describe_gate(g)}" for g in added),
+              f"Roster ({args.roster}):",
               f"  worker    {route_text(template['worker'])}", f"  reviewer  {route_text(template.get('reviewer'))}",
               f"  judge     {route_text(pursue['judge'])}", f"  planner   {route_text(pursue['planner'])}"]
     advisory = template.get("advisory_ollama")
@@ -325,6 +381,14 @@ def run_wish(store, args):
             raise
     advisory, note = ollama_advisory() if args.roster == "default" else (None, None)
     notes = [note] if note else []
+    plan, visual_gate = with_visual_gate(plan, brief, notes)
+    if visual_gate and args.start:
+        try:
+            verify_tools([visual_gate])
+        except ValueError as error:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise ValueError(f"{error} The brief judged the goal visual, so the run needs a screenshot gate. "
+                             "The brief writer ran once; nothing was saved or registered.") from error
     template = assemble(plan, brief, routes, args, advisory, project)
     if brief["visual"]:
         with_explore(template, store)
