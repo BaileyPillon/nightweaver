@@ -124,7 +124,12 @@ def browser_notes(folder):
         for position, view in enumerate(report.get("viewports", [])):
             if isinstance(view, dict) and isinstance(view.get("screenshot"), str) and isinstance(view.get("viewport"), str):
                 scenario = f"scenario {view['scenario']}, " if isinstance(view.get("scenario"), str) else ""
-                notes[view["screenshot"]] = (0, position, f"the page as first loaded, {scenario}{view['viewport']} viewport")
+                steps = view.get("completed_steps")
+                # The image is taken after the case's steps, or where it failed, so say which rather than "as first loaded".
+                state = ("the page at the point of failure" if view.get("passed") is False else
+                         f"the page after its {steps} step{'s' if steps != 1 else ''}" if type(steps) is int and steps > 0 else
+                         "the page as first loaded")
+                notes[view["screenshot"]] = (0, position, f"{state}, {scenario}{view['viewport']} viewport")
         for item in report.get("sweep", []):
             if isinstance(item, dict) and isinstance(item.get("screenshot"), str) and type(item.get("index")) is int:
                 label = f"after clicking '{clean_name(item.get('name', ''))}'"
@@ -136,6 +141,34 @@ def browser_notes(folder):
         return notes
     except (OSError, ValueError, TypeError, AttributeError):
         return {}
+
+
+def sweep_coverage(folder):
+    """One line on what a browser gate's interaction sweep exercised and left alone, so a partial sweep never reads as a full one."""
+    try:
+        report = json.loads((folder / "browser.json").read_text(encoding="utf-8"))
+        records, found = report["sweep"], report["sweep_found"]
+        if not isinstance(records, list) or type(found) is not int:
+            return None
+
+        def names(items, detail=None, count=6):
+            shown = [clean_name(i.get("name", ""))[:40] + (f" ({clean_name(i.get(detail, ''))[:40]})" if detail else "")
+                     for i in items[:count] if isinstance(i, dict)]
+            return ", ".join(shown) + (f" and {len(items) - count} more" if len(items) > count else "")
+
+        records = [r for r in records if isinstance(r, dict)]
+        parts = [f"clicked {sum(isinstance(r.get('screenshot'), str) for r in records)} of {found} control{'s' if found != 1 else ''} found"]
+        refused = [s for s in report.get("sweep_skipped", []) if isinstance(s, dict)]
+        waiting = [{"name": n} for n in report.get("sweep_unvisited", []) if isinstance(n, str)]
+        for label, items, detail in (("could not click", [r for r in records if isinstance(r.get("skipped"), str)], "skipped"),
+                                     ("left alone on purpose", refused, "reason"), ("never reached", waiting, None)):
+            if items:
+                parts.append(f"{label}: {names(items, detail)}")
+        if isinstance(report.get("sweep_truncated"), str):
+            parts.append("stopped early (" + clean_name(report["sweep_truncated"])[:60] + ")")
+        return "Interaction sweep coverage: " + "; ".join(parts) + "."
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def screenshots(folder, limit=12):
@@ -178,7 +211,11 @@ def image_block(images):
         note = notes[image.parent].get(image.name)
         swept = swept or bool(note and note[0] == 1)
         lines.append(f"- {image}" + (f" ({note[2]})" if note else ""))
-    return "\n".join(lines) + (("\n" + SWEEP_NOTE) if swept else "")
+    # Every swept gate gets its coverage line, even one that found nothing to click (no swept image says so by itself).
+    coverage = [(sweep_coverage(folder), folder) for folder in notes]
+    coverage = [(line, folder) for line, folder in coverage if line]
+    tail = [line + (f" ({folder.parent.name}/{folder.name})" if len(coverage) > 1 else "") for line, folder in coverage]
+    return "\n".join(lines) + (("\n" + SWEEP_NOTE) if swept else "") + "".join("\n" + line for line in tail)
 
 
 def reachable(run, state):

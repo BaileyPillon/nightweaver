@@ -512,21 +512,25 @@ def run_case(
                 result["screenshot"] = file
             except Exception as error:
                 issue("screenshot", f"Screenshot unavailable: {error}")
-            if sweep is not None and result["passed"] and not error_counts:
-                # Only a page that loaded cleanly is exercised; the network budget below counts the load, not the clicking.
-                base_traffic, stage = traffic.summary(), {"action": "sweep"}
-                try:
-                    interaction.run(page, sweep, limit=config["sweep"]["max_controls"], timeout=config["timeout_ms"], output=output,
-                                    restore=lambda: navigate(page), events=events, mark=mark, issue=issue)
-                except Exception as error:
-                    issue("sweep", f"Interaction sweep failed: {interaction.brief(error)}")
             stage = {"action": "trace"}
             try:
+                # The trace records the load and the steps. The sweep's pictures are its evidence; tracing them too makes
+                # an animated page's trace.zip outgrow the artifact limit.
                 file = f"{case}.trace.zip"
                 context.tracing.stop(path=str(output / file))
                 result["trace"] = file
             except Exception as error:
                 issue("trace", f"Trace unavailable: {error}")
+            if sweep is not None and result["passed"] and not error_counts:
+                # Only a page that loaded cleanly is exercised; the network budget below counts the load, not the clicking.
+                base_traffic, stage = traffic.summary(), {"action": "sweep"}
+                try:
+                    interaction.run(page, sweep, limit=config["sweep"]["max_controls"], timeout=config["timeout_ms"], output=output,
+                                    restore=lambda: navigate(page), events=events, mark=mark, issue=issue,
+                                    writes=config["sweep"].get("allow_writes", False), stepped=bool(steps),
+                                    overflow=result.get("overflow_px", 0))
+                except Exception as error:
+                    issue("sweep", f"Interaction sweep failed: {interaction.brief(error)}")
     finally:
         context.close()
     result["network_summary"] = base_traffic or traffic.summary()
@@ -578,7 +582,7 @@ def _verify_browser(config, root, output):
     results = []
     channel = {}
     sweep_viewport = next((v["name"] for v in config["viewports"] if v["name"] == "desktop"), config["viewports"][0]["name"])
-    sweep_out, swept = ({"sweep": [], "sweep_found": 0, "sweep_skipped": []} if "sweep" in config else None), False
+    sweep_out, swept = ({"sweep": [], "sweep_found": 0, "sweep_skipped": [], "sweep_unvisited": []} if "sweep" in config else None), False
     with browser_runtime(config.get("channel"), info=channel) as browser:
         runtime = {
             "chromium": browser.version,
