@@ -11,10 +11,10 @@ from .checks import contract_hash, observed_pass, run_gate
 from .engine import common_dir, git, tail, verify_registered_repository
 from .insights import failure_excerpt
 from .process import PausedRun
-from .providers import json_response
 from .repair import describe
 from .safety import redact, write_json
 from .spec import IMAGE_SUFFIXES, fields, text
+from .verdicts import conflict_notes, extract_object, extract_verdict
 
 MAX_MILESTONES = 50
 
@@ -184,9 +184,7 @@ def judge_prompt(run, state, results, images, references):
 
 
 def parse_judgment(answer):
-    data = json_response(answer)
-    if data.get("verdict") not in ("MET", "NOT_MET"):
-        raise ValueError("verdict must be MET or NOT_MET")
+    data = extract_verdict(answer, ("MET", "NOT_MET"))
     score = data.get("score")
     if type(score) is not int or not 0 <= score <= 100:
         raise ValueError("score must be an integer between 0 and 100")
@@ -264,6 +262,7 @@ def judge(run, state):
             raise ValueError(f"The reference image is missing: {reference}")
     log = folder / f"judge-{state.get('provider_calls', 0) + 1:04d}.jsonl"
     config = run.route(state, None, "judge")
+    run.independence(state, "judge", config, run.route(state, run.spec["milestones"][-1], "worker"))
     run.set("judge_started", {"adapter": config["kind"], "wave": wave, "commit": commit}, log=str(log), retry_at=None)
     code, _, answer = run.call_provider(config, "judge", path, log, judge_prompt(run, state, results, images, references),
                                         evidence=folder, images=[*images, *references])
@@ -317,8 +316,12 @@ def judge(run, state):
 
 
 def parse_plan(answer, room):
-    data = json_response(answer)
-    fields(data, "milestones", "planner response")
+    return parse_wave(answer, room)[0]
+
+
+def parse_wave(answer, room):
+    data = extract_object(answer, "milestones")
+    fields(data, "milestones conflicts", "planner response")
     items = data.get("milestones")
     if not isinstance(items, list) or not 1 <= len(items) <= room:
         raise ValueError(f"The plan must contain 1 to {room} milestones")
@@ -329,7 +332,7 @@ def parse_plan(answer, room):
         if len(title) > 200 or len(task) > 12000:
             raise ValueError("A planned milestone title or task is too long")
         planned.append({"title": title, "task": task})
-    return planned
+    return planned, conflict_notes(data.get("conflicts"))
 
 
 def plan_prompt(run, state, room):
@@ -357,7 +360,9 @@ def plan_prompt(run, state, room):
         context.brief(run.store, run.id),
         f"Plan the next 1..{room} milestones that close the most important gaps first. Each must make a useful tracked change and pass these checks. "
         'Do not plan work that is already done. Return only JSON {"milestones":[{"title":"...","task":"..."}]}. '
-        "Give each a short title and a detailed, self-contained task with a testable accepted result."])
+        "Give each a short title and a detailed, self-contained task with a testable accepted result. "
+        'If any requirements contradict each other or cannot be satisfied as stated, list them as an additional "conflicts":["..."] '
+        "array next to milestones; otherwise omit it."])
 
 
 def plan_wave(run, state):
@@ -380,7 +385,7 @@ def plan_wave(run, state):
     try:
         if code:
             raise ValueError(f"The planner exited {code}: {(answer or tail(log))[:300]}")
-        planned = parse_plan(answer, room)
+        planned, conflicts = parse_wave(answer, room)
     except ValueError as error:
         invalid(run, state, "plan", error, log, code)
         return
@@ -388,11 +393,12 @@ def plan_wave(run, state):
     steps = [{**item, "gates": last["gates"], "paths": last["paths"], "worker": last["worker"],
               "worker_fallbacks": last["worker_fallbacks"]} for item in planned]
     drop_worktree(run, state)
-    run.store.extend_plan(run.id, steps, {"wave": wave + 1, "titles": [s["title"] for s in steps], "planner": describe(config)},
+    run.store.extend_plan(run.id, steps, {"wave": wave + 1, "titles": [s["title"] for s in steps], "planner": describe(config),
+                                          **({"conflicts": conflicts} if conflicts else {})},
                           phase="ready", wave=wave + 1, attempt=0, attempts_used=0, worker_session=None, worker_route=0,
                           reviewer_route=0, last_error="", candidate=None, candidate_tree=None, retry_at=None, log=None,
                           plan_attempts=0, planner_route=0, failure_count=0, failure_fingerprint=None, route_rejections=0,
-                          transient_failures=0, verification_batch=None)
+                          transient_failures=0, verification_batch=None, pursuit_conflicts=conflicts)
     run.spec = run.store.get(run.id)["spec"]
 
 
