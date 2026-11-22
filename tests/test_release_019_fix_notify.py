@@ -1,8 +1,10 @@
 """Nightweaver 0.19 review fixes for notifications: terminal blocks reach the phone, the quiet-hours allowance and the digest hold
 lose nothing, the state file survives several processes, and the question inbox no longer trusts the two clocks to agree."""
 
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,7 @@ import test_windows as fixtures
 from test_release_019_notify import Base, NIGHT, NOON, at
 
 from nightweaver import notify
-from nightweaver.cli import dispatch
+from nightweaver.cli import dispatch, main
 from nightweaver.engine import Run
 from nightweaver.recovery import supervise
 from nightweaver.store import timestamp
@@ -176,10 +178,14 @@ class BlockedCause(Base):
         self.enable()
         line = self.blocked(issue="git failed: fatal: unable to access 'C:/Users/Bailey/repo/.git/index.lock': denied, then "
                                   "/home/bailey/.ssh/id_rsa and src\\app\\main.py with a3f9c2e1b4d5a6f7a3f9c2e1b4d5a6f7 left over")
-        for leak in ("Bailey", "bailey", "index.lock", "id_rsa", "main.py", "a3f9c2e1"):
+        self.assertEqual(line, "Blocked: a git command failed.", "git's own text is replaced by a fixed phrase")
+        notify.forget()
+        self.ntfy.requests.clear()
+        line = self.blocked(issue="could not read C:/Users/Bailey/repo/notes.txt then /home/bailey/.ssh/id_rsa and src\\app\\main.py "
+                                  "with a3f9c2e1b4d5a6f7a3f9c2e1b4d5a6f7 left over")
+        for leak in ("Bailey", "bailey", "notes.txt", "id_rsa", "main.py", "a3f9c2e1"):
             self.assertNotIn(leak, line)
-        self.assertTrue(line.startswith("Blocked: git failed: fatal: unable to access <path>"), line)
-        self.assertLessEqual(len(line), 160)
+        self.assertEqual(line, "Blocked: could not read <path>.")
 
     def test_log_fragments_give_a_fixed_phrase_and_a_long_cause_is_cut(self):
         self.enable()
@@ -328,6 +334,7 @@ class QuietHours(Base):
         posts = [r["body"].decode() for r in self.ntfy.of("POST")]
         self.assertEqual(len(posts), 2)
         self.assertIn("Missed", posts[1])
+        self.assertNotIn("not delivered", posts[1], "the message that delivers it must not say it was not delivered")
         self.assertEqual(json.loads(self.cli("status")[0])["held_for_digest"], 0)
 
     def test_a_failed_release_keeps_everything_held(self):
@@ -495,6 +502,281 @@ class QuestionInbox(Base):
         self.assertEqual(notify.poll_answer(self.store, run, "pick", asked["asked_at"], options=["Maybe"]), "Maybe")
         server.replies = server.replies[:2]
         self.assertIsNone(notify.poll_answer(self.store, run, "pick", asked))
+
+
+def held_entries(count, event="blocked", title="Backlog"):
+    return [{"id": f"{number:012d}", "time": timestamp(), "run_id": "0" * 12, "title": title, "event": event,
+             "summary": f"Blocked: reason {number:02d} " + "w" * 180} for number in range(count)]
+
+
+@unittest.skipUnless(os.name == "nt", "Windows controller")
+class MorningRelease(Base):
+    """What quiet hours held is sent as soon as they end, by whatever is alive then, not only by the next notifying event."""
+
+    def spend_the_night(self):
+        self.enable(max_per_night=1, quiet_hours="23:00-07:00")
+        run = self.run_row(title="Night run")
+        with at(NIGHT):
+            run.set("blocked", {"cause": "First stop"})
+            run.set("goal_met", {"wave": 3, "score": 97})
+            run.set("provider_parked", {"provider": "codex", "role": "worker"})
+            notify.flush()
+        self.assertEqual(len(self.ntfy.of("POST")), 1)
+        self.assertEqual(notify.status(self.store)["held_for_digest"], 2)
+        return run
+
+    def morning(self, earlier=1):
+        posts = [r["body"].decode() for r in self.ntfy.of("POST")][earlier:]
+        self.assertEqual(len(posts), 1, posts)
+        self.assertIn("Night run: Goal met in wave 3 with judge score 97/100.", posts[0])
+        self.assertNotIn("usage limit", posts[0], "parks wait for the digest")
+        self.assertNotIn("not delivered", posts[0])
+        self.assertEqual([item["event"] for item in notify._state(self.store)["held"]], ["provider_parked"])
+
+    def test_release_due_sends_the_held_messages_once_quiet_hours_end_with_no_new_event(self):
+        self.spend_the_night()
+        with at(MORNING):
+            self.assertTrue(notify.release_due(self.store))
+            notify.flush()
+        self.morning()
+
+    def test_the_dispatcher_loop_sends_them(self):
+        self.spend_the_night()
+        with at(MORNING):
+            self.assertEqual(dispatch(self.store, False), [])
+            notify.flush()
+        self.morning()
+
+    def test_any_transition_of_a_run_after_quiet_hours_sends_them(self):
+        run = self.spend_the_night()
+        with at(MORNING):
+            run.set("wave_completed", {"wave": 1})  # not an event that notifies
+            notify.flush()
+        self.morning()
+
+    def test_a_guard_that_starts_after_quiet_hours_sends_them(self):
+        self.spend_the_night()
+        run = self.configured(fixtures.fixture("good"), title="Crash loop")
+
+        class Child:
+            pid = 4242
+
+            @staticmethod
+            def wait():
+                return 1
+
+        with at(MORNING), patch("nightweaver.recovery.launch_runner", return_value=Child()):
+            supervise(self.store, run, 0)
+            notify.flush()
+        bodies = [r["body"].decode() for r in self.ntfy.of("POST")]
+        self.assertTrue(any("Night run: Goal met in wave 3" in body for body in bodies), bodies)
+        self.assertEqual([item["event"] for item in notify._state(self.store)["held"]], ["provider_parked"])
+
+    def test_nothing_is_released_while_quiet_hours_are_on_or_when_nothing_is_held(self):
+        self.spend_the_night()
+        with at(NIGHT):
+            self.assertFalse(notify.release_due(self.store))
+        with at(MORNING):
+            notify.release_due(self.store)
+            notify.flush()
+            self.assertFalse(notify.release_due(self.store), "everything that could go is sent")
+        self.assertEqual(len(self.ntfy.of("POST")), 2)
+
+    def test_a_failed_release_keeps_everything_and_is_not_retried_at_once(self):
+        self.spend_the_night()
+        self.ntfy.status = 500
+        with at(MORNING):
+            self.assertTrue(notify.release_due(self.store))
+            notify.flush()
+            self.assertFalse(notify.release_due(self.store), "a dead server is not hammered")
+            notify.flush()
+            self.assertEqual(len(self.ntfy.requests), 2, "one night message and one failed release")
+            self.assertEqual(notify.status(self.store)["held_for_digest"], 2)
+            self.ntfy.status = 200
+            with patch("nightweaver.notify.RETRY_AFTER", 0):
+                self.assertTrue(notify.release_due(self.store))
+                notify.flush()
+        self.morning(earlier=2)
+
+    def test_a_transition_right_after_a_failed_send_does_not_retry_it(self):
+        self.enable(quiet_hours="23:00-07:00")
+        run = self.run_row()
+        self.ntfy.status = 500
+        with at(NOON):
+            run.set("blocked", {"cause": "Missed"})
+            notify.flush()
+            run.set("wave_completed", {"wave": 1})
+            notify.flush()
+        self.assertEqual(len(self.ntfy.requests), 1, "a server that just failed is left alone for a minute")
+        self.assertEqual(notify.status(self.store)["held_for_digest"], 1)
+
+    def test_a_hold_written_before_messages_had_ids_is_released_and_cleared(self):
+        self.enable(quiet_hours="23:00-07:00")
+        old = [{"time": timestamp(), "run_id": "0" * 12, "title": "Old", "event": "blocked", "summary": f"Blocked: legacy {n}."} for n in range(3)]
+        (self.store.root / "notify-state.json").write_text(json.dumps({"nights": {}, "held": old}), encoding="utf-8")
+        with at(MORNING):
+            self.assertTrue(notify.release_due(self.store))
+            notify.flush()
+        (post,) = self.ntfy.of("POST")
+        self.assertEqual(sum(f"legacy {n}." in post["body"].decode() for n in range(3)), 3)
+        self.assertEqual(notify._state(self.store)["held"], [])
+
+
+@unittest.skipUnless(os.name == "nt", "Windows controller")
+class ReleaseLock(Base):
+    """A release sends with the lock free, so a slow server cannot make another process fail open and erase what it just held."""
+
+    def slow_release(self, count):
+        self.enable(quiet_hours="23:00-07:00")
+        (self.store.root / "notify-state.json").write_text(json.dumps({"nights": {}, "held": held_entries(count)}), encoding="utf-8")
+        inside, go, sent = threading.Event(), threading.Event(), []
+
+        def send(store, title, message, *args, **kwargs):
+            sent.append(message)
+            if len(sent) == 1:
+                inside.set()
+                go.wait(30)
+            return True, None
+
+        return inside, go, sent, send
+
+    def test_a_message_held_while_a_release_is_sending_is_kept(self):
+        inside, go, sent, send = self.slow_release(14)
+        with at(MORNING), patch("nightweaver.notify._send", side_effect=send):
+            release = threading.Thread(target=notify._release, args=(self.store,))
+            release.start()
+            self.assertTrue(inside.wait(10))
+            late = threading.Thread(target=notify._hold_failed, args=(self.store, None, "f" * 12, "Late", "blocked", "B-MUST-NOT-BE-LOST"))
+            late.start()
+            late.join(3)
+            stuck = late.is_alive()
+            go.set()
+            release.join(30)
+            late.join(30)
+        self.assertFalse(stuck, "the lock must not be held across the network send")
+        self.assertGreaterEqual(len(sent), 2)
+        text = "\n".join(sent)
+        left = [item["summary"] for item in notify._state(self.store)["held"]]
+        self.assertEqual(("B-MUST-NOT-BE-LOST" in text) + left.count("B-MUST-NOT-BE-LOST"), 1, "delivered by the next chunk or still held")
+        self.assertEqual(sum(f"reason {n:02d} " in text for n in range(14)), 14)
+
+    def test_two_releases_at_once_never_send_the_same_message_twice(self):
+        inside, go, sent, send = self.slow_release(14)
+        with at(MORNING), patch("nightweaver.notify._send", side_effect=send):
+            first = threading.Thread(target=notify._release, args=(self.store,))
+            first.start()
+            self.assertTrue(inside.wait(10))
+            notify._release(self.store)  # the first is mid-send on its share: this one must take only the rest
+            go.set()
+            first.join(30)
+        text = "\n".join(sent)
+        self.assertEqual([text.count(f"reason {n:02d} ") for n in range(14)], [1] * 14)
+        self.assertEqual(notify._state(self.store)["held"], [])
+
+    def test_a_failed_send_gives_the_claimed_messages_back(self):
+        self.enable(quiet_hours="23:00-07:00")
+        (self.store.root / "notify-state.json").write_text(json.dumps({"nights": {}, "held": held_entries(3)}), encoding="utf-8")
+        with at(MORNING), patch("nightweaver.notify._send", return_value=(False, "HTTP 500")):
+            notify._release(self.store)
+        held = notify._state(self.store)["held"]
+        self.assertEqual(len(held), 3)
+        self.assertFalse(any("claimed" in item for item in held), "a failed release leaves nothing locked for the next one")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows controller")
+class EventDefaults(Base):
+    def legacy(self):
+        """providers.json as `notify setup` wrote it before the terminal stops were default events."""
+        self.enable()
+        path = self.store.root / "providers.json"
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        settings["notify"]["ntfy"]["events"] = list(notify.LEGACY_EVENTS)
+        del settings["notify"]["ntfy"]["events_version"]
+        path.write_text(json.dumps(settings), encoding="utf-8")
+        notify.forget()
+
+    def saved(self):
+        return json.loads((self.store.root / "providers.json").read_text(encoding="utf-8"))["notify"]["ntfy"]
+
+    def stop(self):
+        self.run_row().set("repeated_failure_stopped", {"cause": "Stopped: gate g failed 3 times on the same build"}, phase="blocked")
+        return len(self.ntfy.of("POST"))
+
+    def test_a_config_saved_with_the_old_default_list_sends_the_new_stops_without_a_rerun(self):
+        self.legacy()
+        self.assertEqual(notify.status(self.store)["events"], list(notify.DEFAULT_EVENTS))
+        self.assertEqual(self.stop(), 1)
+
+    def test_rerunning_setup_upgrades_the_old_default_list_and_says_so(self):
+        self.legacy()
+        result = notify.setup(self.store, server=self.ntfy.url)
+        self.assertEqual((result["events"], result["events_upgraded"]), (list(notify.DEFAULT_EVENTS), True))
+        self.assertEqual(self.saved()["events"], list(notify.DEFAULT_EVENTS))
+        text = notify.setup_text(result)
+        self.assertIn("newer stops", text)
+        self.assertIn("budget_exhausted", text)
+        again = notify.setup(self.store)
+        self.assertFalse(again["events_upgraded"])
+        self.assertNotIn("newer stops", notify.setup_text(again))
+
+    def test_a_customised_list_is_kept_and_setup_names_the_stops_it_leaves_out(self):
+        self.enable()
+        result = notify.setup(self.store, events=["blocked", "goal_met"])
+        self.assertEqual(self.saved()["events"], ["blocked", "goal_met"])
+        left = [name for name in notify.DEFAULT_EVENTS if name not in notify.LEGACY_EVENTS]
+        self.assertEqual(notify.status(self.store)["stops_not_sent"], left)
+        text = notify.setup_text(result)
+        self.assertIn("Not sent", text)
+        self.assertIn("--events blocked goal_met " + " ".join(left), text)
+        self.assertEqual(self.stop(), 0, "a customised list is the user's choice")
+        notify.setup(self.store, events=["guard_stopped"])
+        self.assertNotIn("stops_not_sent", notify.status(self.store))
+        self.assertNotIn("Not sent", notify.setup_text(notify.setup(self.store)))
+
+    def test_choosing_exactly_the_old_seven_on_purpose_is_respected(self):
+        self.enable()
+        notify.setup(self.store, events=list(notify.LEGACY_EVENTS))
+        self.assertEqual(notify.status(self.store)["events"], list(notify.LEGACY_EVENTS))
+        self.assertEqual(self.stop(), 0)
+
+    def test_setup_help_lists_the_current_defaults_and_the_real_hold_behaviour(self):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), self.assertRaises(SystemExit):
+            main(["--home", str(self.store.root), "notify", "setup", "--help"])
+        text = " ".join(out.getvalue().split())
+        for name in notify.DEFAULT_EVENTS:
+            self.assertIn(name, text)
+        self.assertIn("wave_completed", text)
+        self.assertNotIn("before the rest wait for the digest", text)
+        self.assertRegex(text, r"sent soon after quiet hours end")
+
+
+class RawErrorText(unittest.TestCase):
+    def test_a_known_failure_is_a_fixed_phrase_and_other_text_keeps_only_its_plain_leading_words(self):
+        cases = [({"issue": "fatal: pathspec 'private plans/notes.txt' did not match any files", "during": "judging"},
+                  "Blocked while judging: a git command failed."),
+                 ({"issue": "Worker produced invalid output: src/app.py line 40: api = abc"}, "Blocked: Worker produced invalid output: <path>."),
+                 ({"issue": "The judge terminated with code 1: customer_ssn=123-45-6789 in data.csv"}, "Blocked: The judge terminated with code 1."),
+                 ({"issue": "could not read data.csv today"}, "Blocked: could not read <redacted>."),
+                 ({"issue": 'The worker could not open "my private notes" for reading'}, "Blocked: The worker could not open <redacted>."),
+                 ({"issue": r"[WinError 5] Access is denied: 'C:\Users\Bailey\vault'"}, "Blocked: access was denied."),
+                 ({"issue": "Review kept asking for changes"}, "Blocked: Review kept asking for changes."),
+                 ({"issue": "Pause naïve"}, "Blocked: Pause naïve."),
+                 ({"issue": "Crashed with api_key=sk-abcdefghijklmnop1234 set"}, "Blocked: Crashed with api_key=[REDACTED] set."),
+                 ({"issue": "x/y.py"}, "Blocked: details are in the run log.")]
+        for details, expected in cases:
+            with self.subTest(details["issue"]):
+                self.assertEqual(notify.summarize("blocked", details), expected)
+
+    def test_nightweavers_own_stop_lines_keep_their_gate_names(self):
+        line = notify.summarize("blocked", {"cause": "Stopped: gate unit_tests failed 3 times on the same build", "issue": "C:\\x\\y"})
+        self.assertEqual(line, "Blocked: Stopped: gate unit_tests failed 3 times on the same build.")
+
+    def test_the_dispatcher_text_and_the_digest_note_are_as_plain(self):
+        text = notify.summarize("dispatcher_run_failed", {"issue": "could not read src/private/notes.txt today"})
+        self.assertEqual(text, "Stopped: the dispatcher could not run this: could not read <path>.")
+        self.assertEqual(notify._reason("fatal: bad object 'secret/thing'", 110), "a git command failed")
+        self.assertEqual(notify._reason("Stopped: no change after review feedback", 110), "Stopped: no change after review feedback")
 
 
 if __name__ == "__main__":

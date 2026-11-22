@@ -49,8 +49,10 @@ def with_live_status(store, row, phases=None):
 def dispatch(store, watch, recover_guards=False):
     if watch:
         record_dispatch(store, "Dispatcher started")
+    from . import notify
     with run_lock(store.root / "dispatcher.lock", "Another dispatcher is already serving this runtime"):
         while True:
+            notify.release_due(store)  # the dispatcher outlives its runs: it sends what quiet hours held once they are over
             results = []
             if recover_guards:
                 from .recovery import recovery_status
@@ -68,7 +70,6 @@ def dispatch(store, watch, recover_guards=False):
                     continue
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     details = {"issue": str(error)}
-                    from . import notify
                     notify.announce(store, row["id"], "dispatcher_run_failed", details, store.transition(
                         row["id"], "dispatcher_run_failed", details, phase="blocked", last_error=redact(str(error))))
                     phase = "blocked"
@@ -456,10 +457,13 @@ def main(argv=None):
     notify_actions = notify.add_subparsers(dest="notify_action", required=True)
     setup = notify_actions.add_parser("setup", help="Write the configuration with fresh random topics and print how to subscribe. Sends nothing")
     setup.add_argument("--server", help="ntfy server URL (default https://ntfy.sh, or your own)")
-    setup.add_argument("--events", nargs="+", metavar="EVENT", help="Events to send, space or comma separated (default: goal_met run_completed "
-                       "pursuit_stopped blocked provider_unavailable provider_parked model_mismatch)")
+    from .notify import DEFAULT_EVENTS, OPTIONAL_EVENTS
+    setup.add_argument("--events", nargs="+", metavar="EVENT", help="Events to send, space or comma separated (default: "
+                       + " ".join(DEFAULT_EVENTS) + "; also available: " + " ".join(OPTIONAL_EVENTS) + "). A saved list that is the old "
+                       "default is upgraded; a customised one is kept, so add newer stops with --events")
     setup.add_argument("--quiet-hours", metavar="HH:MM-HH:MM", help="Local night window with a message allowance (default 23:00-07:00; '' disables)")
-    setup.add_argument("--max-per-night", type=int, metavar="N", help="Messages allowed in quiet hours before the rest wait for the digest (default 3)")
+    setup.add_argument("--max-per-night", type=int, metavar="N", help="Messages allowed in quiet hours (default 3; usage-limit waits never count). The rest are held and "
+                       "sent soon after quiet hours end by any running dispatcher or run, or by `notify digest`")
     setup.add_argument("--no-images", action="store_true", help="Never attach screenshots")
     setup.add_argument("--rotate", action="store_true", help="Replace existing topics with new random ones")
     notify_actions.add_parser("test", help="Send one test message now")

@@ -29,8 +29,14 @@ DEFAULT_SERVER = "https://ntfy.sh"
 DEFAULT_EVENTS = ("goal_met", "run_completed", "pursuit_stopped", "blocked", "provider_unavailable", "provider_parked",
                   "model_mismatch", "budget_exhausted", "repeated_failure_stopped", "verification_inconsistent",
                   "local_advice_required", "guard_stopped", "dispatcher_run_failed")
+# What `notify setup` wrote before the terminal stops were defaults. A saved list that is exactly this, without the events_version
+# mark that setup now writes, was never customised, so it reads as the current defaults. Any other list is the user's choice, and
+# setup_text and status say which newer stops it leaves out.
+EVENTS_VERSION = 2
+LEGACY_EVENTS =("goal_met", "run_completed", "pursuit_stopped", "blocked", "provider_unavailable", "provider_parked", "model_mismatch")
 OPTIONAL_EVENTS = ("wave_completed", "milestone_accepted", "judge_invalid", "plan_invalid", "independence_degraded")
 MAX_IMAGES, MAX_IMAGE_BYTES, MAX_BODY, MAX_ACTIONS, KEEP_HELD, HELD_ROOM = 2, 5 * 1024 * 1024, 3800, 3, 200, 2400
+LEASE, RETRY_AFTER = 60, 60  # seconds a release owns the messages it is sending; seconds before a failed release is tried again
 LOUD = ("blocked", "provider_unavailable", "pursuit_stopped", "model_mismatch", "budget_exhausted", "repeated_failure_stopped",
         "verification_inconsistent", "local_advice_required", "guard_stopped", "dispatcher_run_failed")
 PRIORITY = {**dict.fromkeys(LOUD, 4), "provider_parked": 2}
@@ -103,6 +109,7 @@ def valid(block):
     events = block.get("events", DEFAULT_EVENTS)
     if not isinstance(events, (list, tuple)) or not all(isinstance(item, str) for item in events):
         raise ValueError("notify.ntfy.events must be a list of event names")
+    events = DEFAULT_EVENTS if block.get("events_version") != EVENTS_VERSION and set(events) == set(LEGACY_EVENTS) else events
     limit = block.get("max_per_night", 3)
     if type(limit) is not int or limit < 0:
         raise ValueError("notify.ntfy.max_per_night must be a whole number, 0 or more")
@@ -145,20 +152,22 @@ def setup(store, *, server=None, events=None, quiet_hours=None, max_per_night=No
     keep = bool(old.get("topic")) and not rotate
     allowed = {*DEFAULT_EVENTS, *OPTIONAL_EVENTS}
     chosen = list(dict.fromkeys(events)) if events else list(old.get("events") or DEFAULT_EVENTS)
+    upgraded = not events and old.get("events_version") != EVENTS_VERSION and set(chosen) == set(LEGACY_EVENTS)
+    chosen = list(DEFAULT_EVENTS) if upgraded else chosen
     unknown = [item for item in chosen if item not in allowed]
     if unknown:
         raise ValueError(f"Unknown notification events: {', '.join(unknown)}. Choose from: {', '.join(sorted(allowed))}")
     block = {"server": server or old.get("server") or DEFAULT_SERVER,
              "topic": old["topic"] if keep else secrets.token_urlsafe(24),
              "reply_topic": old["reply_topic"] if keep and old.get("reply_topic") else secrets.token_urlsafe(24),
-             "events": chosen, "quiet_hours": quiet_hours if quiet_hours is not None else old.get("quiet_hours", "23:00-07:00"),
+             "events": chosen, "events_version": EVENTS_VERSION, "quiet_hours": quiet_hours if quiet_hours is not None else old.get("quiet_hours", "23:00-07:00"),
              "max_per_night": max_per_night if max_per_night is not None else old.get("max_per_night", 3),
              "images": images if images is not None else old.get("images", True)}
     block["server"] = str(block["server"]).strip().rstrip("/")
     valid(block)
     write_json(settings_path(store), {**settings, "notify": {**notify, "ntfy": block}})
     forget()
-    return {**block, "new_topics": not keep}
+    return {**block, "new_topics": not keep, "events_upgraded": upgraded}
 
 
 def setup_text(result):
@@ -170,11 +179,25 @@ def setup_text(result):
              "Decision buttons answer on a separate private reply topic that Nightweaver reads. You do not subscribe to it.", "",
              NOTE, "Run `nightweaver notify setup --rotate` for new names if one leaks.", "",
              "Sends " + ", ".join(result["events"]) + ".", f"Quiet hours {result['quiet_hours'] or 'off'}: at most "
-             f"{result['max_per_night']} messages a night; the rest are sent when quiet hours end, or with `nightweaver notify digest`.",
+             f"{result['max_per_night']} messages a night (usage-limit waits never count and only appear in the digest). The rest are held and "
+             "sent as one message soon after quiet hours end, by whatever Nightweaver process is running then (a dispatcher or a run), or "
+             "with `nightweaver notify digest`.",
              "Run `nightweaver notify test` to send one test message."]
+    if result.get("events_upgraded"):
+        lines.insert(-1, "Your list was the old default, so it now includes the newer stops: " + ", ".join(
+            name for name in DEFAULT_EVENTS if name not in LEGACY_EVENTS) + ".")
+    elif off := _left_out(result["events"]):
+        lines.insert(-1, "Not sent, because your events list leaves them out: " + ", ".join(off) + ". These are how a run stops unattended; "
+                         "add them with `nightweaver notify setup --events " + " ".join([*result["events"], *off]) + "`.")
     if not result["server"].startswith("https://"):
         lines.insert(-1, "This server is not https, so messages cross the network unencrypted.")
     return "\n".join(lines)
+
+
+def _left_out(events):
+    """The stops that became default events after the list was written and that it does not send. Empty for a list with none of
+    the older events: that is a new, deliberate choice."""
+    return [name for name in DEFAULT_EVENTS if name not in LEGACY_EVENTS and name not in events] if set(events) & set(LEGACY_EVENTS) else []
 
 
 def off(store):
@@ -204,7 +227,8 @@ def status(store):
         return {"configured": False, "problem": str(error)}
     data, night = _state(store), _night(config["quiet"], clock())
     return {"configured": True, "server": config["server"], "topic": mask(config["topic"]), "reply_topic": mask(config["reply_topic"]),
-            "events": list(config["events"]), "quiet_hours": config["quiet_text"], "max_per_night": config["max_per_night"],
+            "events": list(config["events"]), **({"stops_not_sent": left} if (left := _left_out(config["events"])) else {}),
+            "quiet_hours": config["quiet_text"], "max_per_night": config["max_per_night"],
             "images": config["images"], "quiet_now": night is not None,
             "sent_tonight": data.get("nights", {}).get(night, 0) if night else None, "held_for_digest": len(data.get("held", []))}
 
@@ -487,13 +511,15 @@ def _hold_failed(store, night, run_id, title, kind, summary):
             nights[night] = max(0, nights.get(night, 0) - 1)
         _hold(data, run_id, title, kind, summary, failed=True)
         _save(store, data)
+    _cache["released"] = time.monotonic()  # a server that just failed is not tried again by release_due for RETRY_AFTER seconds
 
 
-def _held_lines(held, room):
-    """The oldest held messages that fit in `room` bytes, as (lines, entries): only those entries may be cleared afterwards."""
+def _held_lines(held, room, mark=True):
+    """The oldest held messages that fit in `room` bytes, as (lines, entries): only those entries may be cleared afterwards. mark
+    tags the ones whose first send failed; the release message is itself the delivery, so it does not."""
     lines, shown, used = [], [], 0
     for item in held:
-        line = f"- {_line(item.get('title'), 80)}: {_line(item.get('summary'), 220)}" + (" (not delivered)" if item.get("failed") else "")
+        line = f"- {_line(item.get('title'), 80)}: {_line(item.get('summary'), 220)}" + (" (not delivered)" if mark and item.get("failed") else "")
         used += len(line.encode("utf-8")) + 1
         if used > room:
             break
@@ -502,26 +528,61 @@ def _held_lines(held, room):
     return lines, shown
 
 
+def _key(item):
+    return item.get("id") or json.dumps(item, sort_keys=True)  # a hold written before messages had ids is matched whole
+
+
+def _claim(store):
+    """Under the lock only: pick the oldest releasable held messages that fit one message and stamp them as being sent, so another
+    process leaves them alone for LEASE seconds. The network send happens outside the lock."""
+    with _guard(store):
+        data, now = _state(store), time.time()
+        held = data.get("held", [])
+        for item in held:
+            item.setdefault("id", secrets.token_hex(6))
+        ready = [item for item in held if item.get("event") not in DIGEST_ONLY
+                 and not (isinstance(item.get("claimed"), (int, float)) and now - item["claimed"] < LEASE)]
+        lines, shown = _held_lines(ready, HELD_ROOM, mark=False)
+        for item in shown:
+            item["claimed"] = now
+        if shown:
+            _save(store, data)
+        return lines, shown, len(ready)
+
+
+def _settle(store, shown, sent):
+    """Under the lock only: re-read the hold and drop exactly the messages that left (or give the others back), so anything another
+    process held while the send was in flight is kept."""
+    ids = {item["id"] for item in shown}
+    with _guard(store):
+        data = _state(store)
+        if sent:
+            data["held"] = [item for item in data.get("held", []) if item.get("id") not in ids]
+        for item in data.get("held", []):
+            if item.get("id") in ids:
+                item.pop("claimed", None)
+        _save(store, data)
+
+
 def _release(store):
-    """Outside quiet hours, send what was held back (overnight, or after a failed send) as one message and clear only what it
+    """Outside quiet hours, send what was held back (overnight, or after a failed send) as a few messages and clear only what they
     carried. Digest-only parks stay for the digest. A failed send leaves everything held."""
     if not any(item.get("event") not in DIGEST_ONLY for item in _state(store).get("held", [])):
         return
-    with _guard(store):
-        for _ in range(5):
-            data = _state(store)
-            ready = [item for item in data.get("held", []) if item.get("event") not in DIGEST_ONLY]
-            lines, shown = _held_lines(ready, HELD_ROOM)
-            if not shown:
-                return
-            more = len(ready) - len(shown)
-            ok, _why = _send(store, f"Nightweaver: {len(ready)} held message{'s' * (len(ready) != 1)}",
-                             "Held back while quiet hours were on or delivery failed.\n" + "\n".join(lines)
-                             + (f"\n... and {more} more" if more else ""), (), (), 4, ("sunrise",))
-            if not ok:
-                return
-            data["held"] = [item for item in data["held"] if item not in shown]
-            _save(store, data)
+    for _ in range(5):
+        lines, shown, total = _claim(store)
+        if not shown:
+            return
+        sent = False
+        try:
+            more = total - len(shown)
+            sent, _why = _send(store, f"Nightweaver: {total} held message{'s' * (total != 1)}",
+                               "Held back while quiet hours were on or delivery failed.\n" + "\n".join(lines)
+                               + (f"\n... and {more} more" if more else ""), (), (), 4, ("sunrise",))
+        finally:
+            _settle(store, shown, sent)
+        if not sent:
+            return
 
 
 # ---- the engine hook -----------------------------------------------------------------------------------------------
@@ -550,6 +611,44 @@ def _cause(text, limit=140):
     return line if len(line) <= limit else line[:limit - 3].rstrip() + "..."
 
 
+# Raw error text (a git error, a provider's stderr, str(exception)) can hold names, paths and file content. Known failures become a
+# fixed phrase; anything else keeps only its plain leading words, up to the first path, quoted name, identifier or long token.
+KNOWN = ((r"\bfatal:|^git\b|\bgit (?:failed|exited|returned|error)\b", "a git command failed"),
+         (r"access (?:is )?denied|permission denied|PermissionError|WinError 5\b", "access was denied"),
+         (r"no such file|cannot find the (?:file|path)|FileNotFoundError|WinError 2\b|is not recognized as an internal or external command",
+          "a file or program was not found"),
+         (r"timed out|TimeoutExpired", "a step timed out"), (r"no space left|not enough space|disk full", "the disk is full"))
+_WORD = r"[^\W\d_](?:[^\W\d_]|['’-]){0,22}"
+PLAIN = re.compile(rf"\(?(?:{_WORD}|\d{{1,6}}|\w+=\[REDACTED\]|\[REDACTED\])\)?[.,;:!?]*|[-–—:;,.!?()]+")
+QUOTED = re.compile(r"""(?<![^\W_])(['"`])(?:(?!\1).)*\1(?![^\W_])""")
+
+
+def _plain(text, limit=140):
+    """Raw error text made fit for a phone: "" when nothing safe is left, so the caller says something fixed instead."""
+    line = redact(_line(text, 1000))
+    line = re.sub(r"(\b(?:exited|exit code|exit status|terminated with code)\s+-?\d+)\s*:.*", r"\1", line)
+    for pattern, phrase in KNOWN:
+        if re.search(pattern, line, re.I):
+            return phrase
+    if re.search(r'[{\[]\s*"|"\s*:|\\["nrt]', line):
+        return ""
+    words = []
+    for word in QUOTED.sub("<redacted>", line).split():
+        if not PLAIN.fullmatch(word):
+            words.append("<path>" if re.search(r"[\\/]|^[A-Za-z]:|^~", word) else "<redacted>")
+            break
+        words.append(word)
+    if not any(PLAIN.fullmatch(word) and any(ch.isalpha() for ch in word) for word in words):
+        return ""
+    line = " ".join(words)
+    return line if len(line) <= limit else line[:limit - 3].rstrip() + "..."
+
+
+def _reason(text, limit=140):
+    """Why a run is blocked. Nightweaver's own "Stopped: ..." lines are kept (scrubbed); anything else is raw error text."""
+    return _cause(text, limit) if _line(text, 20).startswith("Stopped:") else _plain(text, limit)
+
+
 def _end(text):
     return text if text[-1:] in (".", "!", "?") else text + "."
 
@@ -559,7 +658,8 @@ def _branch(details):
 
 
 def summarize(kind, details, best=None):
-    """A short human line for an event. Never file contents, paths, environment values, tokens or provider log text."""
+    """A short human line for an event. Raw error text is cut to its plain leading words or replaced by a fixed phrase (_plain), so
+    no file contents, paths, environment values, tokens or provider log text go out."""
     d = details or {}
     score = d.get("score") if d.get("score") is not None else d.get("best_score", best)
     tail = f" Score {score}/100." if score is not None and kind not in ("goal_met", "pursuit_stopped") else ""
@@ -574,7 +674,7 @@ def summarize(kind, details, best=None):
     if kind == "blocked":
         during = d.get("during") if re.fullmatch(r"[a-z_]{1,24}", str(d.get("during") or "")) else None
         raw = d.get("cause") or d.get("issue")
-        cause = _cause(raw) or ("details are in the run log" if raw else "needs a decision")
+        cause = _reason(d.get("cause")) or _reason(d.get("issue")) or ("details are in the run log" if raw else "needs a decision")
         return _end(f"Blocked{f' while {during}' if during else ''}: {cause}") + tail
     if kind == "provider_unavailable":
         return (f"{d.get('provider', 'A provider')} {d.get('role', 'route')} is unavailable "
@@ -599,7 +699,7 @@ def summarize(kind, details, best=None):
     if kind == "guard_stopped":
         return "The runner kept crashing and the restart limit was reached; the run is stopped and needs attention." + tail
     if kind == "dispatcher_run_failed":
-        return _end("Stopped: the dispatcher could not run this: " + (_cause(d.get("issue"), 100) or "see the run log")) + tail
+        return _end("Stopped: the dispatcher could not run this: " + (_plain(d.get("issue"), 100) or "see the run log")) + tail
     return kind.replace("_", " ").capitalize() + "." + tail
 
 
@@ -637,16 +737,53 @@ def on_transition(store, run_id, title, kind, details, following, state):
             branch = next((data.get("branch") for name, data in events if name == "run_completed"), None)
             chosen = [(name, {**data, "branch": branch} if name == "goal_met" else data) for name, data in chosen if name != "run_completed"]
         if chosen:
-            best = state.get("best_score") if isinstance(state, dict) else None
-            with _lock:
-                live = [item for item in _threads if item.is_alive()]
-                # each delivery waits for the one before it, so messages leave in the order the events happened
-                thread = threading.Thread(target=_deliver, args=(store, run_id, title, chosen, best, live[-1] if live else None),
-                                          name="nightweaver-notify", daemon=True)
-                if not _exits:
-                    _exits.append(atexit.register(flush))
-                thread.start()
-                _threads[:] = live + [thread]
+            _spawn(_deliver, store, run_id, title, chosen, state.get("best_score") if isinstance(state, dict) else None)
+        else:
+            release_due(store)  # any transition is a chance to send what the night held back
+    except Exception:
+        pass
+
+
+def _spawn(target, *args):
+    """Run target(*args, after) on a daemon thread. Each waits for the one before it, so messages leave in the order they happened."""
+    with _lock:
+        live = [item for item in _threads if item.is_alive()]
+        thread = threading.Thread(target=target, args=(*args, live[-1] if live else None), name="nightweaver-notify", daemon=True)
+        if not _exits:
+            _exits.append(atexit.register(flush))
+        thread.start()
+        _threads[:] = live + [thread]
+
+
+def _pending(store):
+    return (Path(store.root) / "notify-state.json").is_file() and any(
+        item.get("event") not in DIGEST_ONLY for item in _state(store).get("held", []))
+
+
+def release_due(store):
+    """Send what quiet hours or a failed send held back, as soon as quiet hours are over, without waiting for another notifying
+    event: the engine, the guard and the dispatcher loop call this wherever they are alive. A stat when there is nothing held, never
+    raises or waits, and a failed attempt is not repeated for RETRY_AFTER seconds. Returns whether an attempt was started."""
+    try:
+        config = _config(store)
+        if not config or _night(config["quiet"], clock()) is not None or not _pending(store):
+            return False
+        if time.monotonic() - _cache.get("released", -RETRY_AFTER) < RETRY_AFTER:
+            return False
+        _cache["released"] = time.monotonic()
+        _spawn(_wake, store)
+        return True
+    except Exception:
+        return False
+
+
+def _wake(store, after=None):
+    if after is not None:
+        after.join(10)
+    try:
+        _release(store)
+        if not _pending(store):
+            _cache.pop("released", None)  # all sent: the next night's hold may be released at once
     except Exception:
         pass
 
@@ -747,7 +884,7 @@ def digest(store, hours=12.0, now=None):
             last = store.events(row["id"], limit=1, kinds=list(TERMINAL))
             stopped = last and last[0]["kind"] == "pursuit_stopped"
             group = "stopped" if stopped else "blocked"
-            reason = STOPS.get(last[0]["details"].get("reason"), "") if stopped else _cause(state.get("last_error"), 110)
+            reason = STOPS.get(last[0]["details"].get("reason"), "") if stopped else _reason(state.get("last_error"), 110)
             note = " · ".join(part for part in (reason, extras) if part)
         elif _gave_up(store, row["id"]):
             group, note = "blocked", " · ".join(part for part in ("the runner kept crashing and its restart limit was reached", extras) if part)
@@ -782,8 +919,8 @@ def send_digest(store, hours=12.0):
     ok, why = _send(store, report["title"], report["message"], (), (), 3, ("sunrise",))
     if ok and report["included"]:
         with _guard(store):
-            data = _state(store)  # re-read: runs may have held more while the digest was in flight
-            kept = [item for item in data.get("held", []) if item not in report["included"]]
+            data, sent = _state(store), {_key(item) for item in report["included"]}  # re-read: runs may have held more meanwhile
+            kept = [item for item in data.get("held", []) if _key(item) not in sent]
             if len(kept) != len(data.get("held", [])):
                 data["held"] = kept
                 _save(store, data)

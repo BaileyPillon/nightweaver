@@ -146,6 +146,7 @@ def supervise(store, run_id, limit=None, *, retry=False):
             {"pid": os.getpid(), "limit": limit},
             guard_limit=limit,
         )
+        notify.release_due(store)  # a supervisor coming alive after a quiet night is a chance to send what the night held back
         if launch := row["state"].get("guard_launch"):
             # Both process locks are free but the old supervisor did not record
             # an exit. Preserve uncertainty; never invent a PID or exit code.
