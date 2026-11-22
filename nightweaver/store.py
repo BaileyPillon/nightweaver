@@ -27,6 +27,23 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+# Events that end a pursuit stop: the operator extended the run, retried it or it blocked again for another reason.
+STOP_ENDED = ("pursuit_extended", "blocked_run_retried", "blocked", "judge_invalid", "plan_invalid", "provider_unavailable", "budget_exhausted",
+              "repeated_failure_stopped", "verification_inconsistent", "dispatcher_run_failed", "rescue_diagnosis_invalid")
+
+
+def current_stop(events):
+    """The details of the pursuit_stopped event that still explains why a run is blocked, or None once a later event
+    (an extension, a retry or another block) has superseded it. `events` are oldest first and carry their kinds."""
+    stop = None
+    for event in events:
+        if event["kind"] == "pursuit_stopped":
+            stop = event["details"]
+        elif event["kind"] in STOP_ENDED:
+            stop = None
+    return stop
+
+
 class Store:
     def __init__(self, root=None):
         self.root = Path(root or default_home()).resolve()
@@ -220,7 +237,8 @@ class Store:
         return row
 
     def extend_pursuit(self, run_id, waves):
-        """Grant more waves; a stop at the judge resumes there with a fresh plateau count."""
+        """Grant more waves. A pursuit that stopped on a judged build resumes at the planner with that build's gaps and a fresh plateau
+        count, so the unchanged build is not judged again; any other block at the judge resumes at the judge."""
         if type(waves) is not int or not 1 <= waves <= 20:
             raise ValueError("Added waves must be an integer between 1 and 20")
         with self.connect() as db:
@@ -228,18 +246,33 @@ class Store:
             row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
             if not row["spec"].get("pursue"):
                 raise ValueError("This run does not pursue a goal")
-            if row["state"]["phase"] == "done":
+            state = row["state"]
+            if state["phase"] == "done":
                 raise ValueError("The goal was already met")
+            blocked = state["phase"] == "blocked"
+            stop = None
+            if blocked:
+                kinds = ("pursuit_stopped", *STOP_ENDED)
+                stop = current_stop([{"kind": r["kind"], "details": json.loads(r["details"])} for r in db.execute(
+                    "SELECT kind, details FROM events WHERE run_id=? AND kind IN (" + ",".join("?" for _ in kinds) + ") ORDER BY seq", (run_id, *kinds))])
+            if stop and stop.get("reason") == "milestone_limit":
+                raise ValueError("This run stopped at the 50-milestone limit, which more waves cannot lift. Start a new run from the best build to keep going.")
             row["spec"]["pursue"]["max_waves"] += waves
-            resumed = row["state"]["phase"] == "blocked" and row["state"].get("blocked_from") == "judging"
+            resumed = blocked and state.get("blocked_from") == "judging"
             if resumed:
-                row["state"].update(phase="judging", blocked_from=None, last_error="", provider_issue=None, retry_at=None,
-                                    judge_attempts=0, judge_ledger=None, stale_judgments=0, transient_failures=0)
+                state.update(phase="judging", blocked_from=None, last_error="", provider_issue=None, retry_at=None,
+                             judge_attempts=0, judge_ledger=None, stale_judgments=0, transient_failures=0)
+                judged = {item.get("commit") for item in state.get("judgments", [])}
+                if stop and state.get("accepted") in judged:
+                    # The stop followed a judgment of this very build, so judging it again would add no evidence: plan from its gaps.
+                    gaps = state.get("best_gaps") if state.get("accepted") == state.get("best_commit") else state.get("pursuit_gaps")
+                    state.update(phase="planning", judge_stage=None, plan_attempts=0, planner_route=0, pursuit_note="", pursuit_failures=[],
+                                 pursuit_gaps=gaps or [{"title": "The judge does not consider the goal met", "detail": "See the last judgment."}])
             db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
-                       (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
+                       (json.dumps(row["spec"]), json.dumps(state), timestamp(), run_id))
             self._event(db, run_id, "pursuit_extended", {"waves": waves, "max_waves": row["spec"]["pursue"]["max_waves"],
                                                           "resumed": resumed})
-        return {"max_waves": row["spec"]["pursue"]["max_waves"], "resumed": resumed, "phase": row["state"]["phase"]}
+        return {"max_waves": row["spec"]["pursue"]["max_waves"], "resumed": resumed, "phase": state["phase"]}
 
     def pause(self, run_id, value):
         with self.connect() as db:
@@ -319,11 +352,18 @@ class Store:
             selected.append("[Earlier operator updates are available in the run events.]")
         return "\n".join(reversed(selected))
 
-    def accepted_milestones(self, run_id):
+    def accepted_milestones(self, run_id, *, discarded=False):
+        """The milestones of the current build, oldest first. A pursuit that reverted to a better build no longer counts the milestones
+        of the discarded waves; discarded=True lists every milestone the run ever accepted."""
         with self.connect() as db:
             rows = db.execute("SELECT details FROM events WHERE run_id=? AND kind='milestone_accepted' ORDER BY seq",
                               (run_id,))
-            return [json.loads(row["details"]) for row in rows]
+            entries = [json.loads(row["details"]) for row in rows]
+            if discarded:
+                return entries
+            held = db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
+            gone = set(json.loads(held["state"]).get("discarded_commits", ())) if held else set()
+            return [item for item in entries if item.get("commit") not in gone] if gone else entries
 
     @staticmethod
     def _event(db, run_id, kind, details):

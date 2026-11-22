@@ -100,8 +100,8 @@ class PursuitTests(unittest.TestCase):
         counts = {call["role"]: 0 for call in self.events(run, "provider_call_finished")}
         for call in self.events(run, "provider_call_finished"):
             counts[call["role"]] += 1
-        self.assertEqual(counts, {"worker": 2, "reviewer": 2, "judge": 2, "planner": 1})
-        self.assertEqual(state["provider_calls"], 7)
+        self.assertEqual(counts, {"worker": 2, "reviewer": 2, "judge": 3, "planner": 1}, "the judgment that meets the goal is confirmed by a second one")
+        self.assertEqual(state["provider_calls"], 8)
         # Prompts: the judge sees the goal, ledger and rubric; the planner sees the gaps; the next worker sees the pursuit.
         judge_prompt = self.prompts("judge")[0]
         for text in ("Produce a fixture whose independent check passes", "PASS read fixture value", "Prepare fixture", "do not reward claims"):
@@ -314,10 +314,10 @@ class PursuitTests(unittest.TestCase):
         self.assertEqual(Run(self.store, run).run(), "blocked")
         self.assertEqual(self.store.get(run)["state"]["stale_judgments"], 0)
         result = self.cli("pursuit", run, "--add-waves", 2, "--json")
-        self.assertEqual(result["extension"], {"max_waves": 3, "resumed": True, "phase": "judging"})
+        self.assertEqual(result["extension"], {"max_waves": 3, "resumed": True, "phase": "planning"}, "the stopped build was judged already")
         self.assertEqual(result["max_waves"], 3)
         state = self.store.get(run)["state"]
-        self.assertEqual((state["phase"], state["blocked_from"], state["last_error"]), ("judging", None, ""))
+        self.assertEqual((state["phase"], state["blocked_from"], state["last_error"]), ("planning", None, ""))
         self.assertEqual(self.events(run, "pursuit_extended")[0]["waves"], 2)
         self.assertEqual(self.cli("run", run)["phase"], "done")
         self.assertEqual(self.store.get(run)["spec"]["pursue"]["max_waves"], 3)
@@ -374,7 +374,7 @@ class PursuitSpecTests(unittest.TestCase):
         pursue = validate(self.raw())["pursue"]
         self.assertEqual(pursue, {"judge": {"kind": "codex"}, "judge_fallbacks": [], "planner": {"kind": "codex"}, "max_waves": 3, "wave_size": 3,
                                   "target_score": 85, "plateau": 2, "regression_margin": 5, "references": [], "criteria": ["Beautiful"],
-                                  "rescue": {"strategies": 3, "max_rescues": 1}})
+                                  "rescue": {"strategies": 3, "max_rescues": 1}, "confirm": True, "confirm_margin": 3})
         self.assertIsNot(pursue["planner"], pursue["judge"])
         full = validate(self.raw(planner={"kind": "claude", "effort": "high"}, criteria=["Fast"], max_waves=20, wave_size=5, target_score=0,
                                  plateau=5, regression_margin=50, judge_fallbacks=[{"kind": "gemini"}]))["pursue"]

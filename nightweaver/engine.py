@@ -125,7 +125,11 @@ def fork_run(store, run_id, milestone, worker=None):
     accepted = store.accepted_milestones(run_id)
     if type(milestone) is not int or not 0 <= milestone <= len(accepted):
         raise ValueError("Choose an accepted milestone number, or 0 for the original baseline")
-    remaining = original["spec"]["milestones"][milestone:]
+    # A pursuit that reverted holds milestones of discarded waves: a checkpoint is a milestone of the current build, and the
+    # discarded work is not carried into the fork.
+    cut = 0 if milestone == 0 else accepted[milestone - 1].get("step", milestone)
+    skipped = {item.get("step") for item in store.accepted_milestones(run_id, discarded=True)} - {item.get("step") for item in accepted}
+    remaining = [step for number, step in enumerate(original["spec"]["milestones"], 1) if number > cut and number not in skipped]
     if not remaining:
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]

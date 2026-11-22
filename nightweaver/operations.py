@@ -111,7 +111,10 @@ def handoff(store, run_id):
     state, spec = row["state"], row["spec"]
     index = state["step"]
     step = spec["milestones"][index] if index < len(spec["milestones"]) else None
-    accepted = store.accepted_milestones(run_id)
+    accepted = store.accepted_milestones(run_id)  # the current build's: a pursuit that reverted no longer counts a discarded wave's
+    gone = set(state.get("discarded_commits", ()))
+    discarded = [{"title": spec["milestones"][entry["step"] - 1]["title"], "commit": entry["commit"]}
+                 for entry in store.accepted_milestones(run_id, discarded=True) if entry.get("commit") in gone] if gone else []
     recent = store.events(run_id, limit=1, kinds=["gate_finished"])
     gate = recent[0]["details"] if recent else None
     if gate and step:
@@ -141,6 +144,7 @@ def handoff(store, run_id):
                 for entry in accepted
                 if entry["step"] <= index
             ],
+            **({"discarded": discarded} if discarded else {}),
             "current": {
                 "title": step["title"],
                 "task": step["task"],
@@ -174,6 +178,9 @@ def handoff_markdown(data):
     if data["completed"]:
         lines += ["", "## Accepted milestones", ""]
         lines += [f"- {m['title']} ({m['commit']})" for m in data["completed"]]
+    if data.get("discarded"):
+        lines += ["", "## Discarded milestones (not part of the accepted build)", ""]
+        lines += [f"- {m['title']} ({m['commit']})" for m in data["discarded"]]
     if step := data["current"]:
         lines += ["", f"## Next milestone · {step['title']}", "", step["task"]]
         for label, items in (("Allowed paths", step["paths"]), ("Checks", step["checks"])):

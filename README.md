@@ -6,9 +6,9 @@ Windows-native orchestration for coding agents. Give Nightweaver a goal with che
 
 ## What's new in 0.19 — goal pursuit
 
-Until 0.19 a run ended when its fixed milestone list was accepted, and a person decided what came next. Version 0.19 adds that outer loop. After the last planned milestone is accepted, the controller re-runs every distinct check from every milestone on the finished build and collects screenshots. This is the evidence ledger. An independent, read-only judge then returns `MET` or `NOT_MET`, a 0–100 score, a result for each criterion and a ranked list of gaps. The run is done only when the judge says `MET` at or above `target_score` and every ledger check passes. Otherwise a read-only planner turns the gaps into the next wave of milestones, which inherit the last milestone's checks, scope and workers.
+Until 0.19 a run ended when its fixed milestone list was accepted, and a person decided what came next. Version 0.19 adds that outer loop. After the last planned milestone is accepted, the controller re-runs every check that applies to the finished build and collects screenshots. This is the evidence ledger. An independent, read-only judge then returns `MET` or `NOT_MET`, a 0–100 score, a result for each criterion and a ranked list of gaps. The run is done only when the judge says `MET` at or above `target_score`, every ledger check passes and a second, independent judgment of the same build confirms it. Otherwise a read-only planner turns the gaps into the next wave of milestones, which inherit the last milestone's checks, scope and workers.
 
-A pursuit stops when the goal is met, when the score stops improving (`plateau`, after one [plateau rescue](#rescue-a-plateau) by default), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped at the judge.
+A pursuit stops when the goal is met, when the score stops improving (`plateau`, after one [plateau rescue](#rescue-a-plateau) by default), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped on a judged build.
 
 ```powershell
 nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
@@ -211,14 +211,23 @@ Plans and OneShot templates take the same settings in a `pursue` block beside `w
 | `planner` | the judge | Plans each wave from the judged gaps. It stays read-only. |
 | `max_waves` | 3 (1–20) | Additional waves after the initial plan. |
 | `wave_size` | 3 (1–5) | Most milestones one wave may add. |
-| `target_score` | 85 (0–100) | The score a `MET` verdict must reach. Every ledger check must also pass. |
+| `target_score` | 85 (0–100) | The score a `MET` verdict must reach. Every ledger check must also pass. The controller applies it; no prompt ever shows it. |
+| `confirm` | true | A judgment that would finish the run is confirmed by one more independent judgment of the same build. |
+| `confirm_margin` | 3 (0–20) | The confirmation must say `MET` at `target_score` minus this or better. |
+| `confirm_judge` | the judge | Another route for the confirmation, which falls back to `judge_fallbacks`. |
 | `plateau` | 2 (1–5) | Consecutive judgments that fail to beat the best score before the pursuit stops. |
 | `regression_margin` | 5 (0–50) | A wave scoring this far below the best build is discarded and the best build restored. |
 | `references` | none | Up to six `.png`, `.jpg`, `.jpeg` or `.webp` images, relative to the plan file. |
 | `criteria` | the plan's `acceptance` | What defines done. The judge answers each one. |
 | `rescue` | on: 3 strategies, 1 rescue | What happens when the score plateaus. See [Rescue a plateau](#rescue-a-plateau). |
 
-The judge reads the source, the check logs and up to eight distinct screenshots from the ledger checks, plus any reference images. A pursuit stops with `wave_limit` when `max_waves` is spent, `plateau` when progress stalls, or `milestone_limit` at 50 milestones. It leaves the best build on `nightweaver/<run-id>`.
+The judge reads the source, the check logs and up to eight distinct screenshots from the ledger checks, plus any reference images. The ledger runs the checks that apply to the finished build: the plan's checks, its final checks and the checks retained from earlier milestones, not a check local to an earlier milestone. Each judgment keeps its own evidence folder, so one build's screenshots never reach another's judgment.
+
+Every judge scores against one fixed rubric: 95–100 exceptional, 85–94 finished with only polish-level gaps, 70–84 solid with visible gaps, 50–69 partial, below 50 major gaps. A judge told the pass mark returned exactly that mark in a real run, so `target_score` stays a threshold in the controller. `MET` needs every criterion fully met. When a judgment would finish the run, a second judge call looks at the same build in a fresh session with the screenshots in reverse order and without the first verdict. `MET` stands only if the confirmation also says `MET` at `target_score - confirm_margin` or better. Otherwise the pursuit records `met_unconfirmed`, continues as `NOT_MET` with the gaps of both judgments and scores the build by the lower of the two.
+
+Builds are ranked by whether every ledger check passed, then by score, so a build that fails its own checks never replaces a green one. A judgment lists at most 30 gaps and 60 criteria, and `criteria` or `acceptance` may name at most 60. Planned waves inherit every plan milestone's paths together, or no path limit when any milestone had none, and the planner is told those paths and the protected paths.
+
+A pursuit stops with `wave_limit` when `max_waves` is spent, `plateau` when progress stalls, or `milestone_limit` at 50 milestones. It leaves the best build on `nightweaver/<run-id>`. A milestone-limit stop cannot be extended with `--add-waves`.
 
 ### Rescue a plateau
 
@@ -248,7 +257,7 @@ nightweaver pursuit RUN_ID
 nightweaver pursuit RUN_ID --add-waves 2
 ```
 
-`pursuit` prints each wave with its milestones, the judgment, the top gaps, any failed ledger checks and any revert. Add `--json` for the same data as JSON. `--add-waves N` raises `max_waves` by N (1–20). A run that stopped at the judge goes back there with a fresh plateau count, so resume it or let the dispatcher continue it. `report` adds a Goal pursuit section and `handoff` lists the scores and open gaps. `doctor` and `preflight` check the judge, its fallbacks and the planner.
+`pursuit` prints each wave with its milestones, the judgment, the top gaps, any failed ledger checks and any revert. Add `--json` for the same data as JSON. `--add-waves N` raises `max_waves` by N (1–20). A run that stopped after judging a build goes back to the planner with that build's gaps and a fresh plateau count, because judging the same build again would add no evidence; resume it or let the dispatcher continue it. Milestones of a discarded wave are listed as discarded by `handoff` and `pursuit`, and `fork` and `replay` leave them out. `report` adds a Goal pursuit section and `handoff` lists the scores and open gaps. `doctor` and `preflight` check the judge, its fallbacks and the planner.
 
 ### Run unattended
 

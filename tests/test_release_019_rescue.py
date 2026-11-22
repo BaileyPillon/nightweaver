@@ -83,7 +83,8 @@ class RescueTests(unittest.TestCase):
     def stalled(self, *, judge=None, worker=None, planner=None, rescue=None, plateau=1, extra_pursue=None, **extra):
         """A pursuit that plateaus after its second judgment: 60, then 55. Two strategies by default."""
         block = {"judge": judge or self.table(), "planner": planner or self.sequence("planner", [plan("Next improvement")]), "plateau": plateau,
-                 "max_waves": 4, "rescue": {"strategies": 2} if rescue is None else rescue, **(extra_pursue or {})}
+                 "max_waves": 4, "rescue": {"strategies": 2} if rescue is None else rescue, "confirm": False,  # these tests count judge calls
+                 **(extra_pursue or {})}
         return self.configured((worker or self.builder())["argv"], pursue=block, **extra)
 
     def events(self, run, *kinds):
@@ -441,19 +442,18 @@ class RescueTests(unittest.TestCase):
         self.assertNotIn("Your previous answer was rejected", self.asked("table", DIAGNOSIS)[0], "the retry starts a fresh attempt")
 
     def test_the_best_build_is_shown_through_the_same_checks_as_the_strategies(self):
-        # The screenshot belongs to milestone 1 only; the last milestone, which every strategy is checked by, has none.
+        # The screenshot belongs to a check local to milestone 1. The ledger and every strategy run the checks of the finished build, which are
+        # the last milestone's, and those produce none.
         shot = {"name": "screenshot", "argv": [sys.executable, BUILD, "shot"], "timeout": 20, "artifacts": []}
         run = self.stalled(milestones=[{"title": "Prepare fixture", "task": "Set the value", "gates": [shot]}, {"title": "Polish it", "task": "Polish"}],
                            judge=self.table(order=[INCUMBENT, *NAMES[:2]]))
         self.assertEqual(Run(self.store, run).run(), "blocked")
-        (best_shot,) = self.events(run, "goal_judged")[0]["screenshots"]
+        self.assertEqual(self.events(run, "goal_judged")[0]["screenshots"], [], "the judgment ran the checks of the finished build, not milestone 1's own")
         self.assertEqual([b["screenshots"] for b in self.events(run, "rescue_candidate_built")], [[], []])
         self.assertEqual([c["screenshots"] for c in self.events(run, "rescue_incumbent_checked")], [0], "the best build gets only what the strategies get")
-        self.assertIn(f"- {best_shot}", self.asked("table", DIAGNOSIS)[0], "the diagnosis sees everything the judgment saw")
         comparisons = self.asked("table", COMPARE)
         self.assertEqual(len(comparisons), 4)
         for prompt in comparisons:
-            self.assertNotIn(best_shot, prompt, "a screenshotted incumbent against unscreenshotted strategies favors the incumbent")
             self.assertEqual(prompt.count("none were produced"), 2)
             self.assertNotIn("Only candidate", prompt)
 
