@@ -133,6 +133,10 @@ def diagnosis(store, run_id):
         "judge_invalid",
         "plan_invalid",
         "independence_degraded",
+        "directions_invalid",
+        "comparison_invalid",
+        "exploration_failed",
+        "exploration_skipped",
         "blocked",
         "model_mismatch",
     }

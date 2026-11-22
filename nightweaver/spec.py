@@ -52,7 +52,9 @@ def anchor_provider_paths(raw, folder):
         if isinstance(pursue.get("references"), list):
             pursue["references"] = [str((folder / Path(item).expanduser()).resolve()) if isinstance(item, str) and item.strip() else item
                                     for item in pursue["references"]]
-        routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5)]
+        explore = pursue.get("explore")
+        routes = [pursue.get("judge"), pursue.get("planner"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5),
+                  *(array(explore.get("workers", []), "explore workers", 4) if isinstance(explore, dict) else [])]
         for route in routes:
             if isinstance(route, dict):
                 for key in ("profile_dir", "api_key_file", "oauth_token_file"):
@@ -216,8 +218,27 @@ def gate_spec(item):
     return result
 
 
+def exploration(raw, relative_to):
+    """The design-direction tournament that runs before milestone 1. Workers default to milestone 1's worker (filled in by validate)."""
+    fields(raw, "directions workers brief comparisons", "pursue.explore")
+    out = {"directions": integer(raw.get("directions", 3), "directions", 2, 4)}
+    if "workers" in raw:
+        workers = array(raw["workers"], "explore workers", 4)
+        if not workers:
+            raise ValueError("explore workers must list at least one worker")
+        out["workers"] = [provider(item, IMPLEMENTERS, "explore worker", relative_to) for item in workers]
+    if "brief" in raw:
+        if not isinstance(raw["brief"], str) or not raw["brief"].strip() or len(raw["brief"]) > 4000:
+            raise ValueError("explore brief must be 1 to 4000 characters of guidance on how the directions should differ")
+        out["brief"] = raw["brief"].strip()
+    if raw.get("comparisons", "pairwise") not in ("pairwise", "single"):
+        raise ValueError("explore comparisons must be pairwise or single")
+    out["comparisons"] = raw.get("comparisons", "pairwise")
+    return out
+
+
 def pursuit(raw, relative_to, acceptance):
-    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria", "pursue")
+    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore", "pursue")
     if "judge" not in raw:
         raise ValueError("pursue requires a judge")
     judge = provider(raw["judge"], REVIEWERS, "judge", relative_to)
@@ -237,7 +258,7 @@ def pursuit(raw, relative_to, acceptance):
     criteria = raw.get("criteria", acceptance)
     if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
         raise ValueError("pursue criteria must be a list of nonempty strings")
-    return {"judge": judge,
+    return {"judge": judge, **({"explore": exploration(raw["explore"], relative_to)} if "explore" in raw else {}),
             "judge_fallbacks": [provider(p, REVIEWERS, "judge fallback", relative_to) for p in array(raw.get("judge_fallbacks", []), "judge_fallbacks", 5)],
             "planner": provider(raw["planner"], IMPLEMENTERS, "pursuit planner", relative_to) if "planner" in raw else dict(judge),
             "max_waves": integer(raw.get("max_waves", 3), "max_waves", 1, 20),
@@ -373,6 +394,8 @@ def validate(raw, relative_to=None, store=None):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
     if "pursue" in raw:
         out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
+        if "explore" in out["pursue"]:
+            out["pursue"]["explore"].setdefault("workers", [dict(steps[0]["worker"])])
     if "advisory_ollama" in raw:
         fields(raw["advisory_ollama"], "model port timeout max_tokens think required", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")

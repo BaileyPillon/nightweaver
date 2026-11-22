@@ -15,7 +15,7 @@ from .store import default_home
 from .safety import json_events, redact
 
 
-READ_ONLY = ("reviewer", "judge", "replanner", "brief")
+READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking")
 JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["verdict", "score", "criteria", "gaps", "reason"],
                 "properties": {"verdict": {"enum": ["MET", "NOT_MET"]}, "score": {"type": "integer", "minimum": 0, "maximum": 100},
                                "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": False,
@@ -29,9 +29,19 @@ WAVE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["mi
                "properties": {"milestones": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": False,
                               "required": ["title", "task"], "properties": {"title": {"type": "string"}, "task": {"type": "string"}}}},
                               "conflicts": {"type": "array", "items": {"type": "string"}}}}
+DIRECTIONS_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["directions"],
+                     "properties": {"directions": {"type": "array", "minItems": 2, "maxItems": 4, "items": {
+                         "type": "object", "additionalProperties": False, "required": ["name", "brief"],
+                         "properties": {"name": {"type": "string"}, "brief": {"type": "string"}}}}}}
+COMPARISON_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["winner", "reason"],
+                     "properties": {"winner": {"enum": ["A", "B", "tie"]}, "reason": {"type": "string"}}}
+RANKING_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ranking", "reason"],
+                  "properties": {"ranking": {"type": "array", "minItems": 2, "maxItems": 4, "items": {"type": "string"}},
+                                 "reason": {"type": "string"}}}
 SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "required": ["verdict", "reason"],
                         "properties": {"verdict": {"enum": ["PASS", "REVISE"]}, "reason": {"type": "string"}}},
-           "judge": JUDGE_SCHEMA, "replanner": WAVE_SCHEMA}
+           "judge": JUDGE_SCHEMA, "replanner": WAVE_SCHEMA, "directions": DIRECTIONS_SCHEMA, "comparison": COMPARISON_SCHEMA,
+           "ranking": RANKING_SCHEMA}
 
 
 class ProviderUnavailable(ValueError):

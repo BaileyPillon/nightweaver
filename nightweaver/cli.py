@@ -252,6 +252,13 @@ def route_config(kind, profile, model, effort, label, choices=IMPLEMENTERS):
     return provider(config, choices, label)
 
 
+EXPLORERS = ("codex", "claude", "deepseek", "gemini")
+
+
+def explore_kinds(args):
+    return [kind.strip() for kind in args.explore_workers.split(",")]
+
+
 def pursuit_block(args):
     judge = args.judge or ("claude" if args.worker != "claude" else "codex")
     block = {"judge": route_config(judge, args.judge_profile, args.judge_model, args.judge_effort, "judge", REVIEWERS)}
@@ -262,6 +269,13 @@ def pursuit_block(args):
             block[key] = value
     if args.reference:
         block["references"] = [str(Path(item).expanduser().resolve()) for item in args.reference]
+    if args.explore is not None:
+        block["explore"] = {"directions": args.explore}
+        if args.explore_workers:
+            # The primary worker's kind keeps its profile, model and effort; any other kind starts from the CLI's own defaults.
+            block["explore"]["workers"] = [
+                route_config(kind, *((args.profile_dir, args.model, args.effort) if kind == args.worker else (None, None, None)), "explore worker")
+                for kind in explore_kinds(args)]
     return block
 
 
@@ -358,6 +372,10 @@ def main(argv=None):
     one.add_argument("--target-score", type=int, help="Judge score from 0 to 100 that counts as done (default 85)")
     one.add_argument("--reference", action="append", default=[], metavar="IMAGE",
                      help="Reference image the judge compares screenshots with (repeatable, at most 6)")
+    one.add_argument("--explore", type=int, metavar="N",
+                     help="Before milestone 1, build N divergent design directions, compare them and keep the winner (2 to 4; requires --pursue)")
+    one.add_argument("--explore-workers", metavar="KIND[,KIND...]",
+                     help="Workers that build the directions in turn: codex, claude, deepseek or gemini (default: the primary worker)")
     launch_one = one.add_mutually_exclusive_group()
     launch_one.add_argument("--preview", action="store_true", help="Print the reusable plan and its checks without calling a model")
     launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
@@ -656,7 +674,7 @@ def main(argv=None):
         if action == "list":
             p.add_argument("--compact", action="store_true", help="Return sidebar summaries without prompts and gate definitions")
         p.add_argument("--project")
-        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","judging","planning","done","blocked"))
+        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","planning","done","blocked"))
     args = app.parse_args(argv)
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
@@ -672,7 +690,8 @@ def main(argv=None):
         extras = [flag for flag, value in (("--judge", args.judge), ("--judge-model", args.judge_model), ("--judge-effort", args.judge_effort),
                   ("--judge-profile", args.judge_profile), ("--planner-kind", args.planner_kind), ("--planner-model", args.planner_model),
                   ("--planner-effort", args.planner_effort), ("--planner-profile", args.planner_profile), ("--waves", args.waves),
-                  ("--target-score", args.target_score), ("--reference", args.reference)) if value]
+                  ("--target-score", args.target_score), ("--reference", args.reference), ("--explore", args.explore is not None),
+                  ("--explore-workers", args.explore_workers)) if value]
         if extras:
             app.error(f"{', '.join(extras)} require --pursue")
     if args.command == "oneshot":
@@ -680,6 +699,10 @@ def main(argv=None):
             app.error("--planner-model, --planner-effort and --planner-profile require --planner-kind")
         if not args.reviewer and (args.reviewer_model or args.reviewer_effort or args.reviewer_profile):
             app.error("--reviewer-model, --reviewer-effort and --reviewer-profile require --reviewer")
+        if args.explore_workers and args.explore is None:
+            app.error("--explore-workers requires --explore")
+        if args.explore_workers and any(kind not in EXPLORERS for kind in explore_kinds(args)):
+            app.error("--explore-workers takes a comma-separated list of: " + ", ".join(EXPLORERS))
     if args.command == "events":
         if args.before is not None and (args.after is not None or args.until is not None or args.before < 1):
             app.error("--before requires a positive exclusive cursor and cannot combine with --after or --until")
