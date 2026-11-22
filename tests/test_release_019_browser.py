@@ -22,7 +22,7 @@ from nightweaver.store import Store
 
 MISSING = "BrowserType.launch: Executable doesn't exist at C:\\pw\\chrome-headless-shell.exe\n+---+\n| Please run: playwright install |\n+---+"
 NOT_FOUND = "BrowserType.launch: Chromium distribution 'msedge' is not found at C:\\Edge\\msedge.exe\nRun \"playwright install msedge\""
-SMOKE = {"name": "Browser smoke", "kind": "browser", "browser": {"page": "index.html"}}
+SMOKE = {"name": "Browser smoke", "kind": "browser", "browser": {"page": "index.html", "sweep": {}}}
 PAGE = ('<!doctype html><html lang="en"><meta name="viewport" content="width=device-width,initial-scale=1">'
         '<link rel="icon" href="data:,"><title>Smoke</title><style>body{margin:0;font:20px sans-serif}</style>'
         "<main><h1>Smoke fixture</h1><p>Hello</p></main></html>")
@@ -304,10 +304,10 @@ class SmokeDiscoveryTests(unittest.TestCase):
 
     def test_public_and_docs_pages_are_accepted_in_priority_order(self):
         self.assertEqual(self.discover({"public/index.html": PAGE, "docs/index.html": PAGE})["gates"][0]["browser"],
-                         {"page": "public/index.html"})
-        self.assertEqual(self.discover({"docs/index.html": PAGE})["gates"][0]["browser"], {"page": "docs/index.html"})
+                         {"page": "public/index.html", "sweep": {}})
+        self.assertEqual(self.discover({"docs/index.html": PAGE})["gates"][0]["browser"], {"page": "docs/index.html", "sweep": {}})
         self.assertEqual(self.discover({"index.html": PAGE, "public/index.html": PAGE})["gates"][0]["browser"],
-                         {"page": "index.html"})
+                         {"page": "index.html", "sweep": {}})
 
     def test_a_new_repository_targets_the_page_the_worker_will_create(self):
         for files in ({"README.md": "# New", "LICENSE": "MIT", ".gitignore": "node_modules/\n"}, {".gitkeep": ""}, {}):

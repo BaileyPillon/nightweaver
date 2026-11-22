@@ -325,6 +325,11 @@ def read_browser_evidence(config, out, receipt, max_bytes):
             )
     if report["passed"] == bool(failures):
         raise ValueError("Browser verdict disagrees with viewport results")
+    if "sweep" in config:
+        from .sweep import validate_receipt
+        receipt["browser_sweep"] = validate_receipt(config["sweep"], report, nonempty_files, report["passed"])
+    elif any(key.startswith("sweep") for key in report):
+        raise ValueError("Browser receipt carries sweep evidence the plan did not ask for")
     receipt["browser_coverage"] = coverage
     if failures:
         receipt["browser_failures"] = failures

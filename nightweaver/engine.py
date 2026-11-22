@@ -858,7 +858,7 @@ class Run:
 
     def review_material(self, path, state, evidence):
         """The real change as a saved patch with an inline excerpt, and the screenshots this attempt produced."""
-        from .pursuit import screenshots
+        from .pursuit import image_block, screenshots
         raw = git_bytes(path, "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", state["accepted"])
         cap = 400 * 1024
         body = raw[:cap]
@@ -872,7 +872,7 @@ class Run:
         images = screenshots(evidence)
         if images:
             text += ("\n\nScreenshots produced by this attempt's checks. OPEN each image file listed here with your file-reading tool "
-                     "and judge what you actually see, not what any log claims:\n" + "\n".join(f"- {image}" for image in images))
+                     "and judge what you actually see, not what any log claims:\n" + image_block(images))
         return text, images
 
     def independence(self, state, role, config, worker):
