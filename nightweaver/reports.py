@@ -119,9 +119,19 @@ def _metrics(store, run_id):
         pursuit = {"waves": row["state"].get("wave", 1), "judgments": len(judged), "last_score": judged[-1]["score"] if judged else None,
                    "best_score": row["state"].get("best_score"), "goal_met": "goal_met" in kinds, "reverts": kinds.count("pursuit_reverted"),
                    "stop_reason": stopped["reason"] if stopped and phase == "blocked" else None}
+    exploration = None
+    if {"direction_planned", "exploration_skipped"} & set(kinds):
+        chosen = next((e["details"] for e in reversed(events) if e["kind"] == "direction_chosen"), None)
+        exploration = {"directions": kinds.count("direction_planned"), "built": kinds.count("direction_built"),
+                       "failed": kinds.count("direction_failed"), "comparisons": kinds.count("direction_compared"),
+                       "winner": chosen["winner"] if chosen else None, "chosen_by": chosen["chosen_by"] if chosen else None,
+                       "position_bias_pairs": len(chosen["position_bias_pairs"]) if chosen else 0,
+                       "outcome": "chosen" if chosen else "failed" if "exploration_failed" in kinds else
+                                  "skipped" if "exploration_skipped" in kinds else "in progress"}
     return {
         **recovery_metrics(events),
         **({"pursuit": pursuit} if pursuit else {}),
+        **({"exploration": exploration} if exploration else {}),
         "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
@@ -192,6 +202,11 @@ def _run_report(store, run_id, output, include_images):
             value = (f"{value['waves']} waves, {value['judgments']} judgments, last {value['last_score']}, best {value['best_score']}, "
                      f"{'goal met' if value['goal_met'] else 'stopped: ' + value['stop_reason'] if value['stop_reason'] else 'in progress'}, "
                      f"{value['reverts']} reverts")
+        elif key == "exploration":
+            value = (f"{value['outcome']}: {value['built']} of {value['directions']} directions passed their checks, "
+                     f"{value['comparisons']} judge comparisons"
+                     + (f", direction {value['winner']} chosen by {value['chosen_by']}" if value["winner"] else "")
+                     + (f", position bias in {value['position_bias_pairs']} pairs" if value["position_bias_pairs"] else ""))
         elif key == "provider_usage":
             value = " · ".join(f"{r['role']} / {r['provider']} ({r['model'] or 'default'}), "
                                f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
@@ -211,6 +226,22 @@ def _run_report(store, run_id, output, include_images):
             body += (f'<tr><td>{wave["wave"]}</td><td>{escape("; ".join(m["title"] for m in wave["milestones"]))}</td>'
                      f'<td>{escape(summary)}</td><td>{escape(gaps)}</td></tr>')
         body += '</tbody></table></div>'
+        if data.get("exploration"):
+            ex = data["exploration"]
+            body += (f'<h2>Design exploration</h2><p>{escape(ex["status"].replace("_", " ").capitalize())}'
+                     + (f' · winner chosen by {escape(str(ex["chosen_by"]))}' if ex["chosen_by"] else "")
+                     + f' · {ex["judge_calls"]} judge calls'
+                     + (' · position bias in pairs ' + escape(", ".join(f"{a} vs {b}" for a, b in ex["position_bias_pairs"])) if ex["position_bias_pairs"] else "")
+                     + (f' · {escape(str(ex["reason"]))}' if ex["reason"] else "")
+                     + '</p><div class="table"><table><thead><tr><th>Direction</th><th>Worker</th><th>Checks</th><th>Score</th><th>Result</th>'
+                       '</tr></thead><tbody>')
+            for row in ex["directions"]:
+                worker = row["worker"] or {}
+                checks = "Not built yet" if row["passed"] is None else "Passed" if row["passed"] else "Failed: " + str(row["reason"] or "")[:160]
+                body += (f'<tr><td>{row["index"]}. {escape(row["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
+                         f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
+                         f'<td>{"" if row["score"] is None else format(row["score"], "g")}</td><td>{"Winner" if row["winner"] else ""}</td></tr>')
+            body += '</tbody></table></div>'
     from .junit import history
     observations = history(store, run_id)["observations"]
     if observations:

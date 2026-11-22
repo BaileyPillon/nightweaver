@@ -437,7 +437,10 @@ def report(store, run_id):
                          "failed_checks": [c["name"] for c in judged["ledger"] if not c["passed"]]},
                       "reverted": reverted})
     stopped = next((e["details"] for e in reversed(events) if e["kind"] == "pursuit_stopped"), None)
+    from .explore import report as exploration
+    explored = exploration(store, run_id) if pursue.get("explore") else None
     return redact({"run_id": run_id, "title": spec["title"], "objective": spec["objective"], "phase": state["phase"], "paused": row["pause"],
+                   **({"exploration": explored} if explored else {}),
                    "wave": state.get("wave", 1), "max_waves": pursue["max_waves"], "target_score": pursue["target_score"],
                    "best_score": state.get("best_score"), "best_commit": state.get("best_commit"),
                    "result_branch": state.get("result_ref", "").removeprefix("refs/heads/"), "accepted": state["accepted"],
@@ -452,6 +455,9 @@ def format_report(data):
              f"Phase {data['phase']}{' (paused)' if data['paused'] else ''} - wave {data['wave']} of at most {data['max_waves'] + 1} - "
              f"best score {data['best_score'] if data['best_score'] is not None else 'none yet'} (target {data['target_score']}) - result {data['result_branch']}",
              f"Goal: {data['objective']}"]
+    if data.get("exploration"):
+        from .explore import format_lines
+        lines += format_lines(data["exploration"])
     for wave in data["waves"]:
         lines += ["", f"Wave {wave['wave']}" + (f" (planned by {wave['planned_by'].get('kind')})" if wave["planned_by"] else " (initial plan)")]
         lines += [f"  {m['step']}. {m['title']} - " + (f"accepted {m['commit'][:12]}" if m["accepted"] else "not accepted") for m in wave["milestones"]]

@@ -137,6 +137,8 @@ def fork_run(store, run_id, milestone, worker=None):
     verify_project_binding(store, spec, repo, gitdir)
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
+    if milestone and spec.get("pursue", {}).get("explore"):
+        spec["pursue"] = {k: v for k, v in spec["pursue"].items() if k != "explore"}  # the tournament picks a first milestone's direction
     pack = context.capture(spec, base)
     new_id = store.create(spec, base, context_pack=pack)
     store.transition(new_id, "checkpoint_forked", {"source_run": run_id, "milestone": milestone, "base": base})
@@ -369,6 +371,10 @@ class Run:
 
     def evidence_dir(self, state):
         return self.root / "evidence" / f"{state['step'] + 1:02d}" / f"{state['attempt']:02d}"
+
+    def explores(self, state):
+        """Whether milestone 1 starts with the design-direction tournament that this run has not yet held."""
+        return bool(self.spec.get("pursue", {}).get("explore")) and state["step"] == 0 and not state.get("explored")
 
     def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, finding=None, **state):
         from .repair import blocked_message, cause_line, describe, fingerprint, next_worker
@@ -640,8 +646,8 @@ class Run:
                  blocked_from="checking", last_error=reason)
         return None
 
-    def observe_gate(self, check, path, state, step, snapshot, location):
-        folder = evidence_folder(self.evidence_dir(state), location["gate_index"])
+    def observe_gate(self, check, path, state, step, snapshot, location, evidence=None):
+        folder = evidence_folder(evidence or self.evidence_dir(state), location["gate_index"])
         log = folder / "gate.log"
         self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
                  "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
@@ -682,6 +688,9 @@ class Run:
         evidence = self.evidence_dir(state)
         try:
             raw = (evidence / "checks.json").read_bytes()
+            # The manifest of a direction that won the exploration tournament holds receipts from that direction's evidence folder.
+            won = state.get("exploration") or {}
+            root = Path(won["evidence"]) if state["step"] == 0 and won.get("evidence") and won.get("checks_sha256") == hashlib.sha256(raw).hexdigest() else evidence
             if state.get("checks_sha256") and hashlib.sha256(raw).hexdigest() != state["checks_sha256"]:
                 raise ValueError("The accepted check manifest changed")
             checks = json.loads(raw)
@@ -692,7 +701,7 @@ class Run:
                     raise ValueError("The legacy check manifest does not match its recorded verification")
             for receipt in checks:
                 for sample in [receipt, *receipt.get("prior_mixed_round", [])]:
-                    verify_saved_sample(sample, evidence)
+                    verify_saved_sample(sample, root)
             return raw.decode("utf-8")
         except (ValueError, OSError, KeyError) as error:
             self.set("blocked", {"during": "checking", "issue": str(error)}, phase="blocked",
@@ -954,6 +963,10 @@ class Run:
                         from . import pursuit
                         (pursuit.judge if phase == "judging" else pursuit.plan_wave)(self, state)
                         continue
+                    if phase in ("queued", "ready", "exploring") and self.explores(state):
+                        from . import explore
+                        explore.advance(self, state)
+                        continue
                     path = self.worktree(state)
                     if phase == "working":
                         log = Path(state["log"])
@@ -990,10 +1003,15 @@ class Run:
                     current = self.store.get(self.id)["state"]
                     actual = current["phase"]
                     role = {"reviewing": "reviewer", "judging": "judge", "planning": "planner"}.get(actual, "worker")
-                    config = self.route(current, step, role)
+                    if actual == "exploring":
+                        from . import explore
+                        role, config = explore.active_route(self, current)
+                    else:
+                        config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}
                     pursue = self.spec.get("pursue", {})
-                    routes = {"worker": (step or {}).get("worker_fallbacks", []), "reviewer": self.spec.get("reviewer_fallbacks", []),
+                    routes = {"worker": [] if actual == "exploring" else (step or {}).get("worker_fallbacks", []),
+                              "reviewer": self.spec.get("reviewer_fallbacks", []),
                               "judge": pursue.get("judge_fallbacks", []), "planner": []}[role]
                     index = current.get(role + "_route", 0)
                     next_phase = "ready" if actual == "working" else actual

@@ -240,7 +240,7 @@ def _database_check(file):
                     "invalid run state": """SELECT count(*) FROM runs WHERE json_type(state)!='object'
                         OR json_type(spec)!='object' OR coalesce(json_type(state,'$.step'),'')!='integer'
                         OR coalesce(json_extract(state,'$.phase'),'') NOT IN
-                        ('queued','ready','working','checking','reviewing','promoting','judging','planning','blocked','done')""",
+                        ('queued','ready','exploring','working','checking','reviewing','promoting','judging','planning','blocked','done')""",
                     "invalid milestone cursor": """SELECT count(*) FROM runs WHERE
                         coalesce(json_type(spec,'$.milestones'),'') != 'array'
                         OR json_array_length(spec,'$.milestones') < 1
