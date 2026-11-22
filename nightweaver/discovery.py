@@ -127,6 +127,35 @@ SERVED_SCRIPTS = ("dev", "start", "preview", "serve")
 INERT_FILES = re.compile(
     r"(?i)(?:readme|licen[cs]e|copying|notice)(?:\.[a-z]+)?|\.(?:gitignore|gitattributes|editorconfig|gitkeep|keep)"
 )
+# Words that make a goal a web page, for a new repository that has no page yet.
+WEB_GOAL = re.compile(
+    r"(?i)\b(?:web(?:s?ite|page|app)?s?|pages?|sites?|html5?|css|browsers?|u[ix]|guis?|landing|dashboards?|canvas|svg|webgl"
+    r"|front-?end|visuals?|visually|responsive|layouts?|stylesheets?)\b"
+)
+CODE_SUFFIXES = frozenset(
+    ".py .js .mjs .cjs .ts .tsx .jsx .go .rs .rb .php .java .kt .kts .scala .cs .fs .vb .swift .c .cc .cpp .h .hpp .ex .exs "
+    ".erl .hs .clj .dart .lua .pl .r .sh .ps1".split()
+)
+TEST_STEM = re.compile(r"(?i)(?:tests?|test[_.-].*|.*[_.-](?:tests?|spec)|.*\.(?:test|spec))")
+CAMEL_TEST_STEM = re.compile(r".*[a-z0-9]Tests?")
+TEST_FOLDERS = frozenset({"test", "tests", "__tests__", "spec", "specs", "e2e", "cypress"})
+# Build or test manifests of ecosystems this discovery does not run. Their presence means the project has tests of its own.
+FOREIGN_MANIFESTS = frozenset(
+    "go.mod Cargo.toml pom.xml build.gradle build.gradle.kts settings.gradle settings.gradle.kts build.sbt Gemfile Rakefile "
+    "composer.json mix.exs CMakeLists.txt Package.swift deno.json deno.jsonc tox.ini pytest.ini .pytest.ini pytest.toml "
+    ".pytest.toml noxfile.py".split()
+)
+FOREIGN_PROJECTS = (".sln", ".csproj", ".fsproj", ".vbproj")
+# Files that count as evidence only when their text names a test runner or a test target.
+CONFIGURED_TESTS = {
+    name: re.compile(r"(?im)^(?:test|tests|check)[\w.-]*\s*:")
+    for name in ("makefile", "gnumakefile", "justfile")
+} | {name: re.compile(r"(?i)\b(?:pytest|tox|nox|unittest)\b") for name in ("pyproject.toml", "setup.cfg")}
+
+
+def web_goal(objective):
+    """True when the objective names a web deliverable: a page, site, browser, styling or visual."""
+    return bool(WEB_GOAL.search(objective))
 
 
 def served_by_script(scripts):
@@ -135,31 +164,83 @@ def served_by_script(scripts):
     )
 
 
-def static_page(blobs, scripts):
+def has_test_marks(path):
+    """Whether a path is itself a test file, or a build or test manifest of an ecosystem discovery cannot run."""
+    pure = PurePosixPath(path)
+    if pure.suffix in CODE_SUFFIXES and (
+        TEST_STEM.fullmatch(pure.stem)
+        or CAMEL_TEST_STEM.fullmatch(pure.stem)
+        or not TEST_FOLDERS.isdisjoint(part.lower() for part in pure.parts[:-1])
+    ):
+        return True
+    return pure.name in FOREIGN_MANIFESTS or pure.suffix in FOREIGN_PROJECTS
+
+
+def foreign_tests(sources, js_files, contents):
+    """Paths showing tests that discovery found but cannot run, sorted. None means a smoke gate cannot replace anything."""
+    found = set(js_files)
+    for path in sources:
+        name = PurePosixPath(path).name
+        if has_test_marks(path):
+            found.add(path)
+        elif (pattern := CONFIGURED_TESTS.get(name.lower())) is not None:
+            try:
+                if pattern.search(contents(path)):
+                    found.add(path)
+            except ValueError:
+                found.add(path)  # Too large or not text: tests cannot be ruled out.
+    return sorted(found)
+
+
+def static_page(blobs, scripts, web=None):
     """The page a browser smoke check can load for a web repository without tests, or None."""
     if served_by_script(scripts):
         return None  # A bundler or framework serves this project, so a bare file server cannot render its index.html.
     page = next((p for p in STATIC_PAGES if p in blobs), None)
-    if page is None and all(INERT_FILES.fullmatch(p) for p in blobs):
-        page = "index.html"  # A new repository: the worker creates the page.
+    if page is None and web and new_repository(blobs):
+        page = "index.html"  # A new repository whose goal is a web page: the worker creates it.
     return page
 
 
+def new_repository(blobs):
+    return all(INERT_FILES.fullmatch(p) for p in blobs)
+
+
+def page_root(page):
+    """Where a static page is served from. A site kept in public/ or docs/ is deployed with that folder as its root."""
+    folder = PurePosixPath(page).parent.as_posix()
+    return None if folder == "." else folder
+
+
 def smoke_gate(page):
-    return {"name": "Browser smoke", "kind": "browser", "browser": {"page": page, "sweep": {}}}
+    root = page_root(page)
+    return {"name": "Browser smoke", "kind": "browser",
+            "browser": {"page": page, **({"root": root} if root else {}), "sweep": {}}}
 
 
-def missing_suite(scripts):
+def missing_suite(scripts, unrun=(), new=False):
     if served_by_script(scripts):
         return (
             "No supported committed test suite found. This web project is served by a package.json script, which OneShot "
             "cannot start by itself. Use a Nightweaver template with a browser check that owns the server, for example "
             '{"name": "Browser smoke", "kind": "browser", "browser": {"server": {"argv": ["<executable>", "<server script>", "{port}"]}}}.'
         )
+    if unrun:
+        return (
+            f"No supported committed test suite found. This repository has tests or a build OneShot cannot run ({', '.join(unrun[:4])}"
+            f"{', and more' if len(unrun) > 4 else ''}), so it will not stand in a browser smoke check for them. Use a Nightweaver "
+            'template with a gate that runs them, for example {"name": "Project tests", "argv": ["<test command>"]}.'
+        )
+    if new:
+        return (
+            "No supported committed test suite found. This repository is new and the goal does not name a web page, so there is "
+            "nothing to check yet. Use a Nightweaver template with an explicit check, or pass --web if the goal is a web page."
+        )
     return "No supported committed test suite found. Use a Nightweaver template with an explicit check."
 
 
-def discover(repository, objective, worker, rescue=None, python=None):
+def discover(repository, objective, worker, rescue=None, python=None, web=None):
+    """`web` says the goal is a web page. Only a brand-new repository needs it: None and False give it no smoke gate."""
     root, _ = checkout(Path(repository).resolve(strict=True))
     interpreter = (
         str(Path(python).expanduser().resolve(strict=True))
@@ -375,12 +456,13 @@ def discover(repository, objective, worker, rescue=None, python=None):
             and next((d for d in PurePosixPath(p).parents if d in project_dirs), None)
             == folder
         )
-    page = None if gates else static_page(blobs, scripts)
+    unrun = [] if gates else foreign_tests(sources, js_files, contents)
+    page = None if gates or unrun else static_page(blobs, scripts, web)
     if placeholder and (gates or not page):
         raise ValueError(placeholder)
     if not gates:
         if not page:
-            raise ValueError(missing_suite(scripts))
+            raise ValueError(missing_suite(scripts, unrun, new_repository(blobs)))
         # A web page without tests still gets loaded in a desktop and a phone viewport, and its visible controls get clicked, with screenshots kept as evidence.
         gates.append(smoke_gate(page))
     if len(protected) > 4096:

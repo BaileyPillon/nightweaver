@@ -287,7 +287,7 @@ def say(text):
 def run_wish(store, args):
     """Brief writer, template, saved files and an optional launch through the ordinary goal path. Returns the exit code."""
     from . import cli
-    from .discovery import discover, verify_tools
+    from .discovery import discover, verify_tools, web_goal
     wish = " ".join(args.wish.split())
     if not wish or len(wish) > 4000:
         raise ValueError("Give the wish as one nonempty line of at most 4000 characters")
@@ -297,7 +297,8 @@ def run_wish(store, args):
         raise ValueError("--guard-restarts requires --start")
     root, project = resolve(store, args.target)
     routes, writer = roster(args.roster), brief_route(args)
-    plan = discover(root, wish, routes["worker"])
+    # Only a brand-new repository depends on this hint. The brief is not written yet, so the wish's own words stand in until the brief's visual flag can overrule them.
+    plan = discover(root, wish, routes["worker"], web=web_goal(wish))
     # Everything that can be refused cheaply is refused before the brief writer spends a model call.
     validate(assemble(plan, {"title": plan["title"], "objective": wish, "acceptance": [], "visual": False}, routes, args, None, project), store=store)
     if args.start:
@@ -306,6 +307,8 @@ def run_wish(store, args):
     folder = store.root / "wishes" / wish_id
     folder.mkdir(parents=True)
     brief, log, attempts = write_brief(writer, plan, wish, folder)
+    if not brief["visual"] and [gate["name"] for gate in plan["gates"]] == ["Browser smoke"]:
+        plan = discover(root, wish, routes["worker"], web=False)  # The brief judged the goal not visual: a new repository gets no page to build.
     advisory, note = ollama_advisory() if args.roster == "default" else (None, None)
     notes = [note] if note else []
     template = assemble(plan, brief, routes, args, advisory, project)

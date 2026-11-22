@@ -349,6 +349,8 @@ def main(argv=None):
     one.add_argument("--model", help="Model for the primary worker and planner")
     one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
     one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
+    one.add_argument("--web", action=argparse.BooleanOptionalAction,
+                     help="The goal is a web page, so a new repository gets a browser smoke check (default: judged from the objective)")
     one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
     one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
     one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
@@ -757,7 +759,7 @@ def main(argv=None):
             output(repair_history(store, args.id))
             return 0
         if name == "oneshot":
-            from .discovery import discover, verify_tools
+            from .discovery import discover, verify_tools, web_goal
             if args.rescue_profile and not args.rescue:
                 raise ValueError("--rescue-profile requires --rescue")
             args.planner = args.worker
@@ -767,7 +769,8 @@ def main(argv=None):
                 alternate["profile_dir"] = str(Path(args.rescue_profile).expanduser().resolve())
             if worker == alternate:
                 raise ValueError("Choose a distinct rescue provider or profile")
-            raw = discover(args.repository, args.objective, worker, alternate, args.python)
+            raw = discover(args.repository, args.objective, worker, alternate, args.python,
+                           web=web_goal(args.objective) if args.web is None else args.web)
             if args.reviewer:
                 raw["reviewer"] = route_config(args.reviewer, args.reviewer_profile, args.reviewer_model, args.reviewer_effort, "reviewer", REVIEWERS)
             if args.pursue:

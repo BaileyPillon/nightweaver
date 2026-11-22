@@ -364,7 +364,7 @@ class WishTests(unittest.TestCase):
         self.writer([fenced()])
         self.cli("wish", site, "Calm the page", "--preview")
         saved, template, _ = self.saved()
-        self.assertEqual(template["gates"], [{"name": "Browser smoke", "kind": "browser", "browser": {"page": "index.html"}}])
+        self.assertEqual(template["gates"], [{"name": "Browser smoke", "kind": "browser", "browser": {"page": "index.html", "sweep": {}}}])
         self.assertEqual(template["acceptance"][:5], ACCEPTANCE)
         self.assertIn("390x844", template["acceptance"][5])
         self.assertEqual(template["pursue"]["criteria"], template["acceptance"])

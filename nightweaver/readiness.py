@@ -150,7 +150,8 @@ def browser_readiness():
                 f"Install Chromium there with {hint}, or unset PLAYWRIGHT_BROWSERS_PATH."}
     if system:
         return {**result, "status": "ready_fallback", "channel": system,
-                "action": f"Bundled Chromium is missing, so browser gates use the installed {system}. To use Chromium instead: {hint}"}
+                "action": f"Bundled Chromium is missing, so browser gates use the installed {system}, except gates with visual_match "
+                f"baselines, which fail closed because pixels differ between browsers. To use Chromium instead: {hint}"}
     return {**result, "status": "unavailable", "action": f"Install a browser: {hint}, or install Microsoft Edge or Google Chrome"}
 
 
