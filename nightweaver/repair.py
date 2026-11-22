@@ -4,7 +4,7 @@ import hashlib
 
 from .spec import fields, integer
 
-FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google", "command": "custom"}
+FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google"}
 
 
 def policy(raw):
@@ -103,7 +103,8 @@ def combined_failure(failures):
 
 
 def family(route):
-    return FAMILIES.get(route.get("kind"), route.get("kind"))
+    """The vendor family of a route, or None when it is not known: a command route may wrap any vendor or none."""
+    return FAMILIES.get(route.get("kind"))
 
 
 def fingerprint(phase, signature, failed_gates=(), exit_code=None, reason="", feedback=0):
