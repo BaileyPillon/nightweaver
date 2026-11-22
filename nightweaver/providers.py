@@ -182,6 +182,13 @@ def claude_auth(config=None):
     return None, "cli_login" if (profile / ".credentials.json").is_file() else "none"
 
 
+def isolated_claude(config):
+    """Nightweaver's own Claude config dir, used with a long-lived token unless the operator chose a profile."""
+    if config.get("profile_dir") or os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("NIGHTWEAVER_CLAUDE_SHARED_CONFIG") == "1":
+        return None
+    return default_home() / "profiles" / "claude"
+
+
 def provider_executable(config):
     kind = config["kind"]
     if kind == "command":
@@ -209,6 +216,11 @@ def describe_provider(config):
     if kind == "command":
         return {"provider": kind, "executable": provider_executable(config)}
     profile = profile_override(config)
+    if not profile and kind == "claude" and isolated_claude(config):
+        try:
+            profile = isolated_claude(config) if claude_auth(config)[0] else None
+        except ProviderUnavailable:
+            profile = None
     if not profile:
         profile = (default_home() / "profiles" / "deepseek" if kind == "deepseek" else
                    Path.home() if kind == "gemini" else Path.home() / f".{kind}")
@@ -288,6 +300,11 @@ def adapter(config, mode, session=None, images=()):
         token, _ = claude_auth(config)
         if token:
             env[OAUTH_VARIABLE] = token
+            if isolated_claude(config):
+                # The operator's interactive CLAUDE.md, skills and settings (e.g. "delegate to background
+                # subagents") must not steer an unattended run; the token authenticates in any config dir.
+                isolated_claude(config).mkdir(parents=True, exist_ok=True)
+                env["CLAUDE_CONFIG_DIR"] = str(isolated_claude(config))
     if kind == "deepseek":
         key = deepseek_key(config)
         model = model or "deepseek-flash"
