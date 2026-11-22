@@ -342,8 +342,11 @@ public partial class MainWindow : Window
         {
             var spec = data.GetProperty("spec");
             var state = data.GetProperty("state");
-            int step = state.GetProperty("step").GetInt32();
-            int count = data.GetProperty("total_milestones").GetInt32();
+            // A goal pursuit counts the milestones of waves a revert discarded in its plan, but they are not part of the build.
+            int lost = state.TryGetProperty("discarded", out var discarded) && discarded.TryGetInt32(out int dropped) ? dropped : 0;
+            bool pursuit = state.TryGetProperty("pursuit", out var pursuing) && pursuing.ValueKind == JsonValueKind.True;
+            int step = Math.Max(0, state.GetProperty("step").GetInt32() - lost);
+            int count = Math.Max(0, data.GetProperty("total_milestones").GetInt32() - lost);
             string phase = Get(state, "phase");
             bool pause = data.GetProperty("pause").GetBoolean();
             bool supervised = data.TryGetProperty("guard_active", out var guard) && guard.GetBoolean();
@@ -365,7 +368,16 @@ public partial class MainWindow : Window
             if (state.TryGetProperty("retry_at", out var retryAt) && retryAt.ValueKind == JsonValueKind.String &&
                 DateTimeOffset.TryParse(retryAt.GetString(), out var retryTime) && retryTime > DateTimeOffset.Now && !pause)
                 subtitle = $"Retry at {retryTime.ToLocalTime():HH:mm:ss} · {step}/{count} accepted";
-            string current = step < count ? Get(data, "current_milestone") : "All milestones accepted";
+            // Every milestone of a pursuit can be accepted while its goal is still being judged, planned or missed.
+            string current = step < count ? Get(data, "current_milestone") : !pursuit ? "All milestones accepted" : phase switch
+            {
+                "judging" => "Judging the finished build",
+                "planning" => "Planning the next wave",
+                "rescuing" => "Rescuing a stalled pursuit",
+                "done" => "Goal met",
+                "blocked" => "Goal not met yet",
+                _ => "Milestones accepted",
+            };
             if (prerequisites.Length > 0)
                 current += $"\nWaiting for {string.Join(", ", prerequisites)}";
             string error = Get(state, "last_error");
@@ -449,7 +461,8 @@ public partial class MainWindow : Window
                 "pursuit_reverted" => $"Discarded work kept at {Read("discarded_ref").Replace("refs/heads/", "")}",
                 "pursuit_stopped" => (Read("best_commit").Length > 0
                     ? $"Best build {ShortCommit(Read("best_commit"))} stays on the result branch." : "No judged build to keep.") +
-                    " Add waves with the pursuit command to continue.",
+                    (Read("reason") == "milestone_limit" ? " More waves cannot lift the milestone limit."
+                        : " Add waves with the pursuit command to continue."),
                 "pursuit_extended" => details.TryGetProperty("max_waves", out var limit) && limit.TryGetInt32(out int most)
                     ? $"At most {most + 1} waves in total" : "",
                 "provider_parked" => $"{Display(Read("role"))} · {Display(Read("provider"))}\n{Brief(Read("issue"))}",

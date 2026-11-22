@@ -10,7 +10,7 @@ from tempfile import mkdtemp
 from . import context
 from .checks import contract_hash, observed_pass, run_gate
 from .engine import common_dir, git, tail, verify_registered_repository
-from .insights import failure_excerpt
+from .insights import budget_status, failure_excerpt
 from .process import PausedRun
 from .repair import describe
 from .safety import redact, write_json
@@ -385,7 +385,7 @@ def sync_ref(run, state):
         return state
     if state.get("best_commit") and live == state["best_commit"]:
         return run.set("pursuit_reconciled", {"from": state["accepted"], "to": live}, accepted=live, judge_ledger=None, judge_stage=None,
-                       discarded_commits=[*state.get("discarded_commits", []), *lost_commits(run, live, state["accepted"])])
+                       discarded_commits=[*discards(run, state), *lost_commits(run, live, state["accepted"])])
     raise ValueError("The result branch moved outside this run. Existing commits were preserved.")
 
 
@@ -408,6 +408,40 @@ def confirm_route(run, state):
         routes = [pursue["confirm_judge"], *pursue["judge_fallbacks"]]
         return routes[min(state.get("judge_route", 0), len(routes) - 1)]
     return run.route(state, None, "judge")
+
+
+def confirm_first(run, state):
+    """The saved first judgment when the judge call in progress is the confirmation of it, else None."""
+    stage = state.get("judge_stage") or {}
+    if state.get("phase") == "judging" and stage.get("stage") == "confirm" and stage.get("commit") == state["accepted"]:
+        return saved(judge_dir(run, state.get("wave", 1)), "first.json", state["accepted"])
+    return None
+
+
+def active_route(run, state):
+    """(role, provider config) of the judge call in progress, for fallbacks, parking and blocked states: the confirmation has its own route."""
+    return "judge", confirm_route(run, state) if confirm_first(run, state) else run.route(state, None, "judge")
+
+
+def budget_short(run, state, calls, what):
+    """Why the run's budgets cannot fund `what`, which needs at least `calls` more provider calls, or None."""
+    left = budget_status(run.spec, state)["remaining"]
+    if "max_calls" in left and left["max_calls"] < calls:
+        return f"Only {left['max_calls']:g} provider calls are left in the budget and {what} needs at least {calls}"
+    spent = [name for key, name in (("max_seconds", "run-time"), ("max_observed_tokens", "observed-token")) if key in left and left[key] <= 0]
+    return f"The {spent[0]} budget is spent" if spent else None
+
+
+def discards(run, state):
+    """Commits of the milestones a revert threw away, including those a run recorded before its state kept them."""
+    return list(state["discarded_commits"]) if "discarded_commits" in state else run.store.discarded_commits(run.id)
+
+
+def backfill(run, state):
+    """The state after recording the discards a run made before it kept `discarded_commits`, so every later view and revert sees them."""
+    if "discarded_commits" in state or not state.get("judgments") or not (found := run.store.discarded_commits(run.id)):
+        return state  # nothing can have been discarded before the first judgment
+    return run.set("pursuit_discards_recorded", {"commits": found}, discarded_commits=found)
 
 
 def union_gaps(*lists):
@@ -473,6 +507,9 @@ def conclude(run, state, d, *, applying=False):
     wave, commit, score = p["wave"], p["commit"], p["score"]
     folder = judge_dir(run, wave)
     plan = outcome(state, pursue, d)
+    if applying:
+        # The branch moved before the crash, so the saved decision is a revert whatever the stop rule says now (waves may have been added since).
+        plan["revert"] = True
     kept, needs, failed = plan["kept"], plan["needs"], plan["failed"]
     write_json(folder / "judgment.json", redact(p))
     result = {**kept, "judgments": [*state.get("judgments", []), plan["judgment"]], "judge_attempts": 0, "judge_route": 0, "judge_ledger": None,
@@ -482,21 +519,23 @@ def conclude(run, state, d, *, applying=False):
         if git(run.repository, "rev-parse", "--verify", run.ref) != commit:
             raise ValueError("The result branch no longer holds the judged build. Existing commits were preserved.")
         drop_worktree(run, state)
-        run.set("goal_judged", p, following_event=[("goal_met", {"wave": wave, "score": score, "commit": commit,
-                                                                 **({"confirmed": True} if p.get("confirmation") else {})}),
+        skipped = [("confirmation_skipped", {"wave": wave, "commit": commit, "reason": p["confirmation_skipped"]})] if p.get("confirmation_skipped") else []
+        run.set("goal_judged", p, following_event=[*skipped, ("goal_met", {"wave": wave, "score": score, "commit": commit,
+                                                                           **({"confirmed": True} if p.get("confirmation") else {}),
+                                                                           **({"confirmation_skipped": True} if skipped else {})}),
                 ("run_completed", {"branch": run.ref, "commit": commit})], phase="done", last_error="", **result)
         return
     note = ""
     if plan["revert"]:
         if not applying:
-            write_json(folder / "decision.json", redact({**d, "commit": commit}))
+            write_json(folder / "decision.json", redact({**d, "commit": commit, "revert": True}))
             run.set("judgment_decided", {"wave": wave, "commit": commit, "score": score, "verdict": p["verdict"], "revert_to": kept["best_commit"]},
                     judge_stage={"stage": "apply", "commit": commit, "wave": wave})
         discarded = revert(run, state, wave, commit, kept["best_commit"])
         events.append(("pursuit_reverted", {"wave": wave, "from": commit, "to": kept["best_commit"], "score": score,
                                             "best_score": kept["best_score"], "discarded_ref": discarded}))
         result["accepted"] = kept["best_commit"]
-        result["discarded_commits"] = [*state.get("discarded_commits", []), *lost_commits(run, kept["best_commit"], commit)]
+        result["discarded_commits"] = [*discards(run, state), *lost_commits(run, kept["best_commit"], commit)]
         note = (f"Wave {wave} scored {score}/100, below the best score of {kept['best_score']}/100, so its changes were discarded "
                 f"(saved at {discarded}). Plan from the best build. That wave's own gaps: {titles(p['gaps'])}.")
     stop = plan["stop"]
@@ -523,8 +562,16 @@ def conclude(run, state, d, *, applying=False):
             pursuit_failures=[] if note else [{"name": r["name"], "note": r.get("note", "")[:500]} for r in failed], **result)
 
 
+def stands(run, state, base, one, short, log=None):
+    """A judgment that would finish the run, finished without its confirmation because the budget cannot fund one."""
+    payload = {**base, "verdict": one["verdict"], "score": one["score"], "gaps": one["gaps"], "criteria": one["criteria"], "reason": one["reason"],
+               "confirmation_skipped": short, **({"log": log} if log else {})}
+    return conclude(run, state, {"payload": payload, "done": True, "unconfirmed": None})
+
+
 def judge(run, state):
     run.spec = run.store.get(run.id)["spec"]
+    state = backfill(run, state)
     stage = state.get("judge_stage") or {}
     if stage.get("stage") == "apply" and stage.get("commit") == state["accepted"]:
         # The decision to discard this build was saved before the result branch moved: finish it, never judge again.
@@ -535,7 +582,7 @@ def judge(run, state):
     pursue, wave, commit = run.spec["pursue"], state.get("wave", 1), state["accepted"]
     path = worktree(run, state, fresh=True)
     folder = judge_dir(run, wave)
-    first = saved(folder, "first.json", commit) if stage.get("stage") == "confirm" and stage.get("commit") == commit else None
+    first = confirm_first(run, state)
     confirming = first is not None
     results = where = None
     if state.get("judge_ledger") == commit or confirming:
@@ -555,6 +602,11 @@ def judge(run, state):
         if not Path(reference).is_file():
             raise ValueError(f"The reference image is missing: {reference}")
     log = folder / f"{'confirm' if confirming else 'judge'}-{state.get('provider_calls', 0) + 1:04d}.jsonl"
+    failed = [r for r in results if not r["passed"]]
+    rows = [{k: r[k] for k in ("name", "passed", "note") if k in r} for r in results]
+    base = {"wave": wave, "ledger": rows, "screenshots": [str(p) for p in images], "log": str(log), "commit": commit}
+    if confirming and (short := budget_short(run, run.store.get(run.id)["state"], 1, "the confirmation")):
+        return stands(run, state, {**base, "screenshots": first.get("screenshots", base["screenshots"])}, first["verdict"], short, first["log"])
     config = confirm_route(run, state) if confirming else run.route(state, None, "judge")
     run.independence(state, "judge", config, run.route(state, run.spec["milestones"][-1], "worker"))
     run.set("judge_started", {"adapter": config["kind"], "wave": wave, "commit": commit, **({"stage": "confirm"} if confirming else {})},
@@ -572,13 +624,12 @@ def judge(run, state):
         return
     run.spec = run.store.get(run.id)["spec"]  # an --add-waves issued during the call counts
     pursue = run.spec["pursue"]
-    failed = [r for r in results if not r["passed"]]
     target = pursue["target_score"]
-    rows = [{k: r[k] for k in ("name", "passed", "note") if k in r} for r in results]
-    base = {"wave": wave, "ledger": rows, "screenshots": [str(p) for p in images], "log": str(log), "commit": commit}
     if not confirming:
         if pursue.get("confirm") and finishes(verdict, target, failed):
             # The judgment would finish the run: one independent judgment of the same build must agree before it does.
+            if short := budget_short(run, run.store.get(run.id)["state"], 1, "the confirmation"):
+                return stands(run, state, base, verdict, short)
             write_json(folder / "first.json", redact({"commit": commit, "wave": wave, "verdict": verdict, "log": str(log), "screenshots": base["screenshots"]}))
             run.set("goal_confirming", {"wave": wave, "commit": commit, "score": verdict["score"], "log": str(log)},
                     judge_stage={"stage": "confirm", "commit": commit, "wave": wave}, judge_attempts=0, judge_route=0, transient_failures=0,
@@ -637,8 +688,10 @@ def plan_prompt(run, state, room):
     last = run.spec["milestones"][-1]
     allowed = inherited_paths(run.spec["milestones"])
     protected = run.spec.get("protected_paths", [])
-    latest = next(iter(run.store.events(run.id, limit=1, kinds=["goal_judged"])), None)
-    judged = latest["details"] if latest else {}
+    events = run.store.events(run.id, limit=None, kinds=["goal_judged"])
+    newest = events[-1]["details"] if events else {}
+    # The judgment of the build being planned from: after a discard that is an older wave's, not the discarded build's.
+    judged = next((e["details"] for e in reversed(events) if e["details"]["commit"] == state["accepted"]), newest)
     criteria = pursue["criteria"] or run.spec.get("acceptance", [])
     gaps = "\n".join(f"- {g['title']}: {g['detail']}" for g in state.get("pursuit_gaps", [])) or "- None recorded"
     failures = "\n".join(f"- {f['name']}: {f['note']}" for f in state.get("pursuit_failures", [])) or "- None"
@@ -650,8 +703,8 @@ def plan_prompt(run, state, room):
         f"Goal\n{run.spec['objective']}",
         "Criteria that define done\n" + ("\n".join(f"- {c}" for c in criteria) if criteria else "- None declared; judge against the goal."),
         f"Accepted milestones in this build\n" + ("\n".join(lineage(run, state)) or "None"),
-        f"Latest independent judgment: wave {judged.get('wave', wave)} scored {judged.get('score', '?')}/100, best {state.get('best_score', '?')}/100"
-        f"\nUnmet criteria\n{unmet}",
+        f"{'Latest independent judgment' if judged is newest else 'Independent judgment of the build to plan from'}: wave {judged.get('wave', wave)} "
+        f"scored {judged.get('score', '?')}/100, best {state.get('best_score', '?')}/100\nUnmet criteria\n{unmet}",
         (state.get("pursuit_note") + "\n\n" if state.get("pursuit_note") else "") + f"Gaps to close, most important first\n{gaps}",
         f"Checks that failed on the current build\n{failures}",
         "Checks every new milestone must pass; the controller runs these exact checks\n" + "\n".join(
@@ -677,7 +730,7 @@ def milestone_limit(run, state, wave):
         scored = (state.get("judgments") or [{}])[-1].get("score")
         events.append(("pursuit_reverted", {"wave": wave, "from": accepted, "to": best_commit, "score": scored, "best_score": best,
                                             "discarded_ref": discarded}))
-        changes.update(accepted=best_commit, discarded_commits=[*state.get("discarded_commits", []), *lost_commits(run, best_commit, accepted)])
+        changes.update(accepted=best_commit, discarded_commits=[*discards(run, state), *lost_commits(run, best_commit, accepted)])
     drop_worktree(run, state)
     gaps = state.get("best_gaps") or state.get("pursuit_gaps", [])
     message = (f"Goal not met: the run reached the {MAX_MILESTONES} milestone limit (best score {best}/100). Top gaps: {titles(gaps)}. "
@@ -690,6 +743,7 @@ def milestone_limit(run, state, wave):
 
 def plan_wave(run, state):
     run.spec = run.store.get(run.id)["spec"]
+    state = backfill(run, state)
     wave = state.get("wave", 1)
     room = min(run.spec["pursue"]["wave_size"], MAX_MILESTONES - len(run.spec["milestones"]))
     if room < 1:
@@ -738,13 +792,13 @@ def report(store, run_id):
     if not pursue:
         raise ValueError("This run does not pursue a goal")
     events = store.events(run_id, limit=None, kinds=["wave_planned", "milestone_accepted", "goal_judged", "pursuit_reverted", "pursuit_stopped",
-                                                      "goal_met", "goal_confirming", "met_unconfirmed", *STOP_ENDED])
+                                                      "goal_met", "goal_confirming", "met_unconfirmed", "confirmation_skipped", *STOP_ENDED])
     planned = [e["details"] for e in events if e["kind"] == "wave_planned"]
     from .rescue import report as rescue_report
     rescued = rescue_report(store, run_id)
     firsts = [1, *(d["first_step"] for d in planned)]
     accepted = {e["details"]["step"]: e["details"] for e in events if e["kind"] == "milestone_accepted"}
-    gone = set(state.get("discarded_commits", ()))  # milestones of waves a revert threw away are not part of the build
+    gone = set(store.discarded_commits(run_id))  # milestones of waves a revert threw away are not part of the build
     waves = []
     for index, first in enumerate(firsts):
         last = firsts[index + 1] - 1 if index + 1 < len(firsts) else len(spec["milestones"])
@@ -755,14 +809,15 @@ def report(store, run_id):
                       **({"rescue_strategy": planned[index - 1]["strategy"]} if index and planned[index - 1].get("rescue") else {}),
                       **({"rescue": found[-1], "rescues": found} if (found := [r for r in rescued if r["wave"] == number]) else {}),  # rescue: the latest
                       "milestones": [{"step": n, "title": spec["milestones"][n - 1]["title"],
-                                      "accepted": n in accepted, "discarded": n in accepted and accepted[n].get("commit") in gone,
+                                      "accepted": n in accepted and accepted[n].get("commit") not in gone, "discarded": n in accepted and accepted[n].get("commit") in gone,
                                       "commit": accepted.get(n, {}).get("commit")} for n in range(first, last + 1)],
                       "judgment": None if judged is None else {k: judged[k] for k in ("verdict", "score", "commit", "gaps", "reason")}
                       | {"criteria_met": sum(c["met"] for c in judged["criteria"]), "criteria_total": len(judged["criteria"]),
                          "failed_checks": [c["name"] for c in judged["ledger"] if not c["passed"]]}
                       | ({"confirmation": {"confirmed": judged["confirmation"]["confirmed"], "score": judged["confirmation"]["confirmation"]["score"],
                                            "verdict": judged["confirmation"]["confirmation"]["verdict"], "first_score": judged["confirmation"]["first"]["score"]}}
-                         if judged.get("confirmation") else {}),
+                         if judged.get("confirmation") else {})
+                      | ({"confirmation_skipped": judged["confirmation_skipped"]} if judged.get("confirmation_skipped") else {}),
                       "reverted": reverted})
     stopped = current_stop(events) if state["phase"] == "blocked" else None
     from .explore import report as exploration
@@ -774,7 +829,8 @@ def report(store, run_id):
                    "result_branch": state.get("result_ref", "").removeprefix("refs/heads/"), "accepted": state["accepted"],
                    "met": any(e["kind"] == "goal_met" for e in events),
                    "stopped": stopped, "confirm": pursue.get("confirm", False),
-                   "confirmations": {"asked": sum(e["kind"] == "goal_confirming" for e in events), "unconfirmed": sum(e["kind"] == "met_unconfirmed" for e in events)},
+                   "confirmations": {"asked": sum(e["kind"] == "goal_confirming" for e in events), "unconfirmed": sum(e["kind"] == "met_unconfirmed" for e in events),
+                                     "skipped": sum(e["kind"] == "confirmation_skipped" for e in events)},
                    "last_error": state.get("last_error") or None, "extensions": sum(e["kind"] == "pursuit_extended" for e in events),
                    "waves": waves})
 
@@ -798,6 +854,8 @@ def format_report(data):
             if sure := judgment.get("confirmation"):
                 lines.append("    confirmed by an independent second judgment" + f" ({sure['verdict']} {sure['score']}/100)" if sure["confirmed"] else
                              f"    MET not confirmed: an independent second judgment said {sure['verdict']} {sure['score']}/100 (first said {sure['first_score']}/100)")
+            if judgment.get("confirmation_skipped"):
+                lines.append(f"    MET stood without a confirmation: {judgment['confirmation_skipped']}")
             lines += [f"    gap: {g['title']}" for g in judgment["gaps"][:3]]
             lines += [f"    failed check: {name}" for name in judgment["failed_checks"]]
         if wave["reverted"]:

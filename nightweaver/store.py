@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 from uuid import uuid4
 
 from .safety import redact
@@ -160,6 +161,7 @@ class Store:
         """Read the sidebar's fields without materializing prompts, gate plans or provider configs."""
         query = """SELECT id, updated, pause, state, json_extract(spec,'$.title') AS title,
                    json_extract(spec,'$.project') AS project, json_array_length(spec,'$.milestones') AS total,
+                   json_type(spec,'$.pursue')='object' AS pursuit,
                    json_extract(spec,'$.milestones[' || json_extract(state,'$.step') || '].title') AS current
                    FROM runs ORDER BY updated DESC"""
         keys = ("phase", "step", "accepted", "result_ref", "dispatch", "after", "retry_at", "last_error", "provider_calls",
@@ -171,6 +173,8 @@ class Store:
                 summary = {k: state[k] for k in keys if k in state}
                 if issue := state.get("provider_issue"):
                     summary["provider_issue"] = {k: issue[k] for k in ("provider", "role", "profile_dir") if k in issue}
+                if row["pursuit"]:  # a goal pursuit's milestone count includes the waves a revert discarded
+                    summary.update(pursuit=True, discarded=len(state.get("discarded_commits", ())))
                 spec = {"title": row["title"]}
                 if row["project"]:
                     spec["project"] = row["project"]
@@ -266,12 +270,16 @@ class Store:
                 if stop and state.get("accepted") in judged:
                     # The stop followed a judgment of this very build, so judging it again would add no evidence: plan from its gaps.
                     gaps = state.get("best_gaps") if state.get("accepted") == state.get("best_commit") else state.get("pursuit_gaps")
-                    state.update(phase="planning", judge_stage=None, plan_attempts=0, planner_route=0, pursuit_note="", pursuit_failures=[],
+                    last = (state.get("judgments") or [{}])[-1]
+                    # A stop that discarded the last build planned from an older one: say so, as the planner is told after any other discard.
+                    note = (f"Wave {last.get('wave')} scored {last.get('score')}/100, below the best score of {state.get('best_score')}/100, so its changes "
+                            "were discarded. Plan from the best build." if last.get("commit") and last["commit"] != state.get("accepted") else "")
+                    state.update(phase="planning", judge_stage=None, plan_attempts=0, planner_route=0, pursuit_note=note, pursuit_failures=[],
                                  pursuit_gaps=gaps or [{"title": "The judge does not consider the goal met", "detail": "See the last judgment."}])
             db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
                        (json.dumps(row["spec"]), json.dumps(state), timestamp(), run_id))
             self._event(db, run_id, "pursuit_extended", {"waves": waves, "max_waves": row["spec"]["pursue"]["max_waves"],
-                                                          "resumed": resumed})
+                                                          "resumed": resumed, "phase": state["phase"]})
         return {"max_waves": row["spec"]["pursue"]["max_waves"], "resumed": resumed, "phase": state["phase"]}
 
     def pause(self, run_id, value):
@@ -361,9 +369,28 @@ class Store:
             entries = [json.loads(row["details"]) for row in rows]
             if discarded:
                 return entries
-            held = db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
-            gone = set(json.loads(held["state"]).get("discarded_commits", ())) if held else set()
-            return [item for item in entries if item.get("commit") not in gone] if gone else entries
+        gone = set(self.discarded_commits(run_id))
+        return [item for item in entries if item.get("commit") not in gone] if gone else entries
+
+    def discarded_commits(self, run_id):
+        """Commits that a pursuit's reverts threw away. A run that reverted before its state kept them is read from its pursuit_reverted
+        events: the commits each reverted build holds beyond the build the result branch went back to."""
+        with self.connect() as db:
+            held = db.execute("SELECT state, json_extract(spec,'$.repository') AS repository FROM runs WHERE id=?", (run_id,)).fetchone()
+            state = json.loads(held["state"]) if held else {}
+            if "discarded_commits" in state or not held:
+                return list(state.get("discarded_commits", ()))
+            reverts = [json.loads(row["details"]) for row in db.execute(
+                "SELECT details FROM events WHERE run_id=? AND kind='pursuit_reverted' ORDER BY seq", (run_id,))]
+        found = []
+        if reverts and held["repository"]:
+            from .engine import git
+            for details in reverts:
+                try:
+                    found += [c for c in git(held["repository"], "rev-list", f"{details['to']}..{details['from']}").split() if c not in found]
+                except (ValueError, KeyError, OSError, subprocess.SubprocessError):
+                    continue
+        return found
 
     @staticmethod
     def _event(db, run_id, kind, details):

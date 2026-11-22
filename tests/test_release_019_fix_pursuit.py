@@ -6,15 +6,17 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import test_release_019_pursuit as base
 import test_windows as fixtures
 
-from nightweaver import explore, pursuit, rescue
-from nightweaver.engine import Run, fork_run, git
-from nightweaver.providers import ProviderUnavailable
+from nightweaver import explore, pursuit, readiness, report_activity, rescue
+from nightweaver.contracts import lint_plan
+from nightweaver.engine import Run, call_served, fork_run, git
+from nightweaver.providers import ProviderUnavailable, invoke
 from nightweaver.reports import metrics
 from nightweaver.spec import anchor_provider_paths, validate
 from nightweaver.store import current_stop
@@ -144,7 +146,7 @@ class FixPursuitTests(unittest.TestCase):
         self.assertEqual((state["phase"], state["judge_stage"], state["provider_calls"]), ("done", None, 3))
         self.assertEqual(metrics(self.store, run)["pursuit"]["confirmations"], 1)
         self.assertIn("confirmed by an independent second judgment", self.cli("pursuit", run, raw=True))
-        self.assertEqual(self.cli("pursuit", run, "--json")["confirmations"], {"asked": 1, "unconfirmed": 0})
+        self.assertEqual(self.cli("pursuit", run, "--json")["confirmations"], {"asked": 1, "unconfirmed": 0, "skipped": 0})
 
     def test_unconfirmed_met_continues_as_not_met_with_the_gaps_of_both_judgments(self):
         first = {**judged(92, met=True), "gaps": [{"title": "Polish A", "detail": "Spacing is off"}]}
@@ -259,6 +261,7 @@ class FixPursuitTests(unittest.TestCase):
             self.assertEqual(Run(self.store, run).run(), "done")
         self.assertEqual((len(self.prompts("judge")), len(self.prompts("backup"))), (1, 1))
         self.assertEqual(len(self.events(run, "provider_fallback")), 1)
+        self.assertEqual(self.events(run, "provider_fallback")[0]["from"]["provider"], "claude", "the route the confirmation left, not the judge's")
         self.assertEqual(self.store.get(run)["state"]["judge_route"], 0)
 
     def test_a_usage_limit_during_the_confirmation_parks_and_resumes_there(self):
@@ -549,10 +552,10 @@ class FixPursuitTests(unittest.TestCase):
         self.cli("handoff", run, "--markdown", brief)
         self.assertIn("Discarded milestones", brief.read_text(encoding="utf-8"))
         measured = metrics(self.store, run)
-        self.assertEqual((measured["accepted_milestones"], measured["total_milestones"]), (2, 3))
+        self.assertEqual((measured["accepted_milestones"], measured["total_milestones"]), (2, 2), "a discarded wave is neither accepted nor planned work")
         data = self.cli("pursuit", run, "--json")
         wave_two = data["waves"][1]["milestones"][0]
-        self.assertEqual((wave_two["title"], wave_two["discarded"]), ("Wave two work", True))
+        self.assertEqual((wave_two["title"], wave_two["discarded"], wave_two["accepted"]), ("Wave two work", True, False))
         self.assertEqual(wave_two["commit"], second["commit"])
         self.assertEqual(data["waves"][2]["milestones"][0]["discarded"], False)
         self.assertTrue(data["waves"][2]["milestones"][0]["accepted"])
@@ -601,6 +604,330 @@ class FixPursuitTests(unittest.TestCase):
         self.assertEqual(current_stop([{"kind": "blocked", "details": {}}, stop, {"kind": "goal_judged", "details": {}}]), {"reason": "plateau"})
         later = {"kind": "pursuit_stopped", "details": {"reason": "wave_limit"}}
         self.assertEqual(current_stop([stop, {"kind": "pursuit_extended", "details": {}}, later]), {"reason": "wave_limit"})
+
+
+    # ================================================================ second review: what the first fixes left open
+
+    # ---------------------------------------------------------------- the confirmation route is the route that fails
+
+    def unavailable(self, kind, message, reason):
+        """An `invoke` that fails every judge call routed to a provider of this kind and runs the others."""
+        def flaky(config, mode, *args, **kwargs):
+            if mode == "judge" and config["kind"] == kind:
+                raise ProviderUnavailable(message, reason)
+            return invoke(config, mode, *args, **kwargs)
+        return flaky
+
+    def test_a_failed_confirmation_is_reported_against_the_confirmation_route_not_the_judge(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "confirm_judge": {"kind": "codex"}})
+        with patch("nightweaver.engine.invoke", side_effect=self.unavailable("codex", "signed out", "authentication")):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        (event,) = self.events(run, "provider_unavailable")
+        self.assertEqual((event["provider"], event["role"], event["reason"]), ("codex", "judge", "authentication"))
+        self.assertEqual((state["provider_issue"]["provider"], state["provider_issue"]["role"]), ("codex", "judge"))
+        self.assertEqual((state["blocked_from"], state["judge_stage"]["stage"], state["last_error"]), ("judging", "confirm", "signed out"))
+        self.assertEqual(len(self.prompts("judge")), 1, "the judge itself answered; only the confirmation failed")
+
+    def test_a_usage_limit_on_the_confirmation_names_that_provider_when_waiting_is_off(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "confirm_judge": {"kind": "claude"}}, retry={"max_parks": 0})
+        with patch("nightweaver.engine.invoke", side_effect=self.unavailable("claude", "You have hit your usage limit", "usage_limit")):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertTrue(state["last_error"].startswith("Claude usage limit reached and waiting is disabled"), state["last_error"])
+        self.assertEqual((state["provider_issue"]["provider"], state["provider_issue"]["reason"]), ("claude", "usage_limit"))
+        self.assertEqual(self.events(run, "provider_unavailable")[0]["provider"], "claude")
+
+    def test_a_usage_limit_on_the_confirmation_parks_against_that_provider(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "confirm_judge": {"kind": "claude"}})
+        with patch("nightweaver.engine.invoke", side_effect=self.unavailable("claude", "You have hit your usage limit", "usage_limit")):
+            self.assertEqual(Run(self.store, run).run(defer_retries=True), "waiting")
+        (parked,) = self.events(run, "provider_parked")
+        self.assertEqual((parked["provider"], parked["role"]), ("claude", "judge"))
+        self.assertEqual(self.store.get(run)["state"]["judge_stage"]["stage"], "confirm")
+
+    def test_a_confirmation_that_falls_back_reports_the_route_it_left(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "confirm_judge": {"kind": "claude"},
+                                                                "judge_fallbacks": [self.route("backup", [judged(89, met=True)])]})
+        with patch("nightweaver.engine.invoke", side_effect=self.unavailable("claude", "signed out", "authentication")):
+            self.assertEqual(Run(self.store, run).run(), "done")
+        (fallback,) = self.events(run, "provider_fallback")
+        self.assertEqual((fallback["from"]["provider"], fallback["from"]["role"], fallback["to"]["provider"]), ("claude", "judge", "command"))
+
+    def test_the_judge_route_still_names_the_judge_when_the_first_judgment_fails(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "judge": {"kind": "codex"}, "confirm_judge": {"kind": "claude"}})
+        with patch("nightweaver.engine.invoke", side_effect=self.unavailable("codex", "signed out", "authentication")):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.assertEqual(self.events(run, "provider_unavailable")[0]["provider"], "codex")
+        self.assertEqual(self.store.get(run)["state"]["provider_issue"]["provider"], "codex")
+
+    def test_the_served_model_of_a_confirmation_is_looked_up_in_its_own_profile(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True})
+        spec = self.store.get(run)["spec"]
+        spec["pursue"]["confirm_judge"] = {"kind": "claude", "profile_dir": r"C:\profiles\confirmer"}
+        with self.store.connect() as db:
+            db.execute("UPDATE runs SET spec=? WHERE id=?", (json.dumps(spec), run))
+        runner, seen = Run(self.store, run), []
+        state = {"phase": "judging", "accepted": "c" * 40, "wave": 1, "step": 1, "judge_route": 0, "judge_stage": {"stage": "confirm", "commit": "c" * 40}}
+        pending = {"provider": "claude", "role": "judge", "model": None, "log": "none"}
+        with patch("nightweaver.engine.served_models", side_effect=lambda config, log: seen.append(config) or {"models": [], "source": None}):
+            with patch.object(pursuit, "saved", return_value={"commit": "c" * 40}):
+                call_served(runner, pending, state)
+            call_served(runner, pending, {**state, "judge_stage": None})
+        self.assertEqual(seen[0].get("profile_dir"), r"C:\profiles\confirmer")
+        self.assertIsNone(seen[1].get("profile_dir"), "outside a confirmation the judge's own route is the one that matches")
+
+    # ---------------------------------------------------------------- doctor and preflight check the confirmation judge
+
+    def test_doctor_checks_the_confirmation_judge_and_only_while_confirmation_is_on(self):
+        run = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True, "confirm_judge": {"kind": "gemini"}})
+        report = readiness.diagnose(self.store, self.store.get(run)["spec"])
+        gemini = [p for p in report["providers"] if p.get("provider") == "gemini"]
+        self.assertEqual([p["roles"] for p in gemini], [["pursuit confirmation judge"]])
+        off = self.pursue([judged(90, met=True)], extra_pursue={"confirm": False, "confirm_judge": {"kind": "gemini"}})
+        report = readiness.diagnose(self.store, self.store.get(off)["spec"])
+        self.assertEqual([p for p in report["providers"] if p.get("provider") == "gemini"], [], "an unused route is not checked")
+        plain = self.pursue([judged(90, met=True)], extra_pursue={"confirm": True})
+        roles = [role for p in readiness.diagnose(self.store, self.store.get(plain)["spec"])["providers"] for role in p["roles"]]
+        self.assertNotIn("pursuit confirmation judge", roles, "the confirmation uses the judge's route, which is checked as the judge")
+
+    # ---------------------------------------------------------------- the confirmation call is part of the budget
+
+    def test_plan_lint_counts_the_confirmation_call(self):
+        run = self.pursue([judged(90, met=True)], budgets={"max_calls": 2}, extra_pursue={"confirm": True})
+        lint = lint_plan(self.store.get(run)["spec"])
+        self.assertEqual((lint["minimum_calls_for_acceptance"], lint["feasible"]), (3, False), "a worker, a judgment and its confirmation")
+        self.assertEqual([(f["code"], f["minimum"], f["configured"]) for f in lint["findings"]], [("insufficient_calls", 3, 2)])
+        off = lint_plan(self.store.get(self.pursue([judged(90, met=True)], budgets={"max_calls": 2}, extra_pursue={"confirm": False}))["spec"])
+        self.assertEqual((off["minimum_calls_for_acceptance"], off["feasible"]), (2, True))
+        enough = lint_plan(self.store.get(self.pursue([judged(90, met=True)], budgets={"max_calls": 3}, extra_pursue={"confirm": True}))["spec"])
+        self.assertEqual((enough["minimum_calls_for_acceptance"], enough["feasible"]), (3, True))
+        two = self.pursue([judged(90, met=True)], budgets={"max_calls": 9}, extra_pursue={"confirm": True},
+                          reviewer={"kind": "command", "argv": fixtures.fixture("review")})
+        self.assertEqual(lint_plan(self.store.get(two)["spec"])["minimum_calls_for_acceptance"], 4, "a reviewer call comes before the judgments")
+
+    def test_a_budget_that_cannot_fund_the_confirmation_lets_the_judgment_stand_and_says_so(self):
+        run = self.pursue([judged(90, met=True)], budgets={"max_calls": 2}, extra_pursue={"confirm": True})
+        self.assertEqual(Run(self.store, run).run(), "done")
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["phase"], state["provider_calls"], state["judge_stage"]), ("done", 2, None))
+        self.assertEqual(len(self.prompts("judge")), 1)
+        (skipped,) = self.events(run, "confirmation_skipped")
+        self.assertIn("Only 0 provider calls are left in the budget and the confirmation needs at least 1", skipped["reason"])
+        kinds = [e["kind"] for e in self.store.events(run, limit=None)]
+        self.assertEqual((kinds.count("goal_confirming"), kinds.count("goal_met"), kinds.count("run_completed")), (0, 1, 1))
+        self.assertLess(kinds.index("confirmation_skipped"), kinds.index("goal_met"))
+        judgment = self.events(run, "goal_judged")[0]
+        self.assertEqual((judgment["verdict"], judgment["score"], judgment["confirmation_skipped"]), ("MET", 90, skipped["reason"]))
+        self.assertEqual(self.events(run, "goal_met")[0]["confirmation_skipped"], True)
+        self.assertIn("without a confirmation", report_activity.LABELS["confirmation_skipped"](skipped))
+        measured = metrics(self.store, run)
+        self.assertEqual((measured["outcome"], measured["pursuit"]["confirmations"], measured["pursuit"]["confirmations_skipped"]), ("accepted", 0, 1))
+        self.assertIn("MET stood without a confirmation: Only 0 provider calls", self.cli("pursuit", run, raw=True))
+        self.assertEqual(self.cli("pursuit", run, "--json")["confirmations"], {"asked": 0, "unconfirmed": 0, "skipped": 1})
+        self.assertIn("without a confirmation (budget)", Path(self.cli("report", run)["report"]).read_text(encoding="utf-8"))
+
+    def test_a_budget_that_funds_the_confirmation_still_confirms(self):
+        run = self.pursue([judged(90, met=True)], budgets={"max_calls": 3}, extra_pursue={"confirm": True})
+        self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual((len(self.prompts("judge")), self.events(run, "confirmation_skipped")), (2, []))
+
+    def test_a_confirmation_that_ran_out_of_budget_after_a_failed_attempt_falls_back_the_same_way(self):
+        run = self.pursue([judged(90, met=True), "not json", judged(90, met=True)], budgets={"max_calls": 3}, extra_pursue={"confirm": True})
+        self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual(len(self.prompts("judge")), 2, "the unreadable confirmation used the last call")
+        self.assertEqual(len(self.events(run, "judge_invalid")), 1)
+        self.assertEqual(len(self.events(run, "confirmation_skipped")), 1)
+        self.assertEqual(self.events(run, "goal_judged")[0]["verdict"], "MET")
+
+    def test_the_confirmation_needs_calls_time_and_tokens_left(self):
+        def room(limits, state):
+            return pursuit.budget_short(SimpleNamespace(spec={"budgets": limits}), state, 1, "the confirmation")
+        self.assertIsNone(room({}, {"provider_calls": 500}))
+        self.assertIsNone(room({"max_calls": 4}, {"provider_calls": 3}))
+        self.assertIn("Only 0 provider calls are left in the budget and the confirmation needs at least 1", room({"max_calls": 4}, {"provider_calls": 4}))
+        self.assertIn("run-time budget is spent", room({"max_seconds": 5}, {"started_at": "2000-01-01T00:00:00+00:00"}))
+        self.assertIn("observed-token budget is spent", room({"max_observed_tokens": 100}, {"observed_tokens": 100}))
+
+    def test_a_rescue_keeps_calls_for_the_judgment_and_confirmation_that_follow_it(self):
+        def room(limits, state, confirm):
+            spec = {"budgets": limits, "pursue": {"rescue": {"strategies": 2, "max_rescues": 1}, **({"confirm": True} if confirm else {})}}
+            return rescue.short_of_budget(SimpleNamespace(spec=spec), state)
+        self.assertIsNone(room({"max_calls": 20}, {"provider_calls": 12}, False), "seven for the rescue and one judgment")
+        self.assertIn("a rescue needs at least 8", room({"max_calls": 20}, {"provider_calls": 13}, False))
+        self.assertIsNone(room({"max_calls": 20}, {"provider_calls": 11}, True), "seven for the rescue, a judgment and its confirmation")
+        self.assertIn("a rescue needs at least 9", room({"max_calls": 20}, {"provider_calls": 12}, True))
+
+    # ---------------------------------------------------------------- a run that reverted before the state kept its discards
+
+    def forget_discards(self, run):
+        """Make a run look as one that reverted under the earlier version: its state never kept `discarded_commits`."""
+        state = self.store.get(run)["state"]
+        found = state.pop("discarded_commits")
+        with self.store.connect() as db:
+            db.execute("UPDATE runs SET state=? WHERE id=?", (json.dumps(state), run))
+        return found
+
+    def test_a_run_stored_without_its_discards_still_reports_the_discarded_wave_as_discarded(self):
+        run = self.pursue([judged(70), judged(50), judged(90, met=True)], [plan("Wave two work"), plan("Wave three work")])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        found = self.forget_discards(run)
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("discarded_commits", self.store.get(run)["state"])
+        self.assertEqual(self.store.discarded_commits(run), found, "read back from the pursuit_reverted events")
+        handoff = self.cli("handoff", run)
+        self.assertEqual([c["title"] for c in handoff["completed"]], ["Prepare fixture", "Wave three work"])
+        self.assertEqual([c["title"] for c in handoff["discarded"]], ["Wave two work"])
+        measured = metrics(self.store, run)
+        self.assertEqual((measured["accepted_milestones"], measured["total_milestones"], measured["pursuit"]["discarded_milestones"]), (2, 2, 1))
+        data = self.cli("pursuit", run, "--json")
+        self.assertEqual([(m["title"], m["accepted"], m["discarded"]) for w in data["waves"] for m in w["milestones"]],
+                         [("Prepare fixture", True, False), ("Wave two work", False, True), ("Wave three work", True, False)])
+        self.assertEqual([m["step"] for m in self.store.accepted_milestones(run)], [1, 3])
+        fork = self.store.get(fork_run(self.store, run, 1))
+        self.assertEqual([m["title"] for m in fork["spec"]["milestones"]], ["Wave three work"])
+        self.assertEqual([(m["title"], m["discarded"], m["accepted"] is None) for m in self.cli("timeline", run)["milestones"]],
+                         [("Prepare fixture", False, False), ("Wave two work", True, True), ("Wave three work", False, False)])
+
+    def test_a_run_that_reverted_under_the_earlier_version_records_its_discards_when_it_resumes(self):
+        run = self.pursue([judged(70), judged(50), judged(95, met=True)], [plan("Wave two work"), plan("Wave three work")], extra_pursue={"max_waves": 1})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        found = self.forget_discards(run)
+        self.assertEqual(self.cli("handoff", run)["discarded"][0]["title"], "Wave two work")
+        self.assertEqual(self.store.extend_pursuit(run, 2)["phase"], "planning")
+        self.assertEqual(Run(self.store, run).run(), "done")
+        state = self.store.get(run)["state"]
+        self.assertEqual(state["discarded_commits"], found)
+        self.assertEqual(self.events(run, "pursuit_discards_recorded"), [{"commits": found}])
+        handoff = self.cli("handoff", run)
+        self.assertEqual([c["title"] for c in handoff["completed"]], ["Prepare fixture", "Wave three work"])
+        self.assertEqual([c["title"] for c in handoff["discarded"]], ["Wave two work"])
+        self.assertEqual(self.lineage(f"nightweaver/{run}"), ["Prepare fixture", "Wave three work"])
+
+    def test_a_run_without_reverts_has_nothing_to_record(self):
+        run = self.pursue([judged(60), judged(90, met=True)], [plan("More")])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        self.assertEqual(self.store.discarded_commits(run), [])
+        self.assertEqual(self.events(run, "pursuit_discards_recorded"), [])
+        self.assertNotIn("discarded_commits", self.store.get(run)["state"])
+
+    # ---------------------------------------------------------------- a revert's milestones are not part of the plan's count
+
+    def test_a_finished_run_that_discarded_a_wave_reads_as_complete(self):
+        run = self.pursue([judged(70), judged(50), judged(90, met=True)], [plan("Wave two work"), plan("Wave three work")])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        measured = metrics(self.store, run)
+        self.assertEqual((measured["accepted_milestones"], measured["total_milestones"]), (2, 2))
+        self.assertEqual(measured["pursuit"]["discarded_milestones"], 1)
+        html = Path(self.cli("report", run)["report"]).read_text(encoding="utf-8")
+        self.assertIn("Done · 2/2 milestones accepted", html)
+        self.assertIn("Wave two work (discarded)", html)
+        self.assertIn("1 milestones discarded", html)
+        table = self.root / "ci.md"
+        self.cli("ci-summary", run, "--output", table)
+        text = table.read_text(encoding="utf-8")
+        self.assertIn("| Milestones accepted | 2 / 2 |", text)
+        self.assertIn("| Milestones discarded by a revert | 1 |", text)
+        data = self.cli("pursuit", run, "--json")
+        two = data["waves"][1]["milestones"][0]
+        self.assertEqual((two["accepted"], two["discarded"]), (False, True), "a consumer reading `accepted` no longer counts the discarded wave")
+        self.assertTrue(two["commit"])
+        discarded = next(m for m in self.cli("timeline", run)["milestones"] if m["title"] == "Wave two work")
+        self.assertEqual((discarded["discarded"], discarded["accepted"], discarded["commit"]), (True, None, two["commit"]))
+        self.assertTrue(next(m for m in self.cli("timeline", run)["milestones"] if m["title"] == "Wave three work")["accepted"])
+
+    def test_the_sidebar_summary_tells_the_desktop_how_many_milestones_a_revert_discarded(self):
+        run = self.pursue([judged(70), judged(50), judged(90, met=True)], [plan("Wave two work"), plan("Wave three work")])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        plain = self.configured(fixtures.fixture("implement"))
+        rows = {row["id"]: row for row in self.store.run_summaries()}
+        self.assertEqual((rows[run]["state"]["pursuit"], rows[run]["state"]["discarded"], rows[run]["total_milestones"]), (True, 1, 3))
+        self.assertNotIn("pursuit", rows[plain]["state"])
+        self.assertNotIn("discarded", rows[plain]["state"])
+        source = (Path(__file__).resolve().parents[1] / "Nightweaver.Desktop" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
+        self.assertIn('TryGetProperty("discarded"', source)
+        self.assertIn('Read("reason") == "milestone_limit"', source)
+        self.assertNotIn('"Add waves with the pursuit command to continue.",', source, "the hint is conditional, not appended to every stop")
+
+    # ---------------------------------------------------------------- --add-waves after a discard plans from the best build
+
+    def test_the_planner_after_a_discard_and_an_extension_is_told_the_best_builds_judgment_and_that_a_wave_was_discarded(self):
+        one = {**judged(70), "criteria": [{"criterion": "Layout", "met": False, "note": "Wave one layout is cramped"}]}
+        two = {**judged(50), "criteria": [{"criterion": "Spacing", "met": False, "note": "Wave two spacing is worse"}]}
+        run = self.pursue([one, two, judged(95, met=True)], [plan("Wave two work"), plan("Wave three work")], extra_pursue={"max_waves": 1})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.assertEqual(self.store.extend_pursuit(run, 2)["phase"], "planning")
+        self.assertIn("so its changes were discarded", self.store.get(run)["state"]["pursuit_note"])
+        self.assertEqual(Run(self.store, run).run(), "done")
+        prompt = self.prompts("planner")[1]
+        self.assertIn("Independent judgment of the build to plan from: wave 1 scored 70/100, best 70/100", prompt)
+        self.assertIn("Wave one layout is cramped", prompt)
+        self.assertNotIn("Wave two spacing is worse", prompt, "the discarded build's unmet criteria are not the result's")
+        self.assertNotIn("Latest independent judgment: wave 2", prompt)
+        self.assertIn("Wave 2 scored 50/100, below the best score of 70/100, so its changes were discarded", prompt)
+        self.assertIn("Gap at 70", prompt)
+        first = self.prompts("planner")[0]
+        self.assertIn("Latest independent judgment: wave 1 scored 70/100", first, "with no discard the latest judgment is the build's own")
+
+    def test_a_stop_that_kept_the_judged_build_adds_no_discard_note(self):
+        run = self.pursue([judged(60), judged(65), judged(90, met=True)], [plan("More")], extra_pursue={"max_waves": 1})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.store.extend_pursuit(run, 2)
+        self.assertEqual(self.store.get(run)["state"]["pursuit_note"], "")
+
+    # ---------------------------------------------------------------- the text says where an extended run resumes
+
+    def test_the_extension_message_and_the_activity_label_name_the_stage_the_run_resumes_at(self):
+        run = self.pursue([judged(60), judged(65), "bad", "bad", judged(90, met=True)], [plan("More")], extra_pursue={"max_waves": 1})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        text = self.cli("pursuit", run, "--add-waves", 1, raw=True)
+        self.assertIn("The run is back at the planner; resume or dispatch it to continue.", text)
+        self.assertNotIn("back at the judge", text)
+        self.assertEqual(self.store.get(run)["state"]["phase"], "planning")
+        extended = self.store.events(run, limit=None, kinds=["pursuit_extended"])[-1]
+        self.assertEqual(extended["details"]["phase"], "planning")
+        self.assertEqual(report_activity.LABELS["pursuit_extended"](extended["details"]), "Pursuit extended by 1 wave; planning resumed")
+        self.assertEqual(Run(self.store, run).run(), "blocked")  # the judge cannot read its answer
+        self.assertEqual(self.store.get(run)["state"]["blocked_from"], "judging")
+        text = self.cli("pursuit", run, "--add-waves", 1, raw=True)
+        self.assertIn("The run is back at the judge; resume or dispatch it to continue.", text)
+        self.assertEqual(report_activity.LABELS["pursuit_extended"](self.store.events(run, limit=None, kinds=["pursuit_extended"])[-1]["details"]),
+                         "Pursuit extended by 1 wave; judging resumed")
+        self.assertEqual(report_activity.LABELS["pursuit_extended"]({"waves": 2, "max_waves": 4, "resumed": True}), "Pursuit extended by 2 waves; run resumed")
+        self.assertEqual(report_activity.LABELS["pursuit_extended"]({"waves": 1, "max_waves": 4, "resumed": False, "phase": "judging"}), "Pursuit extended by 1 wave")
+
+    # ---------------------------------------------------------------- a saved discard survives waves added during the crash window
+
+    def test_a_crash_after_the_branch_moves_finishes_the_discard_even_when_waves_were_added_meanwhile(self):
+        run = self.pursue([judged(80), judged(78), judged(95, met=True)], [plan("Wave two work"), plan("Wave three work")], extra_pursue={"max_waves": 1})
+        with patch("nightweaver.pursuit.lost_commits", side_effect=SystemExit), self.assertRaises(SystemExit):
+            Run(self.store, run).run()
+        best = self.events(run, "goal_judged")[0]["commit"]
+        state = self.store.get(run)["state"]
+        self.assertEqual((state["judge_stage"]["stage"], git(self.repo, "rev-parse", f"nightweaver/{run}")), ("apply", best))
+        self.assertNotEqual(state["accepted"], best)
+        self.assertEqual(self.store.extend_pursuit(run, 2), {"max_waves": 3, "resumed": False, "phase": "judging"})
+        self.assertEqual(Run(self.store, run).run(), "done")
+        final = self.store.get(run)["state"]
+        self.assertEqual(self.events(run, "pursuit_stopped"), [], "the wave limit that justified the revert no longer applies")
+        (reverted,) = self.events(run, "pursuit_reverted")
+        self.assertEqual(reverted["to"], best)
+        self.assertEqual(git(self.repo, "rev-parse", f"nightweaver/{run}"), self.events(run, "run_completed")[0]["commit"])
+        self.assertEqual(git(self.repo, "rev-parse", f"nightweaver/{run}"), final["accepted"])
+        self.assertEqual(self.lineage(f"nightweaver/{run}"), ["Prepare fixture", "Wave three work"])
+        self.assertEqual(len(final["discarded_commits"]), 1)
+        self.assertIn("Wave 2 scored 78/100, below the best score of 80/100, so its changes were discarded", self.prompts("planner")[1])
+        self.assertEqual(len(self.prompts("judge")), 3, "the discarded wave was judged once")
+
+    def test_a_saved_discard_keeps_its_stop_when_nothing_was_added(self):
+        run = self.pursue([judged(80), judged(78)], [plan("Wave two work")], extra_pursue={"max_waves": 1})
+        with patch("nightweaver.pursuit.lost_commits", side_effect=SystemExit), self.assertRaises(SystemExit):
+            Run(self.store, run).run()
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.assertEqual(self.events(run, "pursuit_stopped")[0]["reason"], "wave_limit")
+        state = self.store.get(run)["state"]
+        self.assertEqual(git(self.repo, "rev-parse", f"nightweaver/{run}"), state["accepted"])
+        self.assertEqual(state["accepted"], state["best_commit"])
 
 
 class FixPursuitSpecTests(unittest.TestCase):

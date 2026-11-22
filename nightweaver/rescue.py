@@ -20,7 +20,7 @@ from . import context
 from .engine import git, tail
 from .explore import JUDGE_IMAGES, ask, build_one, checkout, cleanup, compose, criteria_lines, rank, run_check, stage_manifest
 from .insights import budget_status
-from .pursuit import MAX_MILESTONES, ledger, lineage, screenshots, stopping, titles
+from .pursuit import MAX_MILESTONES, budget_short, ledger, lineage, screenshots, stopping, titles
 from .repair import describe, family
 from .spec import text
 from .verdicts import extract_object
@@ -44,12 +44,9 @@ def available(run, state):
 
 
 def short_of_budget(run, state):
-    """Why the run's budgets cannot fund a rescue, or None. It needs a diagnosis, a build per strategy and two judge calls per strategy at least."""
-    left, need = budget_status(run.spec, state)["remaining"], 1 + 3 * options(run)["strategies"]
-    if "max_calls" in left and left["max_calls"] < need:
-        return f"Only {left['max_calls']:g} provider calls are left in the budget and a rescue needs at least {need}"
-    spent = [what for key, what in (("max_seconds", "run-time"), ("max_observed_tokens", "observed-token")) if key in left and left[key] <= 0]
-    return f"The {spent[0]} budget is spent" if spent else None
+    """Why the run's budgets cannot fund a rescue, or None. It needs a diagnosis, a build per strategy and two judge calls per strategy at least,
+    then the judgment of the winning build and the confirmation that judgment would need."""
+    return budget_short(run, state, 1 + 3 * options(run)["strategies"] + 1 + int(bool(run.spec["pursue"].get("confirm"))), "a rescue")
 
 
 def begin(run, state, wave, kept):
@@ -127,7 +124,7 @@ def diagnosis_prompt(run, state, ex, images):
     from .pursuit import report
     waves, lines = report(run.store, run.id)["waves"], []
     for wave in waves:
-        line = f"- Wave {wave['wave']}: " + "; ".join(m["title"] + ("" if m["accepted"] else " (not accepted)") for m in wave["milestones"])
+        line = f"- Wave {wave['wave']}: " + "; ".join(m["title"] + ("" if m["accepted"] or m["discarded"] else " (not accepted)") for m in wave["milestones"])
         if judged := wave["judgment"]:
             line += (f" -> {judged['verdict']} {judged['score']}/100 at {judged['commit'][:12]}, criteria {judged['criteria_met']}/{judged['criteria_total']}. "
                      f"Top gaps: {titles(judged['gaps'])}")

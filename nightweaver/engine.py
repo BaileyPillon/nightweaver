@@ -287,7 +287,9 @@ def call_served(run, pending, state):
         if pending["role"] in ("worker", "reviewer", "judge", "planner"):
             try:
                 step = run.spec["milestones"][state["step"]] if pending["role"] in ("worker", "reviewer") else None
-                routed = run.route(state, step, pending["role"])
+                from . import pursuit
+                routed = (pursuit.active_route(run, state)[1] if pending["role"] == "judge" and run.spec.get("pursue") and state.get("phase") == "judging"
+                          else run.route(state, step, pending["role"]))
                 if routed.get("kind") == pending["provider"] and routed.get("model") == pending.get("model"):
                     config = routed  # carries the profile directory a Codex rollout is looked up in
             except (KeyError, IndexError, TypeError):
@@ -1057,6 +1059,9 @@ class Run:
                     if actual in ("exploring", "rescuing"):
                         from . import explore, rescue
                         role, config = (explore if actual == "exploring" else rescue).active_route(self, current)
+                    elif actual == "judging" and self.spec.get("pursue"):
+                        from . import pursuit
+                        role, config = pursuit.active_route(self, current)  # the confirmation judgment has its own route
                     else:
                         config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}

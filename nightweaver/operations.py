@@ -112,7 +112,7 @@ def handoff(store, run_id):
     index = state["step"]
     step = spec["milestones"][index] if index < len(spec["milestones"]) else None
     accepted = store.accepted_milestones(run_id)  # the current build's: a pursuit that reverted no longer counts a discarded wave's
-    gone = set(state.get("discarded_commits", ()))
+    gone = set(store.discarded_commits(run_id))
     discarded = [{"title": spec["milestones"][entry["step"] - 1]["title"], "commit": entry["commit"]}
                  for entry in store.accepted_milestones(run_id, discarded=True) if entry.get("commit") in gone] if gone else []
     recent = store.events(run_id, limit=1, kinds=["gate_finished"])
