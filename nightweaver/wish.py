@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import shutil
 import textwrap
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, build_opener
@@ -287,7 +288,7 @@ def say(text):
 def run_wish(store, args):
     """Brief writer, template, saved files and an optional launch through the ordinary goal path. Returns the exit code."""
     from . import cli
-    from .discovery import discover, verify_tools, web_goal
+    from .discovery import NewRepository, discover, verify_tools
     wish = " ".join(args.wish.split())
     if not wish or len(wish) > 4000:
         raise ValueError("Give the wish as one nonempty line of at most 4000 characters")
@@ -297,18 +298,31 @@ def run_wish(store, args):
         raise ValueError("--guard-restarts requires --start")
     root, project = resolve(store, args.target)
     routes, writer = roster(args.roster), brief_route(args)
-    # Only a brand-new repository depends on this hint. The brief is not written yet, so the wish's own words stand in until the brief's visual flag can overrule them.
-    plan = discover(root, wish, routes["worker"], web=web_goal(wish))
+    # Only a brand-new repository needs to know whether the goal is a web page, and only the brief's visual flag can say. Until then it is
+    # planned as a page, and the brief writer is not shown a check it might bend its answer to.
+    try:
+        plan, new = discover(root, wish, routes["worker"]), False
+    except NewRepository:
+        plan, new = discover(root, wish, routes["worker"], web=True), True
     # Everything that can be refused cheaply is refused before the brief writer spends a model call.
     validate(assemble(plan, {"title": plan["title"], "objective": wish, "acceptance": [], "visual": False}, routes, args, None, project), store=store)
-    if args.start:
+    if args.start and not new:
         verify_tools(plan["gates"])
     wish_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:4]
     folder = store.root / "wishes" / wish_id
     folder.mkdir(parents=True)
-    brief, log, attempts = write_brief(writer, plan, wish, folder)
-    if not brief["visual"] and [gate["name"] for gate in plan["gates"]] == ["Browser smoke"]:
-        plan = discover(root, wish, routes["worker"], web=False)  # The brief judged the goal not visual: a new repository gets no page to build.
+    brief, log, attempts = write_brief(writer, {**plan, "gates": [], "acceptance": []} if new else plan, wish, folder)
+    if new and not brief["visual"]:
+        shutil.rmtree(folder, ignore_errors=True)  # Nothing was saved or registered, and nothing is left to find.
+        raise NewRepository("No supported committed test suite found. This repository is new and the brief judged the goal not a web page, so "
+                            "there is nothing to check yet. Commit a first test, or use a Nightweaver template with an explicit check "
+                            "(nightweaver goal <template> <objective>). The brief writer ran once; nothing was saved or registered.")
+    if new and args.start:
+        try:
+            verify_tools(plan["gates"])
+        except ValueError:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
     advisory, note = ollama_advisory() if args.roster == "default" else (None, None)
     notes = [note] if note else []
     template = assemble(plan, brief, routes, args, advisory, project)

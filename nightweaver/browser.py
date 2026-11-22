@@ -166,6 +166,24 @@ class QuietHandler(SimpleHTTPRequestHandler):
         pass
 
 
+def site_handler(site, checkout):
+    """Serve `site` as the web root. A path it does not have comes from the rest of `checkout`, so a page in docs/ that loads
+    ../dist/lib.js or /docs/style.css, the way it did when the whole checkout was served, still finds them."""
+    class Handler(QuietHandler):
+        def translate_path(self, path):
+            found = super().translate_path(path)
+            if os.path.lexists(found):
+                return found
+            self.directory = str(checkout)
+            try:
+                other = super().translate_path(path)
+            finally:
+                self.directory = str(site)
+            return other if os.path.lexists(other) else found
+
+    return partial(Handler, directory=str(site))
+
+
 @contextmanager
 def local_page(config, root, output):
     if "server" in config:
@@ -177,13 +195,14 @@ def local_page(config, root, output):
         yield config["url"], lambda: None
         return
     page = (root / config["page"]).resolve()
-    site = (root / config["root"]).resolve() if "root" in config else root  # Where the site is deployed from: root-absolute URLs start here.
+    site = (root / config["root"]).resolve() if "root" in config else root  # Where the site is deployed from: root-absolute URLs start here, then the checkout.
     if not page.is_relative_to(root) or not page.is_relative_to(site) or not page.is_file():
         raise CandidateStartupFailure(f"Expected a page inside the candidate checkout: {config['page']}")
     if config.get("offline"):
         yield page.as_uri(), lambda: None
         return
-    with ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(site))) as server:
+    handler = site_handler(site, root) if site != root else partial(QuietHandler, directory=str(root))
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -393,6 +412,10 @@ def favicon_failure(message, page_url, requested=()):
 
 # A page that names its favicon, or draws it from inline code, is asking for the file itself.
 NAMES_FAVICON = "document.documentElement.outerHTML.toLowerCase().includes('favicon.ico')"
+# Every page of the case reports once it has parsed, so a page the journey leaves behind (a navigation, a popup) still counts.
+NAMES_BINDING = "__nightweaverNamesFavicon"
+REPORT_FAVICON = (f"addEventListener('DOMContentLoaded', () => {{ try {{ if (window === top && {NAMES_FAVICON}) "
+                  f"Promise.resolve(window.{NAMES_BINDING}()).catch(() => {{}}) }} catch (e) {{}} }})")
 
 
 def run_case(
@@ -447,36 +470,70 @@ def run_case(
             result["errors"].append(message)
 
     requested = set()  # /favicon.ico URLs that a script, the parser or a preload asked for. The browser's own fetch has no such initiator.
-    favicon = {"names": None, "hidden": [], "blind": False}  # Whether the loaded page names its favicon, the exempt errors held until that is known.
+    # Whether any page of the case names its favicon, and the exempt errors held until that is known. Popups are listed to be awaited.
+    favicon, popups = {"names": False, "hidden": [], "blind": False}, []
 
     def on_request(event):
         if urlparse(event["request"]["url"]).path == "/favicon.ico" and event["initiator"]["type"] != "other":
             requested.add(event["request"]["url"])
 
-    def on_console(msg):
+    def names_favicon():
+        """Some page names /favicon.ico, so a failed fetch of it is that page's own broken reference, now and from here on."""
+        favicon["names"] = True
+        for text in favicon["hidden"]:
+            issue("console", text)
+        favicon["hidden"].clear()
+
+    def on_console(msg, own=True):
+        # A popup's other console errors have never counted. Only its favicon failure does, when some page names the icon.
         if msg.type != "error":
             return
         if favicon["blind"] or not favicon_failure(msg, url, requested):
-            issue("console", msg.text)
-        elif favicon["names"] is None:
-            favicon["hidden"].append(msg.text)
+            if own:
+                issue("console", msg.text)
         elif favicon["names"]:
             issue("console", msg.text)
+        else:
+            favicon["hidden"].append(msg.text)
 
     def judge_favicon(page):
-        """A page that names /favicon.ico gets no exemption: that 404 is the page's own broken reference."""
+        """The last look at the page the case ends on, after a popup has had time to load and ask for its icon."""
+        for popup in popups:
+            try:
+                popup.wait_for_load_state("load", timeout=2000)
+            except Exception:
+                pass  # Closed, or too slow to matter.
         try:
-            favicon["names"] = bool(page.evaluate(NAMES_FAVICON))
+            if popups:
+                page.wait_for_timeout(300)
         except Exception:
-            favicon["names"] = True  # A page that cannot be read cannot be excused.
-        for text in favicon["hidden"] if favicon["names"] else ():
-            issue("console", text)
+            pass
+        try:
+            if page.evaluate(NAMES_FAVICON):
+                names_favicon()
+        except Exception:
+            names_favicon()  # A page that cannot be read cannot be excused.
         favicon["hidden"].clear()
+
+    def watch_popup(popup):
+        try:
+            popup.on("console", lambda msg: on_console(msg, False))
+            popup.on("popup", watch_popup)
+            popups.append(popup)
+        except Exception:
+            pass  # A popup that cannot be watched is left alone, as every popup was before.
+
+    try:
+        context.expose_function(NAMES_BINDING, names_favicon)
+        context.add_init_script(REPORT_FAVICON)
+    except Exception:
+        favicon["blind"] = True  # Without the report nothing can be excused.
 
     def watch_page(page):
         page.set_default_timeout(timeout)
         page.on("pageerror", lambda err: issue("page_error", err))
         page.on("console", on_console)
+        page.on("popup", watch_popup)
         try:
             # Playwright's own request events leave out /favicon.ico, so the initiator comes from the protocol.
             session = context.new_cdp_session(page)

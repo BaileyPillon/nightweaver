@@ -1,6 +1,7 @@
 """Nightweaver 0.19 review fixes for discovery and the browser runner: unrecognised test suites, new repositories,
 public/ and docs/ sites, visual baselines on a fallback browser and the favicon exemption."""
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -137,6 +138,63 @@ class ForeignTestSuiteTests(TempCase):
                  "Makefile": "all:\n\tcp a b\n", "pyproject.toml": '[project]\ndescription = "A toxic comment viewer"\n'}
         self.assertEqual([g["name"] for g in self.discover(plain)["gates"]], ["Browser smoke"])
 
+    def test_a_static_site_with_test_like_names_keeps_the_smoke_gate(self):
+        feature = "export const score = (text) => (/\\d+/.test(text) ? 1 : 0);\n"
+        jekyll = "source 'https://rubygems.org'\ngem 'github-pages', group: :jekyll_plugins\n"
+        for files in (
+            {"typing-test.js": feature}, {"js/speed_test.js": feature}, {"assets/js/ab-test.js": feature}, {"js/PersonalityTest.js": feature},
+            {"spec/diagram.js": feature}, {"js/api-spec.js": feature}, {"Gemfile": jekyll, "_config.yml": "title: Site\n"},
+            {"Makefile": "serve:\n\tpython -m http.server\ncheck-links:\n\tlinkchecker http://localhost\n"},
+            {"Rakefile": "task :deploy do\n  sh 'rsync -a _site/ host:'\nend\n"},
+            {"go.mod": "module example.com/site\n\ngo 1.22\n", "config.toml": "title = 'Site'\n", "public/index.html": PAGE},
+            {"testimonials.js": feature, "contest.js": feature, "latest.js": feature, "tests/logo.svg": "<svg/>", "tests/README.md": "# Fixtures"},
+        ):
+            with self.subTest(files=sorted(files)):
+                plan = self.discover({"index.html": PAGE, **files})
+                self.assertEqual([g["name"] for g in plan["gates"]], ["Browser smoke"])
+
+    def test_a_script_named_like_a_test_that_calls_a_runner_still_counts(self):
+        for name, source in (
+            ("typing-test.js", "import test from 'node:test';\ntest('wpm', () => {});\n"),
+            ("js/speed_test.js", "describe('speed', () => { it('is fast', () => {}); });\n"),
+            ("js/PersonalityTest.js", "const { expect } = require('chai');\nexpect(1).to.equal(1);\n"),
+            ("spec/diagram.js", 'describe("diagram", function () {});\n'),
+            ("e2e/flow.ts", "import { test } from '@playwright/test';\n"),
+        ):
+            with self.subTest(name=name):
+                self.refused({"index.html": PAGE, name: source}, name)
+
+    def test_tests_in_unlisted_languages_and_cases_keep_the_no_suite_failure(self):
+        for files, evidence in (
+            ({"DESCRIPTION": "Package: x\n", "tests/testthat/test-f.R": "test_that('a', {})\n", "docs/index.html": PAGE}, "test-f.R"),
+            ({"elm.json": "{}", "tests/Example.elm": "module Example exposing (..)\n"}, "Example.elm"),
+            ({"Project.toml": "name = 'X'\n", "test/runtests.jl": "using Test\n", "docs/index.html": PAGE}, "runtests.jl"),
+            ({"dune-project": "(lang dune 3.0)\n", "test/test_main.ml": "let () = ()\n"}, "test_main.ml"),
+            ({"build.zig": 'const std = @import("std");\n', "src/main.zig": 'test "a" {}\n'}, "build.zig"),
+            ({"test/basic.bats": "@test 'a' { true }\n"}, "basic.bats"),
+            ({"tests/api.robot": "*** Test Cases ***\n"}, "api.robot"),
+            ({"features/login.feature": "Feature: login\n"}, "login.feature"),
+            ({"tests/api.hurl": "GET http://localhost\n"}, "api.hurl"),
+            ({"t/00-load.t": "use Test::More;\n", "cpanfile": "requires 'Test::More';\n"}, "00-load.t"),
+            ({"meson.build": "project('x')\n"}, "meson.build"),
+            ({"app.test.mts": "x"}, "app.test.mts"),
+            ({"tests/App.JS": "x"}, "tests/App.JS"),
+            ({"tests/Test_X.PY": UNITTEST}, "Test_X.PY"),
+            ({"tests/cases.json": "{}"}, "cases.json"),
+            ({"src/FooSpec.groovy": "class FooSpec {}\n"}, "FooSpec.groovy"),
+            ({"package.json": json.dumps({"devDependencies": {"jest": "1"}, "jest": {"testMatch": ["**/*.check.js"]}}), "src/a.check.js": "x"}, "package.json"),
+            ({"vitest.config.js": "export default {}", "package.json": "{}"}, "vitest.config.js"),
+            ({"go.mod": "module x\n", "main.go": "package main\n"}, "go.mod"),
+            ({"Gemfile": "source 'x'\ngem 'rspec'\n"}, "Gemfile"),
+            ({"Gemfile": "source 'x'\n", "lib/greeter.rb": "puts 1\n"}, "Gemfile"),
+            ({"Taskfile.yml": "version: '3'\ntasks:\n  test:\n    cmds: [go test ./...]\n"}, "Taskfile.yml"),
+            ({"package.json": json.dumps({"scripts": {"build": "tsc", "test:unit": "vitest run"}})}, "package.json"),
+            ({"Rakefile": "require 'rake/testtask'\nRake::TestTask.new\n"}, "Rakefile"),
+            ({"Makefile": "test-e2e:\n\tnpx x\n"}, "Makefile"),
+        ):
+            with self.subTest(evidence=evidence):
+                self.refused({"index.html": PAGE, **files}, evidence)
+
     def test_recognised_suites_are_untouched(self):
         plan = self.discover({"index.html": PAGE, "tests/test_a.py": UNITTEST})
         self.assertEqual([g["name"] for g in plan["gates"]], ["Python unittest tests"])
@@ -159,6 +217,27 @@ class NewRepositoryTests(TempCase):
             self.assertTrue(discovery.web_goal(text), text)
         for text in (self.TOOL, "Port the parser to Rust", "Fix the websocket reconnect bug", "Add a webhook handler", "Refactor the cache"):
             self.assertFalse(discovery.web_goal(text), text)
+
+    def test_web_goal_reads_the_deliverable_not_the_words(self):
+        for text in ("Make a snake game", "Build a calculator app", "Create a portfolio for a photographer", "Build a Tetris game", "Make a todo app",
+                     "Build a tic-tac-toe game I can play", "Build me a portfolio", "Create a calculator that looks like a Casio",
+                     "Make something to play snake in the browser", "Build a Python Flask web app", "Build a landing page with a Python build script"):
+            self.assertTrue(discovery.web_goal(text), text)
+        for text in ("Write a Python script that downloads a web page and extracts its links",
+                     "Build a Python command line tool that checks a website for broken links", "Write a Rust library that parses HTML",
+                     "Build a tkinter GUI that converts units", "Write a Python CLI that paginates long output into pages",
+                     "Create a Python script that renders a visual diff of two text files in the terminal",
+                     "Write a Python command line tool that checks which websites are up", "Write a web scraper that saves each page as text",
+                     "Write a Python library that converts PDF pages to text", "Build a CLI that checks a website for broken links",
+                     "Build a Python snake game", "Make a snake game in Rust", "Build a pygame platformer", "Make a tool that checks a website"):
+            self.assertFalse(discovery.web_goal(text), text)
+
+    def test_a_new_repository_is_not_given_a_page_for_a_tool_that_handles_pages(self):
+        for objective in ("Write a Python script that downloads a web page and extracts its links", "Write a Rust library that parses HTML",
+                          "Write a web scraper that saves each page as text", "Build a CLI that checks a website for broken links"):
+            with self.subTest(objective=objective), self.assertRaises(discovery.NewRepository) as caught:
+                self.discover(self.NEW, objective, web=discovery.web_goal(objective))
+            self.assertIn("--web", str(caught.exception))
 
     def test_a_new_repository_needs_a_web_goal(self):
         for files in (self.NEW, {}):
@@ -194,10 +273,20 @@ class NewRepositoryTests(TempCase):
         code, _, err = self.preview(repo, "Build a landing page for a bakery", "--no-web")
         self.assertEqual(code, 1, err)
 
+    def test_oneshot_says_when_it_judged_the_goal_a_page_and_how_to_overrule_it(self):
+        repo = repository(self.root / "fresh", self.NEW)
+        code, out, err = self.preview(repo, "Make a snake game")
+        self.assertEqual((code, json.loads(out)["gates"][0]["name"]), (0, "Browser smoke"))
+        self.assertIn("--no-web", err)
+        for argv in (("Make a snake game", "--web"), ("Make a snake game", "--no-web")):
+            self.assertNotIn("--no-web", self.preview(repo, *argv)[2])
+        page = repository(self.root / "site", {"index.html": PAGE})
+        self.assertNotIn("--no-web", self.preview(page, "Make a snake game")[2], "the repository already has its page")
+
 
 @unittest.skipUnless(os.name == "nt", "Windows controller")
 class WishHintTests(TempCase):
-    """#24 in wish: the wish's words decide before the brief writer is paid, then the brief's visual flag overrules them."""
+    """#24 in wish: only the brief's visual flag decides whether a new repository gets a page, and a refusal leaves nothing behind."""
 
     BRIEF = {"title": "A page", "objective": "Build it.", "acceptance": ["a", "b", "c", "d"], "visual": True, "conflicts": []}
 
@@ -205,7 +294,7 @@ class WishHintTests(TempCase):
         calls = []
 
         def write(config, plan, text, folder):
-            calls.append(plan["gates"])
+            calls.append([g["name"] for g in plan["gates"]])
             return {**self.BRIEF, "visual": visual}, folder / "brief-writer-1.jsonl", 1
 
         out, err = io.StringIO(), io.StringIO()
@@ -214,26 +303,39 @@ class WishHintTests(TempCase):
             code = main(["--home", str(self.root / "home"), "wish", str(repo), wish, "--preview"])
         return code, out.getvalue(), err.getvalue(), calls
 
-    def test_a_new_repository_with_a_web_wish_gets_the_smoke_gate(self):
-        repo = repository(self.root / "fresh", NewRepositoryTests.NEW)
-        code, out, err, calls = self.run_wish(repo, "Build a landing page for a bakery", True)
-        self.assertEqual(code, 0, err + out)
-        self.assertEqual([[g["name"] for g in gates] for gates in calls], [["Browser smoke"]])
+    def wishes(self):
+        return list((self.root / "home" / "wishes").glob("*"))
 
-    def test_a_new_repository_with_a_tool_wish_stops_before_the_brief_writer(self):
-        repo = repository(self.root / "fresh", NewRepositoryTests.NEW)
-        code, _, err, calls = self.run_wish(repo, NewRepositoryTests.TOOL, False)
-        self.assertEqual(code, 1)
-        self.assertIn("--web", err)
-        self.assertEqual(calls, [])
+    def test_a_visual_wish_gets_the_smoke_gate_whatever_words_it_uses(self):
+        for number, wish in enumerate(("Build a landing page for a bakery", "Make a snake game", "Build me a portfolio for a photographer",
+                                       "Create a calculator that looks like a Casio", "Build a tic-tac-toe game I can play")):
+            with self.subTest(wish=wish):
+                repo = repository(self.root / f"fresh{number}", NewRepositoryTests.NEW)
+                code, out, err, calls = self.run_wish(repo, wish, True)
+                self.assertEqual(code, 0, err + out)
+                self.assertEqual(calls, [[]], "the brief writer is shown no check it could bend its answer to")
+                saved = json.loads((self.wishes()[0] / "template.json").read_text(encoding="utf-8"))
+                self.assertEqual([g["name"] for g in saved["gates"]], ["Browser smoke"])
+                (self.root / "home" / "wishes").rename(self.root / f"saved{number}")
 
-    def test_a_brief_that_is_not_visual_withdraws_a_smoke_gate_the_words_suggested(self):
+    def test_a_wish_that_names_a_page_but_whose_brief_is_not_visual_is_refused_cleanly(self):
         repo = repository(self.root / "fresh", NewRepositoryTests.NEW)
-        code, _, err, calls = self.run_wish(repo, "Write a web scraper that saves each page as text", False)
-        self.assertEqual(code, 1)
-        self.assertIn("No supported committed test suite found", err)
-        self.assertEqual(len(calls), 1, "the brief was written once, then the gate was withdrawn")
-        self.assertEqual(list((self.root / "home" / "wishes").iterdir())[0].joinpath("template.json").exists(), False)
+        for wish in ("Write a web scraper that saves each page as text", "Build a CLI that checks a website for broken links",
+                     NewRepositoryTests.TOOL):
+            code, _, err, calls = self.run_wish(repo, wish, False)
+            self.assertEqual(code, 1, wish)
+            self.assertIn("No supported committed test suite found", err)
+            self.assertIn("the brief judged the goal not a web page", err)
+            self.assertNotIn("--web", err, "wish has no such flag")
+            self.assertEqual(len(calls), 1, "the brief was written once, then the refusal came")
+            self.assertEqual(self.wishes(), [], "no folder is left behind")
+
+    def test_a_repository_that_has_its_page_keeps_it_whatever_the_brief_says(self):
+        repo = repository(self.root / "site", {"index.html": PAGE})
+        for visual in (True, False):
+            code, out, err, calls = self.run_wish(repo, "Tidy the layout", visual)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(calls[-1], ["Browser smoke"], "an existing repository is shown its checks")
 
 
 class PageRootTests(TempCase):
@@ -257,13 +359,25 @@ class PageRootTests(TempCase):
             base = url.rsplit("/", 1)[0]
             self.assertTrue(url.endswith("/index.html"), url)
             self.assertEqual(urlopen(base + "/style.css").read(), b"body{}")
-            with self.assertRaises(HTTPError) as caught:
-                urlopen(base + "/secret.txt")
-            self.assertEqual(caught.exception.code, 404)
-            caught.exception.close()
+            self.assertEqual(urlopen(base + "/secret.txt").read(), b"outside", "the rest of the checkout answers where the folder does not")
         with browser.local_page({"page": "public/index.html"}, site.resolve(), output) as (url, _):
             self.assertTrue(url.endswith("/public/index.html"), url)
             self.assertEqual(urlopen(url.rsplit("/", 2)[0] + "/secret.txt").read(), b"outside")
+
+    def test_a_page_may_reach_above_its_folder_or_name_its_repository_path(self):
+        site = repository(self.root / "site", {"docs/index.html": PAGE, "docs/style.css": "body{}", "docs/shared.txt": "site", "shared.txt": "checkout",
+                                               "dist/lib.js": "lib"})
+        output = self.root / "out"
+        output.mkdir()
+        with browser.local_page({"page": "docs/index.html", "root": "docs"}, site.resolve(), output) as (url, _):
+            base = url.rsplit("/", 1)[0]
+            self.assertEqual(urlopen(base + "/shared.txt").read(), b"site", "the site folder is asked first")
+            self.assertEqual(urlopen(base + "/dist/lib.js").read(), b"lib", "../dist/lib.js from docs/index.html")
+            self.assertEqual(urlopen(base + "/docs/style.css").read(), b"body{}", "/docs/style.css written with the repository path")
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(base + "/nothing.txt")
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
 
     def test_discovery_roots_public_and_docs_pages_only(self):
         self.assertEqual(self.discover({"public/index.html": PAGE})["gates"][0]["browser"],
@@ -330,10 +444,11 @@ class RealBrowserCase(TempCase):
 
     def smoke(self, files):
         """Run the discovered smoke gate for a repository through the normal check path."""
-        repo = repository(self.root / "run", files)
+        self.count += 1
+        repo = repository(self.root / f"run{self.count}", files)
         plan = discovery.discover(repo, "Build the page", {"kind": "codex"})
         gate = gate_spec(plan["gates"][0])
-        return run_gate(gate, repo, evidence_folder(self.root / "evidence", 1), git(repo, "rev-parse", "HEAD^{tree}"))
+        return run_gate(gate, repo, evidence_folder(self.root / f"evidence{self.count}", 1), git(repo, "rev-parse", "HEAD^{tree}"))
 
     def visit(self, site, path="/", steps=()):
         self.count += 1
@@ -348,6 +463,22 @@ class PageRootRunTests(RealBrowserCase):
     def test_root_absolute_assets_load_from_a_public_site(self):
         receipt = self.smoke(self.SITE)
         self.assertEqual(receipt["exit"], 0, receipt.get("browser_failures"))
+
+    def test_pages_that_reach_above_their_folder_or_name_their_repository_path_still_pass(self):
+        def page(extra):
+            return PAGE.replace("<main>", extra + "<main>")
+
+        for files in (
+            {"docs/index.html": page('<script src="../dist/lib.js"></script>'), "dist/lib.js": "document.title = 'lib'"},
+            {"docs/index.html": page('<link rel="stylesheet" href="../assets/site.css"><script src="../assets/app.js"></script>'),
+             "assets/site.css": "h1{color:#036}", "assets/app.js": "document.title = 'ok'"},
+            {"public/index.html": page('<link rel="stylesheet" href="/public/style.css">'), "public/style.css": "h1{color:#036}"},
+            {"public/index.html": page('<script src="../src/main.js"></script>'), "src/main.js": "document.title = 'main'"},
+            {"public/index.html": page('<link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="style.css">'), "public/style.css": "h1{}"},
+        ):
+            with self.subTest(files=sorted(files)):
+                receipt = self.smoke(files)
+                self.assertEqual(receipt["exit"], 0, receipt.get("browser_failures"))
 
     def test_a_missing_root_absolute_asset_still_fails(self):
         receipt = self.smoke({name: data for name, data in self.SITE.items() if name != "public/app.js"})
@@ -440,6 +571,46 @@ class VisualFallbackTests(TempCase):
             self.assertEqual(probe.call_args.args[2], expected, config)
 
 
+    def test_gate_browsers_pins_the_channels_that_carry_visual_baselines(self):
+        from nightweaver.diagnostics import gate_browsers
+        plain, visual = {"kind": "browser", "browser": {"page": "a.html"}}, {"kind": "browser", "browser": {"page": "b.html", "steps": [self.STEP]}}
+        edge = {"kind": "browser", "browser": {"page": "c.html", "channel": "msedge", "steps": [self.STEP]}}
+        self.assertEqual(gate_browsers([plain, {"kind": "tests", "argv": ["x"]}]), ({"bundled"}, set()))
+        self.assertEqual(gate_browsers([plain, visual, edge]), ({"bundled", "msedge"}, {"bundled", "msedge"}))
+        self.assertEqual(gate_browsers([plain, edge]), ({"bundled", "msedge"}, {"msedge"}))
+
+    @unittest.skipUnless(os.name == "nt", "native runner")
+    def test_goal_start_probes_the_browser_without_the_fallback_for_visual_baselines(self):
+        repo = repository(self.root / "project", {"index.html": PAGE})
+        png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082")
+        (repo / "ref.png").write_bytes(png)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "baseline")
+        step = {"action": "visual_match", "selector": "h1", "value": {"baseline": "ref.png", "sha256": hashlib.sha256(png).hexdigest()}}
+        reply = self.root / "reply.json"
+        reply.write_text("{}", encoding="utf-8")
+
+        def start(*steps):
+            template = {"repository": str(repo), "title": "T", "worker": {"kind": "command", "argv": [sys.executable, "--version"]},
+                        "budgets": {"max_seconds": 300}, "milestones": [{"title": "M", "task": "Do"}],
+                        "gates": [{"name": "open", "kind": "browser", "browser": {"page": "index.html", "steps": list(steps)}}]}
+            path = self.root / "template.json"
+            path.write_text(json.dumps(template), encoding="utf-8")
+            err = io.StringIO()
+            with fake_playwright(FakeDriver(bundled=MISSING)), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = main(["--home", str(self.root / "home"), "goal", str(path), "Build", "--start", "--plan-from", str(reply)])
+            return code, err.getvalue()
+
+        code, err = start(step)
+        self.assertEqual(code, 1)
+        self.assertIn("OneShot browser check failed before planning", err)
+        self.assertIn("visual_match baselines", err)
+        code, err = start()
+        self.assertEqual(code, 1)
+        self.assertNotIn("browser check failed", err, "a gate without baselines keeps the fallback")
+        self.assertIn("Planner did not return one to five milestones", err)
+
+
 class FaviconExemptionTests(TempCase):
     """#45: only the browser's own failed same-origin /favicon.ico fetch is exempt from the console contract."""
 
@@ -482,6 +653,32 @@ class FaviconRunTests(RealBrowserCase):
             receipt = self.visit(site)
         self.assertFalse(receipt["passed"])
         self.assertTrue(any("Failed to load resource" in error for error in self.failures(receipt)), self.failures(receipt))
+
+    ICON = '<link rel="icon" href="/favicon.ico">'
+
+    def test_an_icon_declared_by_a_page_the_journey_leaves_still_fails(self):
+        pages = {"/": f'<!doctype html><title>t</title>{self.ICON}<main><h1>One</h1><a id=go href="/two">two</a></main>',
+                 "/two": "<!doctype html><title>t</title><main><h1 id=t>Two</h1></main>"}
+        with Site(pages, icon=404) as site:
+            receipt = self.visit(site, steps=[{"action": "click", "selector": "#go"}, {"action": "visible", "selector": "#t"}])
+        self.assertFalse(receipt["passed"])
+        self.assertTrue(any("Failed to load resource" in error for error in self.failures(receipt)), self.failures(receipt))
+
+    def test_an_icon_declared_by_a_popup_fails(self):
+        pages = {"/": '<!doctype html><title>t</title><main><h1>One</h1><a id=go target=_blank href="/two">two</a></main>',
+                 "/two": f"<!doctype html><title>t</title>{self.ICON}<main><h1>Two</h1></main>"}
+        with Site(pages, icon=404) as site:
+            receipt = self.visit(site, steps=[{"action": "click", "selector": "#go"}])
+        self.assertFalse(receipt["passed"])
+        self.assertTrue(any("Failed to load resource" in error for error in self.failures(receipt)), self.failures(receipt))
+
+    def test_pages_and_popups_that_never_name_the_icon_still_pass(self):
+        pages = {"/": '<!doctype html><title>t</title><main><h1>One</h1><a id=go href="/two">two</a><a id=pop target=_blank href="/two">pop</a></main>',
+                 "/two": "<!doctype html><title>t</title><main><h1 id=t>Two</h1></main>"}
+        with Site(pages, icon=404) as site:
+            receipt = self.visit(site, steps=[{"action": "click", "selector": "#pop"}, {"action": "click", "selector": "#go"},
+                                              {"action": "visible", "selector": "#t"}])
+        self.assertTrue(receipt["passed"], self.failures(receipt))
 
     def test_a_script_request_for_the_favicon_fails(self):
         page = ("<!doctype html><title>t</title><main><h1>Fetch</h1><button id=go>go</button><p id=out></p></main>"

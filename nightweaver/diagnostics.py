@@ -129,6 +129,14 @@ def preflight(store, spec):
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
 
+def gate_browsers(gates):
+    """(channels, pinned) the browser gates ask for. A channel is pinned when a gate on it compares visual_match baselines."""
+    from .browser import uses_visual
+    configs = [g["browser"] for g in gates if g.get("kind") == "browser"]
+    return ({c.get("channel", "bundled") for c in configs},
+            {c.get("channel", "bundled") for c in configs if uses_visual(c)})
+
+
 def probe_browser_channels(channels, resolved=None, pinned=()):
     """Open an in-memory test page once per requested browser, independently of the project.
 

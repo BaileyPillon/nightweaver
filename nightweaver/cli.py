@@ -159,9 +159,9 @@ def plan_goal(store, args, template=None):
     if getattr(args, "prompt_only", False):
         return {"prompt": prompt, "baseline": raw.get("expected_base"), "fixed_milestones": fixed, "model_calls": 0}
     if args.start:
-        from .diagnostics import probe_browser_channels
-        checks = [g for step in prepared["milestones"] for g in step["gates"]]
-        errors = probe_browser_channels(g["browser"].get("channel", "bundled") for g in checks if g.get("kind") == "browser")
+        from .diagnostics import gate_browsers, probe_browser_channels
+        channels, pinned = gate_browsers(g for step in prepared["milestones"] for g in step["gates"])
+        errors = probe_browser_channels(channels, pinned=pinned)
         if errors:
             raise ValueError("OneShot browser check failed before planning:\n" + "\n".join(errors))
     if getattr(args, "plan_from", None):
@@ -769,8 +769,11 @@ def main(argv=None):
                 alternate["profile_dir"] = str(Path(args.rescue_profile).expanduser().resolve())
             if worker == alternate:
                 raise ValueError("Choose a distinct rescue provider or profile")
+            notes = []  # What a guess about the goal was, so the operator can overrule it.
             raw = discover(args.repository, args.objective, worker, alternate, args.python,
-                           web=web_goal(args.objective) if args.web is None else args.web)
+                           web=web_goal(args.objective) if args.web is None else args.web, notes=notes if args.web is None else None)
+            for note in notes:
+                print(note, file=sys.stderr)
             if args.reviewer:
                 raw["reviewer"] = route_config(args.reviewer, args.reviewer_profile, args.reviewer_model, args.reviewer_effort, "reviewer", REVIEWERS)
             if args.pursue:
