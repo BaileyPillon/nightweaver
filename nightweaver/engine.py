@@ -37,7 +37,9 @@ def use_git_timeout(spec):
 
 
 def git_bytes(repo, *args, attributes_from=None, timeout=None):
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    from .safety import scrub_env  # repository hooks and filters run inside git, so no provider credential reaches it
+
+    env = {**scrub_env(os.environ), "GIT_OPTIONAL_LOCKS": "0"}
     if attributes_from is not None:
         env["GIT_ATTR_SOURCE"] = attributes_from
     limit = timeout or GIT_TIMEOUT
