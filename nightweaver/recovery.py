@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from . import notify
 from .engine import pending_dependencies
 from .process import run_lock, runner_active
 from .safety import redact
@@ -128,7 +129,8 @@ def supervise(store, run_id, limit=None, *, retry=False):
         )
 
         def stop(reason):
-            store.transition(run_id, "guard_stopped", {"reason": reason})
+            details = {"reason": reason}
+            notify.announce(store, run_id, "guard_stopped", details, store.transition(run_id, "guard_stopped", details))
             return reason
 
         initial = disposition(store, row)

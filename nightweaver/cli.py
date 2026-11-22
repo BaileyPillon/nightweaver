@@ -67,8 +67,10 @@ def dispatch(store, watch, recover_guards=False):
                         results.append({"run_id": row["id"], "waiting": str(error)})
                     continue
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-                    store.transition(row["id"], "dispatcher_run_failed", {"issue": str(error)},
-                                     phase="blocked", last_error=redact(str(error)))
+                    details = {"issue": str(error)}
+                    from . import notify
+                    notify.announce(store, row["id"], "dispatcher_run_failed", details, store.transition(
+                        row["id"], "dispatcher_run_failed", details, phase="blocked", last_error=redact(str(error))))
                     phase = "blocked"
                 results.append({"run_id": row["id"], "phase": phase})
             if not watch:
