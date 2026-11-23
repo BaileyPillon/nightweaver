@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from uuid import uuid4
 import shutil
 import subprocess
@@ -200,12 +201,27 @@ def missing_identity(repo):
     return found
 
 
+def quoted(path, powershell=False):
+    """`path` as one command-line argument: bare when neither cmd nor PowerShell reads anything special in it, else in double quotes (cmd keeps
+    & ( ) ' inside them). PowerShell also expands $ and the backtick there and ends the string at a curly double quote, so for it a path holding
+    one of those is single-quoted instead, with any single quote (straight or curly) doubled."""
+    text = str(path)
+    if re.fullmatch(r"[\w.:\\/@+=,-]+", text):
+        return text
+    if powershell and re.search("[$`\u201c\u201d\u201e]", text):
+        return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", text) + "'"
+    return f'"{text}"'
+
+
 def identity_message(repo, found):
-    """What to tell the operator when git has no identity for `repo`: which role is missing and the exact commands that fix it."""
-    where = f'"{repo}"' if any(char.isspace() for char in str(repo)) else str(repo)
+    """What to tell the operator when git has no identity for `repo`: which role is missing and the exact commands that fix it, quoted so that
+    they can be pasted into cmd or PowerShell (a PowerShell form follows when the path needs one of its own)."""
+    def fix(where):
+        return f'git -C {where} config user.name "Your Name" and git -C {where} config user.email "you@example.com"'
+    where, shell = quoted(repo), quoted(repo, True)
     return (f"Git has no {' or '.join(found)} identity in {repo} ({'; '.join(found.values())}). Nightweaver creates the accepted commits there, "
-            f'so set one first: git -C {where} config user.name "Your Name" and git -C {where} config user.email "you@example.com" '
-            "(or use git config --global to set it for every repository).")
+            f"so set one first: {fix(where)}" + (f" (in PowerShell: {fix(shell)})" if shell != where else "")
+            + " (or use git config --global to set it for every repository).")
 
 
 def identity_error(repo):
@@ -1229,6 +1245,9 @@ class Run:
                 self.set("blocked", {"issue": str(error), "during": state["phase"]},
                          phase="blocked", blocked_from=state.get("blocked_from") or state["phase"], last_error=str(error))
                 return "blocked"
+            if self.spec.get("pursue") and "final_checks" not in self.spec:
+                from . import pursuit
+                pursuit.settle_gates(self)  # a pursuit made by 0.19: its planned waves ask a wave's early milestones for the final-only checks
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
                          attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,

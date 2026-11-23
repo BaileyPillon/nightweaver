@@ -5,6 +5,8 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -13,8 +15,8 @@ import test_release_019_explore as explore_tests
 import test_windows as fixtures
 
 from nightweaver.cli import main
-from nightweaver.engine import FALLBACK_IDENTITY, Run, commit_tree, git, identity_error, identity_message, require_identity
-from nightweaver.pursuit import wave_gates
+from nightweaver.engine import FALLBACK_IDENTITY, Run, commit_tree, git, identity_error, identity_message, quoted, require_identity
+from nightweaver.pursuit import legacy_final, settle_gates, wave_gates
 from nightweaver.spec import validate
 
 HELPER = str(Path(__file__).with_name("pursuit_fixture.py").resolve())
@@ -105,6 +107,54 @@ class WaveGateTests(unittest.TestCase):
         self.assertNotIn("final_checks", self.store.get(run)["spec"])
         self.assertEqual(Run(self.store, run).run(), "done")
         self.assertEqual(names(self.store.get(run)["spec"]), [[READ], [READ, FINAL], [READ], [READ], [READ, FINAL]])
+        self.assertEqual(self.store.get(run)["spec"]["final_checks"], [FINAL])  # recorded when the run started again: the rest of its life is 0.19.1's
+        (split,) = self.store.events(run, limit=None, kinds=["gates_split"])
+        self.assertEqual(split["details"], {"final_checks": [FINAL], "steps": []})
+
+    def stuck_by_019(self):
+        """A pursuit as 0.19 left it: the wave it planned put the final-only check on every milestone, and its first one cannot pass."""
+        run = self.pursue([judged(60), judged(90, met=True)], [plan("First", "Second", "Third")], final_gates=[final_gate()], attempts=1,
+                          milestones=[{"title": "Prepare fixture", "task": "Set the value"}, {"title": "Prepare more", "task": "Extend it"}])
+        with patch("nightweaver.pursuit.wave_gates", lambda spec: (spec["milestones"][-1]["gates"], [])):  # 0.19: every check of the last, on each
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.rewrite_spec(run, final_checks=None)
+        return run
+
+    def test_a_run_blocked_by_019_waves_resumes_on_retry(self):
+        run = self.stuck_by_019()
+        spec = self.store.get(run)["spec"]
+        self.assertEqual(names(spec), [[READ], [READ, FINAL], [READ, FINAL], [READ, FINAL], [READ, FINAL]])
+        self.assertIn(f"{FINAL} exited 1", self.store.get(run)["state"]["last_error"])
+        self.assertEqual(Run(self.store, run).run(retry=True), "done")
+        spec = self.store.get(run)["spec"]
+        self.assertEqual(spec["final_checks"], [FINAL])
+        self.assertEqual(names(spec), [[READ], [READ, FINAL], [READ], [READ], [READ, FINAL]])
+        self.assertEqual([e["details"]["step"] for e in self.store.events(run, limit=None, kinds=["milestone_accepted"])], [1, 2, 3, 4, 5])
+        (split,) = self.store.events(run, limit=None, kinds=["gates_split"])
+        self.assertEqual(split["details"], {"final_checks": [FINAL], "steps": [3, 4]})
+        self.assertEqual(git(self.repo, "show", f"nightweaver/{run}:lineage.txt").splitlines()[-3:], ["First", "Second", "Third"])
+
+    def test_settling_a_019_pursuit_changes_only_the_unbuilt_early_milestones_of_each_wave(self):
+        run = self.pursue([judged(60)], [plan("First")], final_gates=[final_gate()],
+                          milestones=[{"title": "Prepare fixture", "task": "Set the value"}, {"title": "Prepare more", "task": "Extend it"}])
+        last = self.store.get(run)["spec"]["milestones"][-1]
+        copy = {"gates": last["gates"], "paths": last["paths"], "worker": last["worker"], "worker_fallbacks": []}
+        for wave, titles in ((2, ["First", "Second", "Third"]), (3, ["Fourth", "Fifth"]), (4, ["Rescue: One"])):
+            # Waves planned by 0.19 give every milestone every check. Milestones 1 to 3 are built and the fourth is being worked on.
+            self.store.extend_plan(run, [{"title": t, "task": "t", **copy} for t in titles], {"wave": wave, "titles": titles},
+                                   step=3, verification_batch={"id": "samples of the old checks"})
+        self.rewrite_spec(run, final_checks=None)
+        self.assertEqual(names(self.store.get(run)["spec"])[2:], [[READ, FINAL]] * 6)
+        settle_gates(Run(self.store, run))
+        spec, state = self.store.get(run)["spec"], self.store.get(run)["state"]
+        self.assertEqual(spec["final_checks"], [FINAL])
+        # First is built, so it stays as it ran. Third, Fifth and the one-milestone rescue end their waves and keep every check.
+        self.assertEqual(names(spec)[2:], [[READ, FINAL], [READ], [READ, FINAL], [READ], [READ, FINAL], [READ, FINAL]])
+        self.assertIsNone(state["verification_batch"])  # the milestone being worked on changed: samples of the old check list no longer apply
+        (split,) = self.store.events(run, limit=None, kinds=["gates_split"])
+        self.assertEqual(split["details"], {"final_checks": [FINAL], "steps": [4, 6]})
+        settle_gates(Run(self.store, run))  # nothing left to settle
+        self.assertEqual(len(self.store.events(run, limit=None, kinds=["gates_split"])), 1)
 
     def test_a_pursuit_with_only_final_checks_plans_single_milestone_waves(self):
         run = self.pursue([judged(60), judged(90, met=True)], [plan("Third")], gates=[], final_gates=[final_gate()])
@@ -127,10 +177,66 @@ class WaveGateTests(unittest.TestCase):
         each, final = wave_gates(spec)
         self.assertEqual(([g["name"] for g in each], [g["name"] for g in final]), (["Plan", "Own subsequent"], ["Final", "Own final"]))
 
-    def test_checks_the_last_milestone_owns_stay_with_every_new_milestone(self):
+    def split(self, spec):
+        return [[g["name"] for g in half] for half in wave_gates(spec)]
+
+    def test_checks_only_the_last_milestone_owns_bind_only_a_waves_last_milestone(self):
+        # They are not shared by the plan's earlier milestones, so (like final_gates) a freeze-only milestone of a new wave is not held to them.
         spec = self.spec(gates=[gate("Plan")], milestones=[{"title": "M1", "task": "t"}, {"title": "M2", "task": "t", "gates": [gate("Own")]}])
-        self.assertEqual(spec["final_checks"], [])
-        self.assertEqual([[g["name"] for g in half] for half in wave_gates(spec)], [["Plan", "Own"], []])
+        self.assertEqual(spec["final_checks"], ["Own"])
+        self.assertEqual(self.split(spec), [["Plan"], ["Own"]])
+        # Whatever retention the last milestone gives its own check, nothing follows it: it stays a final check.
+        for retention in ("local", "final", "subsequent"):
+            with self.subTest(retention):
+                spec = self.spec(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[
+                    {"title": "M1", "task": "t"}, {"title": "M2", "task": "t", "gates": [gate("Own")], "retain_gates": retention}])
+                self.assertEqual(self.split(spec), [["Plan"], ["Own", "Final"]])
+
+    def test_a_one_milestone_plan_keeps_its_own_checks_per_milestone(self):
+        # Nothing to compare with: the checks the one milestone owns are what a later wave's milestones are held to, as in 0.19.
+        spec = self.spec(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[{"title": "M1", "task": "t", "gates": [gate("Own")]}])
+        self.assertEqual((spec["final_checks"], self.split(spec)), (["Final"], [["Plan", "Own"], ["Final"]]))
+        spec = self.spec(milestones=[{"title": "M1", "task": "t", "gates": [gate("Own")]}])
+        self.assertEqual((spec["final_checks"], self.split(spec)), ([], [["Own"], []]))
+
+    def test_a_spec_from_019_is_split_like_the_same_plan_made_by_0191(self):
+        """legacy_final reads only what 0.19 saved (the milestones' gates and retained_from) and agrees with the recorded split everywhere
+        but where that record cannot tell the two retentions apart (the next test)."""
+        plans = {
+            "plain": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=["M1", "M2", "M3"]),
+            "last milestone's own": dict(gates=[gate("Plan")], milestones=["M1", ("M2", "Own")]),
+            "own of every milestone": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[("M1", "A"), ("M2", "B"), ("M3", "C")]),
+            "subsequent from the first of four": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[("M1", "Sub", "subsequent"), "M2", "M3", "M4"]),
+            "subsequent from the second of four": dict(gates=[gate("Plan")], milestones=["M1", ("M2", "Sub", "subsequent"), "M3", "M4"]),
+            "final from the first of three": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[("M1", "X", "final"), "M2", "M3"]),
+            "final from the first of two": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[("M1", "X", "final"), "M2"]),
+            "only final checks": dict(final_gates=[gate("Final")], milestones=[("M1", "A"), "M2"]),
+            "mixed": dict(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[
+                ("M1", "F", "final"), ("M2", "S", "subsequent"), "M3", ("M4", "Own")]),
+        }
+        for label, raw in plans.items():
+            with self.subTest(label):
+                steps = [{"title": item if isinstance(item, str) else item[0], "task": "t",
+                          **({} if isinstance(item, str) else {"gates": [gate(item[1])]}),
+                          **({"retain_gates": item[2]} if not isinstance(item, str) and len(item) > 2 else {})} for item in raw["milestones"]]
+                spec = self.spec(**{**raw, "milestones": steps})
+                self.assertEqual(legacy_final(spec["milestones"]), spec["final_checks"])
+                legacy = {key: value for key, value in spec.items() if key != "final_checks"}
+                self.assertEqual(wave_gates(legacy), wave_gates(spec))
+
+    def test_what_0191_records_for_the_same_plan_is_what_it_derives_for_retained_checks(self):
+        spec = self.spec(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[
+            {"title": "M1", "task": "t"}, {"title": "M2", "task": "t", "gates": [gate("Sub")], "retain_gates": "subsequent"}, {"title": "M3", "task": "t"}])
+        self.assertEqual(self.split(spec), [["Plan", "Sub"], ["Final"]])
+        # "final" and "subsequent" leave the same record in the penultimate milestone's check list, so 0.19's plan is read the safe way: as a
+        # final check, which the last milestone of a wave still passes. The other reading would leave a final-only check on a freeze-only step.
+        self.assertEqual(legacy_final(spec["milestones"]), ["Final", "Sub"])
+        # One more milestone between them and the record tells them apart: the next milestone inherits a "subsequent" check, never a "final" one.
+        longer = self.spec(gates=[gate("Plan")], final_gates=[gate("Final")], milestones=[
+            {"title": "M1", "task": "t"}, {"title": "M2", "task": "t", "gates": [gate("Sub")], "retain_gates": "subsequent"},
+            {"title": "M3", "task": "t", "gates": [gate("End")], "retain_gates": "final"}, {"title": "M4", "task": "t"}])
+        self.assertEqual(self.split(longer), [["Plan", "Sub"], ["Final", "End"]])
+        self.assertEqual(legacy_final(longer["milestones"]), ["Final", "End"])
 
     def test_plans_without_a_pursuit_record_nothing(self):
         data = {"title": "Plain", "objective": "No pursuit", "repository": str(self.repo), "worker": {"kind": "command", "argv": fixtures.fixture("good")},
@@ -279,6 +385,32 @@ class IdentityTests(unittest.TestCase):
                 require_identity(self.repo)
         self.assertIn("git -C plain config user.name", identity_message("plain", {"author": "Author identity unknown"}))
         self.assertIsNone(identity_error(self.root / "not a repository"))
+
+    def test_the_fix_commands_quote_the_paths_cmd_and_powershell_read_specially(self):
+        cases = ((r"D:\R&D\repo(1)", None), (r"D:\Users\o'brien\repo", None), (r"D:\Work Files\repo", None), (r"D:\a$b\repo", r"'D:\a$b\repo'"),
+                 (r"D:\say `hi`\repo", r"'D:\say `hi`\repo'"), ("D:\\it's \u201cq\u201d\\repo", "'D:\\it''s \u201cq\u201d\\repo'"))
+        for path, shell in cases:
+            with self.subTest(path):
+                message = identity_message(Path(path), {"author": "Author identity unknown"})
+                self.assertIn(f'git -C "{path}" config user.name "Your Name" and git -C "{path}" config user.email "you@example.com"', message)
+                if shell is None:
+                    self.assertNotIn("PowerShell", message)
+                else:  # cmd keeps the double-quoted form; PowerShell would expand $ and the backtick in it, so it also gets a single-quoted one
+                    self.assertIn(f'(in PowerShell: git -C {shell} config user.name "Your Name" and git -C {shell} config user.email', message)
+        self.assertEqual((quoted(r"D:\plain\repo-1.git"), quoted("D:\\a b")), (r"D:\plain\repo-1.git", '"D:\\a b"'))
+
+    @unittest.skipUnless(shutil.which("powershell"), "needs Windows PowerShell")
+    def test_the_quoted_commands_run_in_cmd_and_in_powershell(self):
+        folder = self.root / "R&D (1) o'brien $x `t"
+        folder.mkdir()
+        git(folder, "init")
+        for shell in ("cmd", "powershell"):
+            with self.subTest(shell):
+                line = f"git -C {quoted(folder, shell == 'powershell')} config user.name Tester-{shell}"
+                done = subprocess.run(line if shell == "cmd" else ["powershell", "-NoProfile", "-Command", line],
+                                      shell=shell == "cmd", capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(git(folder, "config", "--get", "user.name"), f"Tester-{shell}")
 
     def test_launching_commands_stop_before_any_model_call(self):
         planned = self.root / "planned.json"

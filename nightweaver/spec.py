@@ -340,7 +340,8 @@ def validate(raw, relative_to=None, store=None):
     milestones = array(raw.get("milestones", []), "milestones", 50)
     steps = []
     retained = []
-    final_only = [g["name"] for g in final_gates]  # the checks only the plan's last milestone passes; a pursuit's later waves need them told apart
+    kept = []  # checks retained "subsequent" from a milestone that is not the last: every later milestone passes them, a pursuit's new waves too
+    last_own = []
     for index, item in enumerate(milestones):
         fields(item, "title task gates paths worker worker_fallbacks retain_gates", "milestone")
         own = [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
@@ -364,8 +365,6 @@ def validate(raw, relative_to=None, store=None):
             if name not in by_name:
                 current.append(gate)
                 by_name[name] = gate
-                if policy == "final":
-                    final_only.append(name)
             inherited.setdefault(name, []).append(source)
         if not current:
             raise ValueError("Each milestone needs uniquely named checks")
@@ -379,6 +378,9 @@ def validate(raw, relative_to=None, store=None):
             steps[-1]["retained_from"] = inherited
         if retention != "local":
             retained.extend((g, retention, steps[-1]["title"]) for g in own)
+            if retention == "subsequent" and index < len(milestones) - 1:
+                kept.extend(g["name"] for g in own)
+        last_own = [g["name"] for g in own]
     if not steps:
         raise ValueError("At least one milestone is required")
     out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
@@ -431,7 +433,12 @@ def validate(raw, relative_to=None, store=None):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
     if "pursue" in raw:
         out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
-        out["final_checks"] = final_only  # written by 0.19.1 on: a pursuit plan without it was made by 0.19 (see pursuit.wave_gates)
+        # Written by 0.19.1 on (a pursuit plan without it was made by 0.19: see pursuit.legacy_final). The checks every milestone of a new wave
+        # passes are the plan's `gates` and those retained "subsequent"; the rest of the last milestone's checks (final_gates, checks retained
+        # "final", checks only the last milestone owns) bind only the last milestone of a wave. A one-milestone plan has nothing to compare:
+        # its own checks stay per-milestone.
+        each = {g["name"] for g in gates} | set(kept) | (set(last_own) if len(steps) == 1 else set())
+        out["final_checks"] = [g["name"] for g in steps[-1]["gates"] if g["name"] not in each]
         if "explore" in out["pursue"]:
             out["pursue"]["explore"].setdefault("workers", [dict(steps[0]["worker"])])
     if "advisory_ollama" in raw:

@@ -240,6 +240,18 @@ class Store:
             self._event(db, run_id, "wave_planned", {**details, "first_step": first})
         return row
 
+    def revise_spec(self, run_id, revise, kind, details, **changes):
+        """Rewrite a run's saved plan and say so, in one transaction: `revise(spec)` edits the decoded spec in place."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            revise(row["spec"])
+            row["state"].update(changes)
+            db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
+                       (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
+            self._event(db, run_id, kind, details)
+        return row
+
     def extend_pursuit(self, run_id, waves):
         """Grant more waves. A pursuit that stopped on a judged build resumes at the planner with that build's gaps and a fresh plateau
         count, so the unchanged build is not judged again; any other block at the judge resumes at the judge."""

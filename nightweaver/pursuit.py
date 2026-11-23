@@ -683,19 +683,67 @@ def inherited_paths(milestones):
     return list(dict.fromkeys(path for step in milestones for path in step["paths"]))
 
 
+def legacy_final(plan):
+    """The names of the checks only the last milestone of `plan` (the milestones its author wrote, no wave) passes, for a pursuit made by 0.19,
+    which recorded none (`final_checks`). The per-milestone checks are the plan's own and those retained to a milestone that is not the last;
+    everything else on the last milestone (its final_gates, the checks retained "final", the checks only it owns) is final. A one-milestone
+    plan gives nothing to compare with, so all its checks stay per-milestone, as 0.19 had it.
+
+    Retention is read from each milestone's retained_from. A check retained from a milestone before the penultimate one reaches a milestone
+    that is not the last, so it is per-milestone. One owned by the penultimate milestone reaches only the last one, where "final" and
+    "subsequent" leave the same record; it is taken as final, so a wave's early milestones are never held to a check the plan only promised
+    for the end (a stuck run is worse than a check enforced on the wave's last milestone alone)."""
+    early, last = plan[:-1], plan[-1]
+    if not early:
+        return []
+    retained = {name for step in plan for name in step.get("retained_from", {})}
+    reaching = {name for step in early for name in step.get("retained_from", {})}
+    each = [g for g in last["gates"] if g["name"] in reaching or (g["name"] not in retained and all(g in step["gates"] for step in early))]
+    return [g["name"] for g in last["gates"] if g not in each]
+
+
 def wave_gates(spec):
     """(each, final): the checks every milestone of a new wave passes, and those only the wave's last milestone passes in addition (the plan's
-    final_gates and the checks retained to its final milestone). Together they are the gates of the current last milestone.
-
-    A plan made by 0.19 did not record which checks are final-only, so they are derived: the per-milestone checks are those every earlier
-    milestone shares with the last one. A single-milestone plan gives nothing to compare with, so all its checks stay per-milestone."""
+    final_gates, the checks retained to its final milestone and the checks only its last milestone owns: spec.final_checks). Together they are
+    the gates of the current last milestone. A spec without final_checks was made by 0.19 and has had no wave planned (settle_gates records
+    the split when a run starts), so it is derived from its milestones as the plan."""
     milestones = spec["milestones"]
+    names = spec["final_checks"] if "final_checks" in spec else legacy_final(milestones)
     last = milestones[-1]
-    names = spec.get("final_checks")
-    if names is None:
-        shared = [g for g in last["gates"] if all(g in step["gates"] for step in milestones[:-1])]
-        names = [g["name"] for g in last["gates"] if g not in shared] if shared else []  # nothing shared: nothing can be told apart
     return [g for g in last["gates"] if g["name"] not in names], [g for g in last["gates"] if g["name"] in names]
+
+
+def settle_gates(run):
+    """Bring a pursuit made by 0.19 to the 0.19.1 rules when it starts again. 0.19 recorded no final_checks and gave every milestone of a wave
+    the last milestone's checks, final-only ones included, so a wave's early milestone could never pass (a freeze-only step cannot meet 'every
+    study has result.json') and `retry` failed the same way. This records the split and takes the final-only checks off the milestones of
+    planned waves that are not yet built, except each wave's last, which keeps every check. Built milestones are history and stay as they ran."""
+    row = run.store.get(run.id)
+    spec, state = row["spec"], row["state"]
+    run.spec = spec
+    if not spec.get("pursue") or "final_checks" in spec:
+        return
+    milestones = spec["milestones"]
+    waves = [e["details"] for e in run.store.events(run.id, limit=None, kinds=["wave_planned"])]
+    names = legacy_final(milestones[:waves[0]["first_step"] - 1] if waves else milestones)
+    changed = {}
+    for wave in waves:
+        first = wave["first_step"] - 1
+        if [m["title"] for m in milestones[first:first + len(wave["titles"])]] != wave["titles"]:
+            continue  # the record and the plan disagree: leave that wave alone
+        for index in range(max(first, state["step"]), first + len(wave["titles"]) - 1):
+            kept = [g for g in milestones[index]["gates"] if g["name"] not in names]
+            if kept and len(kept) < len(milestones[index]["gates"]):
+                changed[index] = kept
+
+    def record(spec):
+        spec["final_checks"] = names
+        for index, gates in changed.items():
+            spec["milestones"][index]["gates"] = gates
+
+    run.store.revise_spec(run.id, record, "gates_split", {"final_checks": names, "steps": [index + 1 for index in sorted(changed)]},
+                          **({"verification_batch": None} if state["step"] in changed else {}))  # samples of the old check list no longer match
+    run.spec = run.store.get(run.id)["spec"]
 
 
 def listed(gates):
