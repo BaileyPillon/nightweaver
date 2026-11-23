@@ -149,10 +149,10 @@ def settle_worktree(repo, path, wait=None):
     return True
 
 
-def git_bytes(repo, *args, attributes_from=None, timeout=None):
+def git_bytes(repo, *args, attributes_from=None, timeout=None, env=None):
     from .safety import scrub_env  # repository hooks and filters run inside git, so no provider credential reaches it
 
-    env = {**scrub_env(os.environ), "GIT_OPTIONAL_LOCKS": "0"}
+    env = {**scrub_env(os.environ), "GIT_OPTIONAL_LOCKS": "0", **(env or {})}
     if attributes_from is not None:
         env["GIT_ATTR_SOURCE"] = attributes_from
     limit = timeout or GIT_TIMEOUT
@@ -172,8 +172,69 @@ def git_bytes(repo, *args, attributes_from=None, timeout=None):
     return result.stdout
 
 
-def git(repo, *args, timeout=None):
-    return git_bytes(repo, *args, timeout=timeout).decode("utf-8", "replace").rstrip("\r\n")
+def git(repo, *args, timeout=None, env=None):
+    return git_bytes(repo, *args, timeout=timeout, env=env).decode("utf-8", "replace").rstrip("\r\n")
+
+
+FALLBACK_IDENTITY = ("Nightweaver", "nightweaver@localhost")
+
+
+def complaint(error):
+    """The first line git said, without the advice that follows it."""
+    return next((line.strip() for line in str(error).splitlines() if line.strip()), "identity unknown")
+
+
+def missing_identity(repo):
+    """{role: git's first complaint} for the commit identities (author, committer) git cannot resolve in `repo`; empty when both resolve
+    or when `repo` is not a repository (later steps report that themselves)."""
+    try:
+        git(repo, "rev-parse", "--git-dir")
+    except (ValueError, OSError):
+        return {}
+    found = {}
+    for role in ("author", "committer"):
+        try:
+            git(repo, "var", f"GIT_{role.upper()}_IDENT")
+        except ValueError as error:
+            found[role] = complaint(error)
+    return found
+
+
+def identity_message(repo, found):
+    """What to tell the operator when git has no identity for `repo`: which role is missing and the exact commands that fix it."""
+    where = f'"{repo}"' if any(char.isspace() for char in str(repo)) else str(repo)
+    return (f"Git has no {' or '.join(found)} identity in {repo} ({'; '.join(found.values())}). Nightweaver creates the accepted commits there, "
+            f'so set one first: git -C {where} config user.name "Your Name" and git -C {where} config user.email "you@example.com" '
+            "(or use git config --global to set it for every repository).")
+
+
+def identity_error(repo):
+    """None when git can author commits in `repo`, else a message that names the exact fix."""
+    found = missing_identity(repo)
+    return identity_message(repo, found) if found else None
+
+
+def require_identity(repo):
+    if message := identity_error(repo):
+        raise ValueError(message)
+
+
+def commit_tree(path, tree, parent, message):
+    """The commit of `tree` on `parent`. A repository that resolves no identity still gets the commit, under FALLBACK_IDENTITY for the
+    role git cannot fill, so a run started before the identity checks existed (or one whose config changed) is not lost at promotion.
+    Only the missing side is replaced: a configured identity is never overridden."""
+    env = {f"GIT_{role.upper()}_{key}": value for role in missing_identity(path) for key, value in zip(("NAME", "EMAIL"), FALLBACK_IDENTITY)}
+    return git(path, "commit-tree", tree, "-p", parent, "-m", message, env=env or None)
+
+
+def identity_fallback(repo, commit):
+    """{"name", "email", "roles"} when `commit` carries FALLBACK_IDENTITY as its author or committer, else None."""
+    try:
+        author, committer = (line.split("\t") for line in git(repo, "show", "-s", "--format=%an\t%ae%n%cn\t%ce", commit).splitlines()[:2])
+    except ValueError:
+        return None
+    roles = [role for role, who in (("author", author), ("committer", committer)) if tuple(who) == FALLBACK_IDENTITY]
+    return {"name": FALLBACK_IDENTITY[0], "email": FALLBACK_IDENTITY[1], "roles": roles} if roles else None
 
 
 def common_dir(path):
@@ -1010,7 +1071,7 @@ class Run:
         if self.store.get(self.id)["state"].get("feedback_version", 0) != state.get("feedback_version", 0):
             self.reject("Operator feedback changed during review. Apply the saved update.", "feedback", worker_session=None)
             return
-        commit = git(path, "commit-tree", snapshot, "-p", state["accepted"], "-m", step["title"])
+        commit = commit_tree(path, snapshot, state["accepted"], step["title"])
         self.set("promotion_prepared", {"commit": commit, "tree": snapshot},
                  phase="promoting", candidate=commit)
 
@@ -1125,12 +1186,13 @@ class Run:
         number = state["step"] + 1
         finished = number == len(self.spec["milestones"])
         passed = [gate["name"] for gate in self.spec["milestones"][number - 1]["gates"]]
+        fallback = identity_fallback(self.repository, candidate)  # the safety net of commit_tree, said where the commit becomes the accepted one
         pursuing = finished and bool(self.spec.get("pursue"))
         wave = state.get("wave", 1)
         completion = (("wave_completed", {"wave": wave, "commit": candidate, "branch": self.ref}) if pursuing else
                       ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None)
         self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref,
-                 "tree": state.get("candidate_tree"), "verified_checks": passed},
+                 "tree": state.get("candidate_tree"), "verified_checks": passed, **({"identity_fallback": fallback} if fallback else {})},
                  following_event=completion, **({"wave": wave, "judge_attempts": 0, "judge_route": 0} if pursuing else {}),
                  phase="judging" if pursuing else "done" if finished else "ready", step=number, accepted=candidate,
                  attempt=0, attempts_used=0, candidate=None, candidate_tree=None,

@@ -16,7 +16,7 @@ import shutil
 import subprocess
 
 from .checks import observed_pass
-from .engine import common_dir, git, tail, use_git_timeout, verify_registered_repository
+from .engine import commit_tree, common_dir, git, tail, use_git_timeout, verify_registered_repository
 from .insights import failure_excerpt
 from .process import PausedRun
 from .pursuit import screenshots
@@ -303,7 +303,7 @@ def build_one(run, state, ex, current, *, config, path, out, step, detail, promp
     if reason is not None:
         return record(run, ex, {**detail, "passed": False, "reason": redact(reason)[:1500]}, current, names)
     write_json(out / "checks.json", outputs)
-    commit = git(path, "commit-tree", snapshot, "-p", state["accepted"], "-m", step["title"])
+    commit = commit_tree(path, snapshot, state["accepted"], step["title"])
     verify_registered_repository(run.spec, common_dir(run.repository))
     git(run.repository, "update-ref", ref, commit)
     record(run, ex, {**detail, "passed": True, "reason": None, "commit": commit, "ref": ref,

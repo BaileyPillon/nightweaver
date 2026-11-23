@@ -683,9 +683,28 @@ def inherited_paths(milestones):
     return list(dict.fromkeys(path for step in milestones for path in step["paths"]))
 
 
+def wave_gates(spec):
+    """(each, final): the checks every milestone of a new wave passes, and those only the wave's last milestone passes in addition (the plan's
+    final_gates and the checks retained to its final milestone). Together they are the gates of the current last milestone.
+
+    A plan made by 0.19 did not record which checks are final-only, so they are derived: the per-milestone checks are those every earlier
+    milestone shares with the last one. A single-milestone plan gives nothing to compare with, so all its checks stay per-milestone."""
+    milestones = spec["milestones"]
+    last = milestones[-1]
+    names = spec.get("final_checks")
+    if names is None:
+        shared = [g for g in last["gates"] if all(g in step["gates"] for step in milestones[:-1])]
+        names = [g["name"] for g in last["gates"] if g not in shared] if shared else []  # nothing shared: nothing can be told apart
+    return [g for g in last["gates"] if g["name"] not in names], [g for g in last["gates"] if g["name"] in names]
+
+
+def listed(gates):
+    return "\n".join("- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in gates)
+
+
 def plan_prompt(run, state, room):
     pursue, wave = run.spec["pursue"], state.get("wave", 1)
-    last = run.spec["milestones"][-1]
+    each, final = wave_gates(run.spec)
     allowed = inherited_paths(run.spec["milestones"])
     protected = run.spec.get("protected_paths", [])
     events = run.store.events(run.id, limit=None, kinds=["goal_judged"])
@@ -707,8 +726,9 @@ def plan_prompt(run, state, room):
         f"scored {judged.get('score', '?')}/100, best {state.get('best_score', '?')}/100\nUnmet criteria\n{unmet}",
         (state.get("pursuit_note") + "\n\n" if state.get("pursuit_note") else "") + f"Gaps to close, most important first\n{gaps}",
         f"Checks that failed on the current build\n{failures}",
-        "Checks every new milestone must pass; the controller runs these exact checks\n" + "\n".join(
-            "- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in last["gates"]),
+        "Checks every new milestone must pass; the controller runs these exact checks\n" + listed(each or final)
+        + ("\n\nChecks the last milestone you plan must also pass. They hold for the finished build, so do not require them of an earlier one\n"
+           + listed(final) if each and final else ""),
         "Every new milestone is confined to these paths; the controller rejects a change outside them, so plan only work that fits\n"
         f"Allowed paths: {', '.join(allowed) or 'any file in the repository'}\n"
         f"Protected paths (no milestone may change them): {', '.join(protected) or 'none declared'}",
@@ -748,6 +768,8 @@ def plan_wave(run, state):
     room = min(run.spec["pursue"]["wave_size"], MAX_MILESTONES - len(run.spec["milestones"]))
     if room < 1:
         return milestone_limit(run, state, wave)
+    if not wave_gates(run.spec)[0]:
+        room = 1  # every check is a final one: a milestone before the last would pass nothing, so the wave is one milestone, as in the first plan
     path = worktree(run, state)
     folder = judge_dir(run, wave)
     log = folder / f"plan-{state.get('provider_calls', 0) + 1:04d}.jsonl"
@@ -763,8 +785,9 @@ def plan_wave(run, state):
         return
     last = run.spec["milestones"][-1]
     paths = inherited_paths(run.spec["milestones"])
-    steps = [{**item, "gates": last["gates"], "paths": paths, "worker": last["worker"],
-              "worker_fallbacks": last["worker_fallbacks"]} for item in planned]
+    each = wave_gates(run.spec)[0]  # the wave's last milestone passes the final checks as well, so it keeps every check of the plan's last
+    steps = [{**item, "gates": last["gates"] if number == len(planned) else each, "paths": paths, "worker": last["worker"],
+              "worker_fallbacks": last["worker_fallbacks"]} for number, item in enumerate(planned, 1)]
     drop_worktree(run, state)
     run.store.extend_plan(run.id, steps, {"wave": wave + 1, "titles": [s["title"] for s in steps], "planner": describe(config),
                                           **({"conflicts": conflicts} if conflicts else {})},

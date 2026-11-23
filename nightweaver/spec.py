@@ -340,6 +340,7 @@ def validate(raw, relative_to=None, store=None):
     milestones = array(raw.get("milestones", []), "milestones", 50)
     steps = []
     retained = []
+    final_only = [g["name"] for g in final_gates]  # the checks only the plan's last milestone passes; a pursuit's later waves need them told apart
     for index, item in enumerate(milestones):
         fields(item, "title task gates paths worker worker_fallbacks retain_gates", "milestone")
         own = [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
@@ -363,6 +364,8 @@ def validate(raw, relative_to=None, store=None):
             if name not in by_name:
                 current.append(gate)
                 by_name[name] = gate
+                if policy == "final":
+                    final_only.append(name)
             inherited.setdefault(name, []).append(source)
         if not current:
             raise ValueError("Each milestone needs uniquely named checks")
@@ -428,6 +431,7 @@ def validate(raw, relative_to=None, store=None):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
     if "pursue" in raw:
         out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
+        out["final_checks"] = final_only  # written by 0.19.1 on: a pursuit plan without it was made by 0.19 (see pursuit.wave_gates)
         if "explore" in out["pursue"]:
             out["pursue"]["explore"].setdefault("workers", [dict(steps[0]["worker"])])
     if "advisory_ollama" in raw:

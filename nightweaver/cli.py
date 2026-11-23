@@ -11,7 +11,7 @@ import threading
 import time
 from uuid import uuid4
 
-from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, source_info
+from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, require_identity, source_info
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
@@ -104,6 +104,22 @@ def background(store, run_id, retry, restarts=None):
     return child.pid
 
 
+def read_objective(path):
+    """The text of an objective file: UTF-8, nonempty, at most 1 MB. It exists because Windows caps a command line at 32,767 characters."""
+    path = Path(path).expanduser()
+    try:
+        if path.stat().st_size > 1000000:
+            raise ValueError(f"The objective file exceeds 1MB: {path}")
+        objective = path.read_text(encoding="utf-8-sig").strip()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"The objective file must be UTF-8 text: {path}") from error
+    except OSError as error:
+        raise ValueError(f"Cannot read the objective file {path}: {error}") from error
+    if not objective:
+        raise ValueError(f"The objective file is empty: {path}")
+    return objective
+
+
 def plan_goal(store, args, template=None):
     if template is None:
         path = Path(args.template).resolve(strict=True)
@@ -112,6 +128,8 @@ def plan_goal(store, args, template=None):
         raw, folder = template, Path(template["repository"])
     anchor_provider_paths(raw, folder)
     repository, project = resolve_repository(raw, folder, store)
+    if args.start or args.enqueue:
+        require_identity(repository)  # before the planner call: promotion would otherwise stop at the first accepted milestone
     raw["repository"] = str(repository)
     if project:
         raw["project"] = project["name"]
@@ -286,6 +304,8 @@ def pursuit_block(args):
 
 
 def register(store, spec, args):
+    if args.start or args.enqueue:
+        require_identity(Path(spec["repository"]))
     run_id = create_run(store, spec, enqueue=args.enqueue, after=args.after)
     result = {"run_id": run_id}
     if args.start:
@@ -347,10 +367,12 @@ def main(argv=None):
     add.add_argument("plan")
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
-    goal.add_argument("objective")
     one = commands.add_parser("oneshot", help="Build and verify a goal from a repository's committed tests")
     one.add_argument("repository", type=Path)
-    one.add_argument("objective")
+    for parser in (goal, one):
+        parser.add_argument("objective", nargs="?", help="The goal in one argument (or give --objective-file)")
+        parser.add_argument("--objective-file", type=Path, metavar="PATH",
+                            help="Read the objective from this UTF-8 file instead of the command line, which Windows limits to 32,767 characters")
     one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
     one.add_argument("--model", help="Model for the primary worker and planner")
     one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
@@ -689,6 +711,11 @@ def main(argv=None):
         p.add_argument("--project")
         p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","rescuing","planning","done","blocked"))
     args = app.parse_args(argv)
+    if args.command in ("goal", "oneshot"):
+        if args.objective is not None and args.objective_file is not None:
+            app.error("--objective-file cannot be combined with an objective argument")
+        if args.objective is None and args.objective_file is None:
+            app.error("give the objective as an argument or with --objective-file")
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
     if args.command in ("add", "goal") and args.after and not args.enqueue:
@@ -730,6 +757,8 @@ def main(argv=None):
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
     try:
+        if getattr(args, "objective_file", None) is not None:
+            args.objective = read_objective(args.objective_file)
         if args.command in ("db-backup", "db-check"):
             from .diagnostics import database_backup, database_check
             database = Path(args.home or default_home()) / "runs.sqlite3"
@@ -773,6 +802,8 @@ def main(argv=None):
             from .discovery import discover, verify_tools, web_goal
             if args.rescue_profile and not args.rescue:
                 raise ValueError("--rescue-profile requires --rescue")
+            if not args.preview:
+                require_identity(args.repository.expanduser().resolve())  # refuse before any model call, not at the first promotion
             args.planner = args.worker
             worker = planner_route(args)
             alternate = {"kind": args.rescue} if args.rescue else None
@@ -803,7 +834,9 @@ def main(argv=None):
             output(result)
             return launch_exit(result)
         if name == "wish":
-            from .wish import run_wish
+            from .wish import resolve, run_wish
+            if args.start:
+                require_identity(resolve(store, args.target)[0])  # before the brief writer's model call
             return run_wish(store, args)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
@@ -816,6 +849,9 @@ def main(argv=None):
             report = diagnose(store, read_plan(args.plan, store) if args.plan else None,
                               planner_route(args) if args.planner else None, args.live)
             output(report)
+            if report.get("identity", {}).get("status") == "blocked":
+                print(f"Nightweaver: {report['identity']['action']}", file=sys.stderr)
+                return 3
             return 3 if any(route["status"] in {"blocked", "unverified"} for route in report.get("providers", [])) else 0
         elif name == "project":
             if args.project_action == "list":

@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 from uuid import uuid4
 
-from .engine import source_info
+from .engine import identity_error, source_info
 from .providers import ProviderUnavailable, advisory, check_provider, claude_auth, describe_provider, invoke
 
 
@@ -155,6 +155,12 @@ def browser_readiness():
     return {**result, "status": "unavailable", "action": f"Install a browser: {hint}, or install Microsoft Edge or Google Chrome"}
 
 
+def identity_readiness(repository):
+    """Whether git can author the commits Nightweaver makes in the repository: promotion stops with 'Author identity unknown' otherwise."""
+    problem = identity_error(repository)
+    return {"status": "blocked", "action": problem} if problem else {"status": "ready"}
+
+
 def diagnose(store, spec=None, planner=None, live=False):
     report = {"data_directory": str(store.root),
               "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "gemini", "ollama")},
@@ -164,6 +170,7 @@ def diagnose(store, spec=None, planner=None, live=False):
     roles = []
     if spec:
         report["source"] = source_info(store, spec)
+        report["identity"] = identity_readiness(report["source"]["repository"])
         if "project" in spec:
             report["source"]["project"] = spec["project"]
         roles = [(f"worker {index}: {step['title']}", step["worker"])

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from . import context
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs
-from .engine import common_dir, git, git_bytes, verify_registered_repository
+from .engine import common_dir, complaint, git, git_bytes, identity_message, verify_registered_repository
 from .readiness import diagnose
 from .safety import write_json
 from .spec import artifact
@@ -29,11 +29,11 @@ def preflight(store, spec):
     except (OSError, ValueError) as error:
         report["context"] = []
         errors.append(f"Committed context: {error}")
-    for identity in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+    for role, identity in (("author", "GIT_AUTHOR_IDENT"), ("committer", "GIT_COMMITTER_IDENT")):
         try:
             git(repository, "var", identity)
         except ValueError as error:
-            errors.append(f"{identity}: {error}")
+            errors.append(identity_message(repository, {role: complaint(error)}))
     executables = {}
     browsers, pinned, baselines, verified_pins = set(), set(), set(), set()
     from .browser import uses_visual
