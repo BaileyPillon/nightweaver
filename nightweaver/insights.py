@@ -129,7 +129,20 @@ def diagnosis(store, run_id):
         "dispatcher_run_failed",
         "repeated_failure_stopped",
         "verification_inconsistent",
+        "pursuit_stopped",
+        "judge_invalid",
+        "plan_invalid",
+        "independence_degraded",
+        "directions_invalid",
+        "comparison_invalid",
+        "exploration_failed",
+        "exploration_skipped",
+        "rescue_diagnosis_invalid",
+        "rescue_comparison_invalid",
+        "rescue_failed",
+        "rescue_skipped",
         "blocked",
+        "model_mismatch",
     }
     failures = [e for e in events if e["kind"] in kinds]
     counts = Counter(e["details"].get("phase", e["kind"]) for e in failures if e["kind"] != "blocked")
@@ -164,6 +177,7 @@ def export_trace(store, run_id, output, after=0, until=None):
         "provider",
         "adapter",
         "model",
+        "served_model",
         "exit",
         "tree",
         "commit",
@@ -177,6 +191,9 @@ def export_trace(store, run_id, output, after=0, until=None):
         "stability_runs",
         "seconds",
         "same_failure_count",
+        "wave",
+        "score",
+        "verdict",
     }
     header = {"schema": "nightweaver.trace.v1", "run_id": run_id, "base": row["state"]["base"]}
     records = [header]

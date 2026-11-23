@@ -15,8 +15,10 @@ from .engine import Run, checkout, create_run, directory_identity, fork_run, pen
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
-from .spec import anchor_provider_paths, fields, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
+from .repair import conflict_brief
+from .spec import IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
 from .store import Store, default_home, timestamp
+from .verdicts import conflict_notes, extract_object
 from .safety import redact
 
 
@@ -47,8 +49,10 @@ def with_live_status(store, row, phases=None):
 def dispatch(store, watch, recover_guards=False):
     if watch:
         record_dispatch(store, "Dispatcher started")
+    from . import notify
     with run_lock(store.root / "dispatcher.lock", "Another dispatcher is already serving this runtime"):
         while True:
+            notify.release_due(store)  # the dispatcher outlives its runs: it sends what quiet hours held once they are over
             results = []
             if recover_guards:
                 from .recovery import recovery_status
@@ -65,8 +69,9 @@ def dispatch(store, watch, recover_guards=False):
                         results.append({"run_id": row["id"], "waiting": str(error)})
                     continue
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-                    store.transition(row["id"], "dispatcher_run_failed", {"issue": str(error)},
-                                     phase="blocked", last_error=redact(str(error)))
+                    details = {"issue": str(error)}
+                    notify.announce(store, row["id"], "dispatcher_run_failed", details, store.transition(
+                        row["id"], "dispatcher_run_failed", details, phase="blocked", last_error=redact(str(error))))
                     phase = "blocked"
                 results.append({"run_id": row["id"], "phase": phase})
             if not watch:
@@ -132,6 +137,8 @@ def plan_goal(store, args, template=None):
         "The final milestone must also pass the final checks. If there are no per-milestone checks, return one milestone. "
         "If there is no way to split the work while passing the per-milestone checks, return one milestone. "
         'Return only JSON {"milestones":[{"title":"...","task":"..."}]}. '
+        "If any requirements contradict each other or cannot be satisfied as stated (including with the access and tools described), "
+        'list them as an additional "conflicts":["..."] array next to milestones; otherwise omit it. '
         "These checks were chosen by the operator, keep them as provided: "
         + json.dumps(gates) + "\nFinal checks: " + json.dumps(final_gates)
         + "\nAcceptance requirements: " + json.dumps(raw.get("acceptance", []))
@@ -155,9 +162,9 @@ def plan_goal(store, args, template=None):
     if getattr(args, "prompt_only", False):
         return {"prompt": prompt, "baseline": raw.get("expected_base"), "fixed_milestones": fixed, "model_calls": 0}
     if args.start:
-        from .diagnostics import probe_browser_channels
-        checks = [g for step in prepared["milestones"] for g in step["gates"]]
-        errors = probe_browser_channels(g["browser"].get("channel", "bundled") for g in checks if g.get("kind") == "browser")
+        from .diagnostics import gate_browsers, probe_browser_channels
+        channels, pinned = gate_browsers(g for step in prepared["milestones"] for g in step["gates"])
+        errors = probe_browser_channels(channels, pinned=pinned)
         if errors:
             raise ValueError("OneShot browser check failed before planning:\n" + "\n".join(errors))
     if getattr(args, "plan_from", None):
@@ -180,8 +187,10 @@ def plan_goal(store, args, template=None):
             ) from error
         if code:
             raise ValueError(f"Planner exited {code}. See {log}")
-        response = json_response(answer)
-    fields(response, "milestones", "planner response")
+        response = extract_object(answer, "milestones")
+    fields(response, "milestones conflicts", "planner response")
+    conflicts = conflict_notes(response.get("conflicts"))
+    notes = "\n\n" + conflict_brief(conflicts) if conflicts else ""
     milestones = response.get("milestones", [])
     if not isinstance(milestones, list) or not 1 <= len(milestones) <= 5:
         raise ValueError("Planner did not return one to five milestones")
@@ -204,13 +213,13 @@ def plan_goal(store, args, template=None):
         text(item, "title")
         text(item, "task")
     if fixed:
-        raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"]}
+        raw["milestones"] = [{**original, "task": original["task"] + "\n\nPlan detail\n" + proposed["task"] + notes}
                              for original,proposed in zip(template_steps, milestones)]
     elif not gates and len(milestones) > 1:
         raw["milestones"] = [{"title": raw["title"], "task": "\n\n".join(
-            f"{s['title']}\n{s['task']}" for s in milestones)}]
+            f"{s['title']}\n{s['task']}" for s in milestones) + notes}]
     else:
-        raw["milestones"] = milestones
+        raw["milestones"] = [{**item, "task": item["task"] + notes} for item in milestones] if notes else milestones
     spec = validate(raw, store=store)
     if pin_source:
         current = source_info(store, spec)
@@ -219,7 +228,7 @@ def plan_goal(store, args, template=None):
         spec.update(git_directory_identity=identity, git_common_dir=source["git_common_dir"])
     if args.start or args.enqueue:
         result = register(store, spec, args)
-        return {**result, "milestones": raw["milestones"]}
+        return {**result, "milestones": raw["milestones"], **({"planner_conflicts": conflicts} if conflicts else {})}
     return raw
 
 
@@ -229,7 +238,51 @@ def planner_route(args):
         config["profile_dir"] = str(Path(args.profile_dir).expanduser().resolve())
     if args.model:
         config["model"] = args.model
+    if getattr(args, "effort", None):
+        config["effort"] = args.effort
+        return provider(config, IMPLEMENTERS, "planner")
     return config
+
+
+def route_config(kind, profile, model, effort, label, choices=IMPLEMENTERS):
+    config = {"kind": kind}
+    if profile:
+        config["profile_dir"] = str(Path(profile).expanduser().resolve())
+    if model:
+        config["model"] = model
+    if effort:
+        config["effort"] = effort
+    return provider(config, choices, label)
+
+
+EXPLORERS = ("codex", "claude", "deepseek", "gemini")
+
+
+def explore_kinds(args):
+    return [kind.strip() for kind in args.explore_workers.split(",")]
+
+
+def pursuit_block(args):
+    judge = args.judge or ("claude" if args.worker != "claude" else "codex")
+    block = {"judge": route_config(judge, args.judge_profile, args.judge_model, args.judge_effort, "judge", REVIEWERS)}
+    if args.planner_kind:
+        block["planner"] = route_config(args.planner_kind, args.planner_profile, args.planner_model, args.planner_effort, "planner")
+    for key, value in (("max_waves", args.waves), ("target_score", args.target_score)):
+        if value is not None:
+            block[key] = value
+    if args.reference:
+        block["references"] = [str(Path(item).expanduser().resolve()) for item in args.reference]
+    if args.rescue_strategies is not None:
+        # 0 turns the plateau rescue off; the rescue is otherwise on, with three strategies and one rescue per run.
+        block["rescue"] = {"max_rescues": 0} if args.rescue_strategies == 0 else {"strategies": args.rescue_strategies}
+    if args.explore is not None:
+        block["explore"] = {"directions": args.explore}
+        if args.explore_workers:
+            # The primary worker's kind keeps its profile, model and effort; any other kind starts from the CLI's own defaults.
+            block["explore"]["workers"] = [
+                route_config(kind, *((args.profile_dir, args.model, args.effort) if kind == args.worker else (None, None, None)), "explore worker")
+                for kind in explore_kinds(args)]
+    return block
 
 
 def register(store, spec, args):
@@ -251,6 +304,41 @@ def register(store, spec, args):
     return result
 
 
+def notify_command(store, args):
+    from . import notify
+    action = args.notify_action
+    if action == "setup":
+        events = [item for group in args.events or [] for item in group.split(",") if item] or None
+        quiet = None if args.quiet_hours is None else args.quiet_hours.strip()
+        print(notify.setup_text(notify.setup(store, server=args.server, events=events, quiet_hours=quiet, max_per_night=args.max_per_night,
+                                             images=False if args.no_images else None, rotate=args.rotate)))
+        return 0
+    if action == "status":
+        output(notify.status(store))
+    elif action == "off":
+        output(notify.off(store))
+    elif action == "test":
+        if not notify.configured(store):
+            raise ValueError("Notifications are not set up. Run nightweaver notify setup first")
+        sent, why = notify.send_test(store)
+        output({"sent": sent, **({} if sent else {"issue": why})})
+        return 0 if sent else 3
+    elif args.hours <= 0:
+        raise ValueError("--hours must be more than 0")
+    elif args.print:
+        report = notify.digest(store, args.hours)
+        text = report["title"] + "\n\n" + report["message"]
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, "replace").decode(encoding))  # a run title the console cannot show must not stop the digest
+    else:
+        if not notify.configured(store):
+            raise ValueError("Notifications are not set up. Run nightweaver notify setup first, or use --print")
+        report = notify.send_digest(store, args.hours)
+        output({key: report[key] for key in ("sent", "title", "counts", "held", "issue") if key in report})
+        return 0 if report["sent"] else 3
+    return 0
+
+
 def main(argv=None):
     app = argparse.ArgumentParser(prog="nightweaver")
     app.add_argument("--home", type=Path, help="Override private runtime data directory")
@@ -265,17 +353,48 @@ def main(argv=None):
     one.add_argument("objective")
     one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
     one.add_argument("--model", help="Model for the primary worker and planner")
+    one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
     one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
+    one.add_argument("--web", action=argparse.BooleanOptionalAction,
+                     help="The goal is a web page, so a new repository gets a browser smoke check (default: judged from the objective)")
     one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
     one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
     one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
     one.add_argument("--rescue-profile", help="Signed-in CLI profile for the alternate")
     one.add_argument("--direct", action="store_true", help="Use the objective as one milestone and skip the planner call")
+    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "deepseek"), help="Review every milestone with this provider")
+    one.add_argument("--reviewer-model")
+    one.add_argument("--reviewer-effort")
+    one.add_argument("--reviewer-profile", help="Signed-in CLI profile for the milestone reviewer")
+    one.add_argument("--pursue", action="store_true", help="Keep judging and planning further waves until the goal is met or progress stops")
+    one.add_argument("--judge", choices=("codex", "claude", "gemini", "deepseek"),
+                     help="Independent goal judge (default: a different model family from the worker)")
+    one.add_argument("--judge-model")
+    one.add_argument("--judge-effort")
+    one.add_argument("--judge-profile", help="Signed-in CLI profile for the judge")
+    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "deepseek"), help="Wave planner (default: the judge)")
+    one.add_argument("--planner-model")
+    one.add_argument("--planner-effort")
+    one.add_argument("--planner-profile")
+    one.add_argument("--waves", type=int, help="Additional waves allowed after the initial plan (1 to 20, default 3)")
+    one.add_argument("--target-score", type=int, help="Judge score from 0 to 100 that counts as done (default 85)")
+    one.add_argument("--reference", action="append", default=[], metavar="IMAGE",
+                     help="Reference image the judge compares screenshots with (repeatable, at most 6)")
+    one.add_argument("--explore", type=int, metavar="N",
+                     help="Before milestone 1, build N divergent design directions, compare them and keep the winner (2 to 4; requires --pursue)")
+    one.add_argument("--explore-workers", metavar="KIND[,KIND...]",
+                     help="Workers that build the directions in turn: codex, claude, deepseek or gemini (default: the primary worker)")
+    one.add_argument("--rescue-strategies", type=int, metavar="N",
+                     help="When progress stalls, try N divergent strategies from the best build (2 to 4, default 3; 0 turns the rescue off; requires --pursue)")
     launch_one = one.add_mutually_exclusive_group()
     launch_one.add_argument("--preview", action="store_true", help="Print the reusable plan and its checks without calling a model")
     launch_one.add_argument("--wait", action="store_true", help="Return the final run outcome")
     launch_one.add_argument("--enqueue", action="store_true", help="Use the persistent queue for the worker run")
     commands.add_parser("repair-history", help="Trace failed candidates and functional worker handoffs").add_argument("id")
+    pursue_cmd = commands.add_parser("pursuit", help="Show a goal pursuit run's waves, judgments and best build, or grant more waves")
+    pursue_cmd.add_argument("id")
+    pursue_cmd.add_argument("--json", action="store_true")
+    pursue_cmd.add_argument("--add-waves", type=int, metavar="N", help="Allow N more waves and resume a run stopped after judging (it plans the next wave from the best build's gaps)")
     guard = commands.add_parser("guard", help="Run with bounded recovery after a Windows runner exits unexpectedly")
     guard.add_argument("id")
     guard.add_argument("--max-restarts", type=int, choices=range(11), metavar="0..10")
@@ -287,6 +406,24 @@ def main(argv=None):
     single = commands.add_parser("event", help="Inspect one exact evidence event within a run")
     single.add_argument("id")
     single.add_argument("seq", type=int)
+    wisher = commands.add_parser("wish", help="Turn one line into a fully specified goal-pursuit run: brief, checks, models and pursuit")
+    wisher.add_argument("target", help="Repository folder or bound project name")
+    wisher.add_argument("wish", help="The wish, in one line")
+    wisher.add_argument("--roster", choices=("default", "fast"), default="default",
+                        help="default: extra-high effort everywhere; fast: CLI defaults and no reviewer or advisory")
+    wisher.add_argument("--brief-kind", choices=("claude", "codex", "deepseek"), help="Brief writer (default claude claude-opus-5-5 xhigh)")
+    wisher.add_argument("--brief-model")
+    wisher.add_argument("--brief-effort")
+    wisher.add_argument("--waves", type=int, help="Additional waves allowed after the initial plan (1 to 20, default 3)")
+    wisher.add_argument("--target-score", type=int, help="Judge score from 0 to 100 that counts as done (default 88)")
+    wisher.add_argument("--reference", action="append", default=[], metavar="IMAGE",
+                        help="Reference image the judge compares screenshots with (repeatable, at most 6)")
+    wisher.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
+                        help="With --start, launch under a dedicated crash supervisor with this lifetime restart allowance")
+    wish_launch = wisher.add_mutually_exclusive_group()
+    wish_launch.add_argument("--preview", action="store_true", help="Write the brief and template and stop before any planner call")
+    wish_launch.add_argument("--start", action="store_true", help="Plan with the pursuit planner and start a dedicated runner now")
+    wisher.add_argument("--wait", action="store_true", help="With --start, run through verification and return the outcome")
     for parser in (one, add, goal):
         parser.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
                             help="Launch under a dedicated crash supervisor with this lifetime restart allowance")
@@ -300,6 +437,7 @@ def main(argv=None):
         parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini"), default="claude" if parser is goal else None)
         parser.add_argument("--profile-dir")
         parser.add_argument("--model", help="Model used by the planner")
+        parser.add_argument("--effort", help="Reasoning effort used by the planner")
     project = commands.add_parser("project", help="Manage canonical project checkouts")
     project_commands = project.add_subparsers(dest="project_action", required=True)
     project_commands.add_parser("list")
@@ -322,6 +460,25 @@ def main(argv=None):
     configure = commands.add_parser("configure", help="Configure a provider using an existing local key file")
     configure.add_argument("provider", choices=("deepseek",))
     configure.add_argument("--key-file", type=Path, required=True)
+    notify = commands.add_parser("notify", help="Opt-in phone notifications and morning digest over ntfy")
+    notify_actions = notify.add_subparsers(dest="notify_action", required=True)
+    setup = notify_actions.add_parser("setup", help="Write the configuration with fresh random topics and print how to subscribe. Sends nothing")
+    setup.add_argument("--server", help="ntfy server URL (default https://ntfy.sh, or your own)")
+    from .notify import DEFAULT_EVENTS, OPTIONAL_EVENTS
+    setup.add_argument("--events", nargs="+", metavar="EVENT", help="Events to send, space or comma separated (default: "
+                       + " ".join(DEFAULT_EVENTS) + "; also available: " + " ".join(OPTIONAL_EVENTS) + "). A saved list that is the old "
+                       "default is upgraded; a customised one is kept, so add newer stops with --events")
+    setup.add_argument("--quiet-hours", metavar="HH:MM-HH:MM", help="Local night window with a message allowance (default 23:00-07:00; '' disables)")
+    setup.add_argument("--max-per-night", type=int, metavar="N", help="Messages allowed in quiet hours (default 3; usage-limit waits never count). The rest are held and "
+                       "sent soon after quiet hours end by any running dispatcher or run, or by `notify digest`")
+    setup.add_argument("--no-images", action="store_true", help="Never attach screenshots")
+    setup.add_argument("--rotate", action="store_true", help="Replace existing topics with new random ones")
+    notify_actions.add_parser("test", help="Send one test message now")
+    notify_actions.add_parser("status", help="Show the configuration with topics partly masked")
+    notify_actions.add_parser("off", help="Remove the notification configuration")
+    digest = notify_actions.add_parser("digest", help="Send a summary of recent runs")
+    digest.add_argument("--hours", type=float, default=12, help="Look back this many hours (default 12)")
+    digest.add_argument("--print", action="store_true", help="Print the digest instead of sending it")
     for name in ("run", "start", "pause", "resume", "status", "events"):
         parser = commands.add_parser(name)
         parser.add_argument("id")
@@ -530,7 +687,7 @@ def main(argv=None):
         if action == "list":
             p.add_argument("--compact", action="store_true", help="Return sidebar summaries without prompts and gate definitions")
         p.add_argument("--project")
-        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","done","blocked"))
+        p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","rescuing","planning","done","blocked"))
     args = app.parse_args(argv)
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
@@ -542,6 +699,23 @@ def main(argv=None):
             getattr(args, "preview", False) or getattr(args, "enqueue", False)
             or (args.command in ("goal", "add") and not args.start)):
         app.error("--guard-restarts requires a dedicated launch")
+    if args.command == "oneshot" and not args.pursue:
+        extras = [flag for flag, value in (("--judge", args.judge), ("--judge-model", args.judge_model), ("--judge-effort", args.judge_effort),
+                  ("--judge-profile", args.judge_profile), ("--planner-kind", args.planner_kind), ("--planner-model", args.planner_model),
+                  ("--planner-effort", args.planner_effort), ("--planner-profile", args.planner_profile), ("--waves", args.waves),
+                  ("--target-score", args.target_score), ("--reference", args.reference), ("--explore", args.explore is not None),
+                  ("--explore-workers", args.explore_workers), ("--rescue-strategies", args.rescue_strategies is not None)) if value]
+        if extras:
+            app.error(f"{', '.join(extras)} require --pursue")
+    if args.command == "oneshot":
+        if not args.planner_kind and (args.planner_model or args.planner_effort or args.planner_profile):
+            app.error("--planner-model, --planner-effort and --planner-profile require --planner-kind")
+        if not args.reviewer and (args.reviewer_model or args.reviewer_effort or args.reviewer_profile):
+            app.error("--reviewer-model, --reviewer-effort and --reviewer-profile require --reviewer")
+        if args.explore_workers and args.explore is None:
+            app.error("--explore-workers requires --explore")
+        if args.explore_workers and any(kind not in EXPLORERS for kind in explore_kinds(args)):
+            app.error("--explore-workers takes a comma-separated list of: " + ", ".join(EXPLORERS))
     if args.command == "events":
         if args.before is not None and (args.after is not None or args.until is not None or args.before < 1):
             app.error("--before requires a positive exclusive cursor and cannot combine with --after or --until")
@@ -550,8 +724,8 @@ def main(argv=None):
     if args.command == "doctor":
         if args.live and not (args.plan or args.planner):
             app.error("--live requires --plan or --planner")
-        if (args.profile_dir or args.model) and not args.planner:
-            app.error("--profile-dir and --model require --planner")
+        if (args.profile_dir or args.model or args.effort) and not args.planner:
+            app.error("--profile-dir, --model and --effort require --planner")
     if os.name != "nt":
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
@@ -566,6 +740,8 @@ def main(argv=None):
         store = Store(args.home)
         os.environ["NIGHTWEAVER_HOME"] = str(store.root)
         name = args.command
+        if name == "notify":
+            return notify_command(store, args)
         if name in ("guard", "recovery", "restarts", "recovery-queue"):
             from .recovery import EXIT_CODES, GUARD_EVENTS, recovery_status, supervise
             if name == "guard":
@@ -594,7 +770,7 @@ def main(argv=None):
             output(repair_history(store, args.id))
             return 0
         if name == "oneshot":
-            from .discovery import discover, verify_tools
+            from .discovery import discover, verify_tools, web_goal
             if args.rescue_profile and not args.rescue:
                 raise ValueError("--rescue-profile requires --rescue")
             args.planner = args.worker
@@ -604,7 +780,17 @@ def main(argv=None):
                 alternate["profile_dir"] = str(Path(args.rescue_profile).expanduser().resolve())
             if worker == alternate:
                 raise ValueError("Choose a distinct rescue provider or profile")
-            raw = discover(args.repository, args.objective, worker, alternate, args.python)
+            notes = []  # What a guess about the goal was, so the operator can overrule it.
+            raw = discover(args.repository, args.objective, worker, alternate, args.python,
+                           web=web_goal(args.objective) if args.web is None else args.web, notes=notes if args.web is None else None)
+            for note in notes:
+                print(note, file=sys.stderr)
+            if args.reviewer:
+                raw["reviewer"] = route_config(args.reviewer, args.reviewer_profile, args.reviewer_model, args.reviewer_effort, "reviewer", REVIEWERS)
+            if args.pursue:
+                raw["pursue"] = pursuit_block(args)
+                if raw["budgets"] == {"max_calls": 15, "max_seconds": 3600}:
+                    raw["budgets"] = {"max_calls": 80, "max_seconds": 21600}
             if args.expected_base and raw["expected_base"] != args.expected_base.lower():
                 raise ValueError("The repository moved since preview. Preview its checks again.")
             spec = validate(raw, store=store)
@@ -616,6 +802,9 @@ def main(argv=None):
             result = register(store, spec, args) if args.direct else plan_goal(store, args, raw)
             output(result)
             return launch_exit(result)
+        if name == "wish":
+            from .wish import run_wish
+            return run_wish(store, args)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
             report = (preflight(store, read_plan(args.plan, store)) if name == "preflight"
@@ -725,6 +914,18 @@ def main(argv=None):
         elif name in ("call-ledger", "browser-hotspots"):
             from .trajectory import call_ledger, browser_hotspots
             output((call_ledger if name == "call-ledger" else browser_hotspots)(store, args.id))
+        elif name == "pursuit":
+            from .pursuit import format_report, report
+            extension = store.extend_pursuit(args.id, args.add_waves) if args.add_waves is not None else None
+            data = {**report(store, args.id), **({"extension": extension} if extension else {})}
+            if args.json:
+                output(data)
+            else:
+                print(format_report(data))
+                if extension:
+                    print(f"Added {args.add_waves} waves (limit now {extension['max_waves']})."
+                          + (f" The run is back at the {'planner' if extension['phase'] == 'planning' else 'judge'}; resume or dispatch it to continue."
+                             if extension["resumed"] else ""))
         elif name == "status":
             output(with_live_status(store, store.get(args.id)))
         elif name == "events":

@@ -35,7 +35,8 @@ def preflight(store, spec):
         except ValueError as error:
             errors.append(f"{identity}: {error}")
     executables = {}
-    browsers, baselines, verified_pins = set(), set(), set()
+    browsers, pinned, baselines, verified_pins = set(), set(), set(), set()
+    from .browser import uses_visual
     from .journeys import browser_cases
     browser_work = []
     catalog_cache, catalog_baselines = {}, []
@@ -77,6 +78,8 @@ def preflight(store, spec):
                 continue
             config = gate["browser"]
             browsers.add(config.get("channel", "bundled"))
+            if uses_visual(config):
+                pinned.add(config.get("channel", "bundled"))  # Pixel baselines never move to another browser build.
             cases = list(browser_cases(config))
             samples = gate.get("stability_runs",1)
             browser_work.append({"milestone":number,"gate":gate["name"],"cases_per_sample":len(cases),
@@ -118,26 +121,42 @@ def preflight(store, spec):
                     errors.append(f"Invalid PNG baseline {name}: {error}")
         except ValueError as error:
             errors.append(f"Unreadable baseline {name}: {error}")
-    errors.extend(probe_browser_channels(browsers))
+    used = {}
+    errors.extend(probe_browser_channels(browsers, used, pinned))
     from .contracts import check_schedule
-    return {**report, "check_schedule": check_schedule(spec), "catalog_baselines":catalog_baselines, "browser_work":browser_work, "browser_channels": sorted(browsers), "gate_executables": executables, "errors": errors, "model_calls": 0,
+    return {**report, "check_schedule": check_schedule(spec), "catalog_baselines":catalog_baselines, "browser_work":browser_work, "browser_channels": sorted(browsers), "browser_channels_used": used, "gate_executables": executables, "errors": errors, "model_calls": 0,
             "verified_pins": [{"path": p, "sha256": h} for p,h in sorted(verified_pins)],
             "ready": not errors and all(p["status"] != "blocked" for p in report["providers"])}
 
 
-def probe_browser_channels(channels):
-    """Open an in-memory test page once per requested browser, independently of the project."""
+def gate_browsers(gates):
+    """(channels, pinned) the browser gates ask for. A channel is pinned when a gate on it compares visual_match baselines."""
+    from .browser import uses_visual
+    configs = [g["browser"] for g in gates if g.get("kind") == "browser"]
+    return ({c.get("channel", "bundled") for c in configs},
+            {c.get("channel", "bundled") for c in configs if uses_visual(c)})
+
+
+def probe_browser_channels(channels, resolved=None, pinned=()):
+    """Open an in-memory test page once per requested browser, independently of the project.
+
+    The bundled default falls back to an installed Edge or Chrome when its Chromium download is missing, except for a
+    channel in `pinned` (gates with visual baselines). `resolved`, when given, receives the channel each request will
+    actually use and any fallback."""
     errors = []
     for channel in sorted(set(channels)):
+        info = {}
         try:
             from .browser import browser_runtime
-            with browser_runtime(None if channel == "bundled" else channel, timeout=10000) as browser:
+            with browser_runtime(None if channel == "bundled" else channel, timeout=10000, info=info, allow_fallback=channel not in pinned) as browser:
                 page = browser.new_page()
                 page.set_content("<title>Nightweaver preflight</title>")
                 if page.title() != "Nightweaver preflight":
                     errors.append(f"Browser probe failed: {channel}")
         except Exception as error:
             errors.append(f"{channel}: {error}")
+        if info and resolved is not None:
+            resolved[channel] = {"used": info["used"], **({"fallback": info["fallback"]} if info["fallback"] else {})}
     return errors
 
 
@@ -233,12 +252,14 @@ def _database_check(file):
                     "invalid run state": """SELECT count(*) FROM runs WHERE json_type(state)!='object'
                         OR json_type(spec)!='object' OR coalesce(json_type(state,'$.step'),'')!='integer'
                         OR coalesce(json_extract(state,'$.phase'),'') NOT IN
-                        ('queued','ready','working','checking','reviewing','promoting','blocked','done')""",
+                        ('queued','ready','exploring','working','checking','reviewing','promoting','judging','rescuing','planning','blocked','done')""",
                     "invalid milestone cursor": """SELECT count(*) FROM runs WHERE
                         coalesce(json_type(spec,'$.milestones'),'') != 'array'
                         OR json_array_length(spec,'$.milestones') < 1
                         OR json_extract(state,'$.step') < 0
-                        OR CASE WHEN json_extract(state,'$.phase')='done'
+                        OR CASE WHEN json_extract(state,'$.phase') IN ('done','judging','rescuing','planning')
+                            OR (json_extract(state,'$.phase')='blocked'
+                                AND coalesce(json_extract(state,'$.blocked_from'),'') IN ('judging','rescuing','planning'))
                             THEN json_extract(state,'$.step') != json_array_length(spec,'$.milestones')
                             ELSE json_extract(state,'$.step') >= json_array_length(spec,'$.milestones') END""",
                     "missing prerequisite": """SELECT count(*) FROM runs r, json_each(r.state,'$.after') d

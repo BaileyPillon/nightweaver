@@ -1,20 +1,23 @@
 """Advance approved milestones through independent, content-addressed checks."""
 
 from contextlib import ExitStack
+import ctypes
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 from uuid import uuid4
+import shutil
 import subprocess
+import tempfile
 import time
 
-from .process import BusyRun, PausedRun, run_lock
-from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, usage
+from .process import BusyRun, ExtendedLimits, PausedRun, WindowsJob, run_lock
+from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
-from . import context
+from . import context, notify
 from .safety import atomic_write, redact, write_json
 from .store import timestamp
 
@@ -23,19 +26,154 @@ class BudgetExceeded(ValueError):
     pass
 
 
-def git_bytes(repo, *args, attributes_from=None):
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+GIT_TIMEOUT = 90
+WORKTREE_ADD_TIMEOUT = 900
+SETTLE_POLL, SETTLE_QUIET = 1.0, 5  # seconds between looks at an unfinished checkout; looks with no index lock before git is given up on
+IDLE_DEFAULT = 900
+PARK_MARGIN, PARK_UNPARSED, PARK_UNPARSED_MAX = 90, 1800, 7200
+
+
+def use_git_timeout(spec):
+    """The run's git_timeout is the default for every git call this process makes until another run sets its own."""
+    global GIT_TIMEOUT
+    GIT_TIMEOUT = spec.get("git_timeout", 90)
+
+
+class SurvivingJob(WindowsJob):
+    """A Job that ends its processes when terminate() says so and not when its handle closes. A runner that dies during a checkout
+    (a killed console, a crash) leaves git to finish it and release its lock, rather than cutting it in half."""
+
+    def __enter__(self):
+        super().__enter__()
+        if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(ExtendedLimits()), ctypes.sizeof(ExtendedLimits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.kernel.CloseHandle(self.handle)
+            raise error
+        return self
+
+
+def run_owned(argv, limit, env):
+    """subprocess.run for a git command that starts children, such as `worktree add`, which runs `reset --hard`.
+
+    The command and what it starts live in one Job. A timeout ends them all and returns at once, where subprocess.run
+    kills only the parent and then waits for an orphaned child to release the pipes, which can take as long as the checkout."""
+    with tempfile.TemporaryDirectory(prefix="nw-git-", ignore_cleanup_errors=True) as temp, SurvivingJob() as job:
+        out, err = Path(temp, "out"), Path(temp, "err")
+        with out.open("wb") as stdout, err.open("wb") as stderr:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                       creationflags=subprocess.CREATE_NO_WINDOW, env=env)
+            try:
+                try:
+                    job.attach(process.pid)
+                except OSError:
+                    pass  # the kill below still ends the parent
+                process.wait(timeout=limit)
+            finally:
+                if process.poll() is None:
+                    try:
+                        job.terminate()
+                    except OSError:
+                        pass
+                    process.kill()
+                    process.wait(timeout=30)
+        return subprocess.CompletedProcess(argv, process.returncode, out.read_bytes(), err.read_bytes())
+
+
+def abandon_worktree(repo, args):
+    """Take a half-made `git worktree add` back out so that --retry starts clean. Git holds the entry locked while the
+    checkout runs and `prune` skips locked entries, so it is unlocked and removed first. Never raises."""
+    folders = [arg for arg in args[2:] if not arg.startswith("-")]
+    if not folders:
+        return
+    path = folders[0]
+    for step in (("unlock", path), ("remove", "--force", "--force", path)):
+        try:
+            git(repo, "worktree", *step, timeout=60)
+        except (ValueError, subprocess.TimeoutExpired, OSError):
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+    try:
+        git(repo, "worktree", "prune", "--expire", "now", timeout=60)
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def initializing(path):
+    """The admin folder of a worktree whose `git worktree add` has not finished (git keeps it locked as 'initializing'), else None."""
+    try:
+        link = Path(path, ".git").read_text(encoding="utf-8").strip()
+        admin = Path(link.partition(":")[2].strip())
+        return admin if link.startswith("gitdir:") and (admin / "locked").read_text(encoding="utf-8").strip() == "initializing" else None
+    except OSError:
+        return None
+
+
+def settle_worktree(repo, path, wait=None):
+    """Whether `path`, if anything is there, is a finished checkout that can be reused. False means it was cleared away (or never
+    existed) and the caller makes it again.
+
+    A runner that died during `git worktree add` leaves the entry locked while git, which outlives it, finishes the checkout: wait for
+    that. If git died too (a reboot, a killed process tree) nothing ever releases the lock or its index.lock: the checkout is taken out
+    for good once no process holds the index lock, or after `wait` seconds (the add timeout by default)."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    if not (path / ".git").is_file():
+        if path.is_dir() and not any(path.iterdir()):  # git died before it linked the checkout
+            abandon_worktree(repo, ("worktree", "add", str(path)))
+            return False
+        return True  # not ours to judge: the caller reports the missing link
+    admin = initializing(path)
+    if admin is None:
+        return True
+    deadline = time.monotonic() + (WORKTREE_ADD_TIMEOUT if wait is None else wait)
+    unheld = 0
+    while admin is not None:
+        lock = admin / "index.lock"
+        stale = False
+        if lock.exists():
+            unheld = 0
+            try:
+                lock.unlink()  # a running git has it open and Windows refuses; a dead one's lock is just a file
+                stale = True
+            except OSError:
+                pass
+        else:
+            unheld += 1
+            stale = unheld >= SETTLE_QUIET
+        if stale or time.monotonic() >= deadline:
+            abandon_worktree(repo, ("worktree", "add", str(path)))
+            return False
+        time.sleep(SETTLE_POLL)
+        admin = initializing(path)
+    return True
+
+
+def git_bytes(repo, *args, attributes_from=None, timeout=None):
+    from .safety import scrub_env  # repository hooks and filters run inside git, so no provider credential reaches it
+
+    env = {**scrub_env(os.environ), "GIT_OPTIONAL_LOCKS": "0"}
     if attributes_from is not None:
         env["GIT_ATTR_SOURCE"] = attributes_from
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=90,
-                            creationflags=subprocess.CREATE_NO_WINDOW, env=env)
+    limit = timeout or GIT_TIMEOUT
+    adding = args[:2] == ("worktree", "add")
+    if adding:
+        limit = max(limit, WORKTREE_ADD_TIMEOUT)  # a checkout of a very large repository takes minutes
+    argv = ["git", "-C", str(repo), *args]
+    try:
+        result = (run_owned(argv, limit, env) if adding else
+                  subprocess.run(argv, capture_output=True, timeout=limit, creationflags=subprocess.CREATE_NO_WINDOW, env=env))
+    except subprocess.TimeoutExpired:
+        if adding:
+            abandon_worktree(repo, args)
+        raise
     if result.returncode:
         raise ValueError(result.stderr.decode("utf-8", "replace").strip() or f"Git {args[0]} failed")
     return result.stdout
 
 
-def git(repo, *args):
-    return git_bytes(repo, *args).decode("utf-8", "replace").rstrip("\r\n")
+def git(repo, *args, timeout=None):
+    return git_bytes(repo, *args, timeout=timeout).decode("utf-8", "replace").rstrip("\r\n")
 
 
 def common_dir(path):
@@ -107,7 +245,11 @@ def fork_run(store, run_id, milestone, worker=None):
     accepted = store.accepted_milestones(run_id)
     if type(milestone) is not int or not 0 <= milestone <= len(accepted):
         raise ValueError("Choose an accepted milestone number, or 0 for the original baseline")
-    remaining = original["spec"]["milestones"][milestone:]
+    # A pursuit that reverted holds milestones of discarded waves: a checkpoint is a milestone of the current build, and the
+    # discarded work is not carried into the fork.
+    cut = 0 if milestone == 0 else accepted[milestone - 1].get("step", milestone)
+    skipped = {item.get("step") for item in store.accepted_milestones(run_id, discarded=True)} - {item.get("step") for item in accepted}
+    remaining = [step for number, step in enumerate(original["spec"]["milestones"], 1) if number > cut and number not in skipped]
     if not remaining:
         raise ValueError("No milestones remain after that checkpoint; choose an earlier checkpoint")
     base = original["state"]["base"] if milestone == 0 else accepted[milestone - 1]["commit"]
@@ -121,6 +263,8 @@ def fork_run(store, run_id, milestone, worker=None):
     verify_project_binding(store, spec, repo, gitdir)
     if worker:
         spec["milestones"] = [{**step, "worker": worker, "worker_fallbacks": []} for step in remaining]
+    if milestone and spec.get("pursue", {}).get("explore"):
+        spec["pursue"] = {k: v for k, v in spec["pursue"].items() if k != "explore"}  # the tournament picks a first milestone's direction
     pack = context.capture(spec, base)
     new_id = store.create(spec, base, context_pack=pack)
     store.transition(new_id, "checkpoint_forked", {"source_run": run_id, "milestone": milestone, "base": base})
@@ -135,13 +279,65 @@ def tail(path, count=3600):
         return data.read().decode("utf-8", "replace").strip()
 
 
-def tree(path, base, allowed, protected):
+def tool_dropping(name):
+    """Files that browsers and agent tooling leave behind, never part of a milestone's work."""
+    *folders, leaf = name.split("/")
+    leaf = leaf.casefold()
+    return leaf in ("debug.log", "chrome_debug.log") or leaf.endswith(".dmp") or ".playwright-mcp" in (f.casefold() for f in folders)
+
+
+def stage(path, base, keep=()):
+    """Stage the worktree, then take tool droppings back out of the index, so the index holds what the candidate commit holds.
+
+    Returns (changes, dropped): every (status, name) the worktree differs from base by, and the new files left out.
+    tree(), reject() and the no-progress check all take their identity from here, so they always agree on the build.
+    Only a new file can be a dropping, and never one that is a deliverable: a path inside what the milestone names in `keep`, or
+    one that tracked content moved to (a rename git can see, or the file name of a tracked dropping-shaped file the milestone deleted)."""
+    from .contracts import under
+    git(path, "add", "-A", "--", ".")
+    fields = git(path, "diff", "--cached", "--no-renames", "--name-status", "-z", base).split("\0")
+    changes = list(zip(fields[0::2], fields[1::2]))
+    dropped = [name for status, name in changes if status == "A" and tool_dropping(name) and not under(name, keep)]
+    if dropped:
+        # The content of a tracked file that moved is never lost: it is a rename, or it keeps the name of the dropping-shaped file it left.
+        renamed = set(git(path, "diff", "--cached", "-M", "--diff-filter=R", "--name-only", "-z", base).split("\0"))
+        left = {name.rpartition("/")[2].casefold() for status, name in changes if status == "D" and tool_dropping(name)}
+        dropped = [name for name in dropped if name not in renamed and name.rpartition("/")[2].casefold() not in left]
+    for start in range(0, len(dropped), 100):
+        git(path, "--literal-pathspecs", "reset", "-q", "--", *dropped[start:start + 100])
+    return changes, dropped
+
+
+def remove_droppings(path, names):
+    """Delete untracked droppings from the worktree: a gate must never see a file the accepted commit will not contain."""
+    root = os.path.realpath(path)
+    for name in names:
+        target = Path(path, *name.split("/"))
+        if os.path.commonpath([root, os.path.realpath(target.parent)]) != root:
+            raise ValueError(f"A tool left a file outside the worktree: {name}")
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as error:
+            raise ValueError(f"A tool left a file that cannot be removed: {name} ({error.strerror or error})") from error
+        for folder in target.parents:
+            if os.path.realpath(folder) == root:
+                break
+            try:
+                folder.rmdir()
+            except OSError:
+                break
+
+
+def tree(path, base, allowed, protected, removed=None):
     from .contracts import under
     if git(path, "rev-parse", "HEAD") != base:
         raise ValueError("Worktree HEAD changed. Keep agent edits uncommitted.")
-    git(path, "add", "-A", "--", ".")
-    names = git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", base).split("\0")
-    names = [name for name in names if name]
+    changes, dropped = stage(path, base, allowed)
+    remove_droppings(path, dropped)
+    if removed is not None:
+        removed.extend(dropped)
+    skipped = set(dropped)
+    names = [name for _, name in changes if name not in skipped]
     if not names:
         raise ValueError("The milestone produced no tracked changes")
     forbidden = [name for name in names if under(name, protected)]
@@ -193,6 +389,90 @@ def preserve_artifacts(path, output, names, before, max_bytes=32 * 1024 * 1024):
     return recorded
 
 
+def counted_usage(receipt, log, kind, state):
+    """Codex reports usage cumulatively across a resumed thread, so count only what this call added.
+
+    Returns the receipt to record (observed_tokens is the delta, reported_tokens the raw figure) and the state to keep."""
+    session = metadata(Path(log), kind)[0] if kind == "codex" and receipt["observed_tokens"] is not None else None
+    if not session:
+        return receipt, {}
+    sessions, channels = state.get("session_usage", {}), state.get("session_channels", {})
+    seen = channels.get(session, {})
+
+    def added(total, before):
+        return total if before is None or total < before else total - before
+
+    raw = receipt["observed_tokens"]
+    counted = {**receipt, "observed_tokens": added(raw, sessions.get(session)), "reported_tokens": raw, "session": session,
+               "token_channels": {key: added(value, seen.get(key)) for key, value in receipt["token_channels"].items()}}
+    return counted, {"session_usage": {**sessions, session: raw}, "session_channels": {**channels, session: receipt["token_channels"]}}
+
+
+def park_plan(spec, state, error, now, kind):
+    """Decide whether a usage limit is waited out or blocks the run, and until when."""
+    policy = spec.get("retry", {})
+    number = state.get("parks", 0) + 1
+    reset = error.reset_at or reset_after(str(error), now)
+    parsed = reset is not None
+    until = (max(reset, now) + timedelta(seconds=PARK_MARGIN) if parsed else
+             now + timedelta(seconds=min(PARK_UNPARSED_MAX, PARK_UNPARSED * 2 ** (number - 1))))
+    wait = (until - now).total_seconds()
+    name = {"codex": "Codex", "claude": "Claude", "deepseek": "DeepSeek", "gemini": "Gemini"}.get(kind, kind)
+    when = (reset if parsed else until).astimezone()
+    clock = when.strftime("%H:%M" if when.date() == now.astimezone().date() else "%b %d %H:%M")
+    limits = spec.get("budgets", {})
+    deadline = (datetime.fromisoformat(state["started_at"]) + timedelta(seconds=limits["max_seconds"])
+                if limits.get("max_seconds") and state.get("started_at") else None)
+    allowed, longest = policy.get("max_parks", 8), policy.get("max_park_seconds", 21600)
+    if number > allowed:
+        block = (f"{name} usage limit reached and waiting is disabled (retry.max_parks is 0)" if not allowed else
+                 f"{name} usage limit was hit again after {number - 1} waits, the most this run allows (retry.max_parks {allowed})")
+    elif wait > longest:
+        block = (f"{name} usage limit {'resets at ' + clock if parsed else 'gave no reset time and the next retry is at ' + clock}, "
+                 f"{wait / 3600:.1f} hours away, longer than this run waits (retry.max_park_seconds {longest})")
+    elif deadline and until > deadline:
+        block = (f"{name} usage limit resets at {clock}, after this run's time budget" if parsed else
+                 f"{name} usage limit gave no reset time and the next retry at {clock} is after this run's time budget")
+    else:
+        block = None
+    return {"block": block, "park": number, "parsed": parsed, "until": until.isoformat(timespec="milliseconds"),
+            "reset": reset.isoformat(timespec="seconds") if parsed else None, "seconds": round(wait)}
+
+
+def call_served(run, pending, state):
+    """The model ids the provider's log reports for a finished call. A log that cannot be read never fails the call."""
+    try:
+        config = {"kind": pending["provider"]}
+        if pending["role"] in ("worker", "reviewer", "judge", "planner"):
+            try:
+                step = run.spec["milestones"][state["step"]] if pending["role"] in ("worker", "reviewer") else None
+                from . import pursuit
+                routed = (pursuit.active_route(run, state)[1] if pending["role"] == "judge" and run.spec.get("pursue") and state.get("phase") == "judging"
+                          else run.route(state, step, pending["role"]))
+                if routed.get("kind") == pending["provider"] and routed.get("model") == pending.get("model"):
+                    config = routed  # carries the profile directory a Codex rollout is looked up in
+            except (KeyError, IndexError, TypeError):
+                pass
+        return served_models(config, pending["log"])
+    except Exception:
+        return {"models": [], "source": None}
+
+
+def model_drift(pending, served, seen):
+    """model_mismatch events for reported ids that differ from the model a route asked for, once per route and id."""
+    requested = pending.get("model")
+    events, seen = [], list(seen)
+    for name in served["models"] if requested else ():
+        key = "|".join(str(part) for part in (pending.get("role"), pending["provider"], requested, name))
+        if key in seen or same_model(requested, name):
+            continue
+        seen.append(key)
+        events.append(("model_mismatch", {"provider": pending["provider"], "role": pending.get("role"), "requested": requested, "served": name,
+                       "source": served["source"], "call": pending.get("call"),
+                       "issue": f"{pending['provider']} {pending.get('role')} asked for {requested} but was served {name}"}))
+    return events, seen
+
+
 class Run:
     def __init__(self, store, run_id):
         self.store = store
@@ -204,7 +484,9 @@ class Run:
         self.ref = row["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
 
     def set(self, kind, details=None, **state):
-        return self.store.transition(self.id, kind, details, **state)
+        result = self.store.transition(self.id, kind, details, **state)
+        notify.on_transition(self.store, self.id, self.spec["title"], kind, details, state.get("following_event"), result)
+        return result
 
     def paused(self):
         self.check_budget()
@@ -222,41 +504,68 @@ class Run:
             raise BudgetExceeded("Run observed-token budget exhausted; usage may overshoot by the last call")
 
     def route(self, state, step, role):
+        pursue = self.spec.get("pursue")
         routes = ([step["worker"], *step.get("worker_fallbacks", [])] if role == "worker" else
+                  [pursue["judge"], *pursue["judge_fallbacks"]] if role == "judge" else
+                  [pursue["planner"]] if role == "planner" else
                   [self.spec["reviewer"], *self.spec.get("reviewer_fallbacks", [])])
         return routes[min(state.get(role + "_route", 0), len(routes) - 1)]
 
-    def finish_call(self, pending, *, recovered=False):
-        receipt = usage(Path(pending["log"]), pending["provider"])
+    def finish_call(self, pending, *, recovered=False, succeeded=False):
         state = self.store.get(self.id)["state"]
+        receipt, sessions = counted_usage(usage(Path(pending["log"]), pending["provider"]), pending["log"], pending["provider"], state)
+        served = call_served(self, pending, state)
+        mismatches, seen = model_drift(pending, served, state.get("model_mismatches", []))
         self.set("provider_call_finished", {**pending, **receipt, "recovered": recovered,
-                 "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds())},
-                 pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
-                 usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None))
+                 "seconds": None if recovered else max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(pending["started"])).total_seconds()),
+                 "served_model": served["models"][0] if served["models"] else None,
+                 **({"served_models": served["models"]} if len(served["models"]) > 1 else {}),
+                 **({"served_source": served["source"]} if served["source"] else {})},
+                 following_event=mismatches or None, pending_call=None, observed_tokens=state.get("observed_tokens", 0) + (receipt["observed_tokens"] or 0),
+                 usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None), **sessions,
+                 **({"parks": 0} if succeeded and state.get("parks") else {}), **({"model_mismatches": seen} if mismatches else {}))
 
-    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None):
+    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None):
         self.check_budget(call=True)
         state = self.store.get(self.id)["state"]
+        milestone = role in ("worker", "reviewer")
         pending = {"call": state.get("provider_calls", 0) + 1, "role": role, "provider": config["kind"],
                    "model": config.get("model"), "started": timestamp(), "log": str(log),
-                   "step": state["step"] + 1, "attempt": state["attempt"]}
+                   "step": state["step"] + int(milestone), "attempt": state["attempt"]}
+        if not milestone:
+            pending["wave"] = state.get("wave", 1)
+        if "effort" in config:
+            pending["effort"] = config["effort"]
         self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
         limits = self.spec.get("budgets", {})
         health = {"max_log_bytes": limits.get("max_log_bytes", 16 * 1024 * 1024),
                   "heartbeat": lambda info: self.set("process_heartbeat", {**info, "role": role})}
         if "idle_timeout" in limits:
             health["idle_timeout"] = limits["idle_timeout"]
+        elif role in ("worker", "reviewer", "judge", "planner") and self.spec.get("idle_default"):
+            # A silent stall otherwise runs to the full agent timeout. Only plans written by 0.19 carry the marker, so a saved
+            # 0.18 plan keeps the behavior it was approved with.
+            health["idle_timeout"] = IDLE_DEFAULT
+        returned = False
         try:
-            return invoke(config, role, path, log, prompt, self.spec["agent_timeout"], self.paused,
-                          session, evidence=evidence, health=health)
+            result = invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
+                            session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
+            returned = True
+            return result
         finally:
-            self.finish_call(pending)
+            self.finish_call(pending, succeeded=returned)
 
     def worktree(self, state):
+        use_git_timeout(self.spec)
         path = self.root / "worktrees" / f"{state['step'] + 1:02d}"
-        if not path.exists():
+        if not settle_worktree(self.repository, path):
             path.parent.mkdir(parents=True, exist_ok=True)
-            git(self.repository, "worktree", "add", "--detach", str(path), state["accepted"])
+            try:
+                git(self.repository, "worktree", "add", "--detach", str(path), state["accepted"])
+            except subprocess.TimeoutExpired as error:
+                # git_bytes has already unlocked, removed and pruned the half-made checkout, so --retry starts clean.
+                raise ValueError(f"Creating the run worktree took more than {int(error.timeout)} seconds on this repository. "
+                                 "Raise git_timeout in the plan, then resume with --retry.") from error
             self.set("worktree_ready", {"path": str(path), "base": state["accepted"]})
         if not (path / ".git").is_file():
             raise ValueError(f"The run worktree is missing its Git link: {path}")
@@ -267,27 +576,36 @@ class Run:
     def evidence_dir(self, state):
         return self.root / "evidence" / f"{state['step'] + 1:02d}" / f"{state['attempt']:02d}"
 
-    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, **state):
-        from .repair import describe, next_worker
+    def explores(self, state):
+        """Whether milestone 1 starts with the design-direction tournament that this run has not yet held."""
+        return bool(self.spec.get("pursue", {}).get("explore")) and state["step"] == 0 and not state.get("explored")
+
+    def reject(self, reason, phase, *, exit_code=None, failed_gates=(), repairable=True, finding=None, seen=None, **state):
+        """`seen` is the operator-feedback version the judgment of this build was made with (a reviewer's REVISE), which can be older
+        than the one in the store when the operator spoke while the reviewer was working."""
+        from .repair import blocked_message, cause_line, describe, droppings_note, fingerprint, next_worker
         current = self.store.get(self.id)["state"]
         reason = redact(reason)
+        if phase in ("check", "snapshot", "artifact", "review"):
+            reason = droppings_note(current.get("droppings"), current["step"] + 1, current["attempt"]) + reason
         path = self.root / "worktrees" / f"{current['step'] + 1:02d}"
         changed = []
         try:
-            git(path, "add", "-A", "--", ".")
+            changes, dropped = stage(path, current["accepted"], self.spec["milestones"][current["step"]]["paths"])
             signature = git(path, "write-tree")
-            names = git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", current["accepted"], "--")
-            changed = [n for n in names.split("\0") if n]
+            left_out = set(dropped)
+            changed = [name for _, name in changes if name not in left_out]
         except (ValueError, OSError):
             signature = "unknown"
-        fingerprint = hashlib.sha256(f"{phase}\n{reason}\n{signature}".encode()).hexdigest()
-        count = current.get("failure_count", 0) + 1 if fingerprint == current.get("failure_fingerprint") else 1
+        # The identity of a failure is what failed on which build, never how it was worded.
+        identity = fingerprint(phase, signature, failed_gates, exit_code, reason, current.get("feedback_version", 0))
+        count = current.get("failure_count", 0) + 1 if identity == current.get("failure_fingerprint") else 1
         limit = self.spec.get("retry", {}).get("repeated_failure_limit", 3)
         step = self.spec["milestones"][current["step"]]
         active = current.get("worker_route", 0)
         used = current.get("attempts_used", current["attempt"])
         repair = self.spec.get("repair", {})
-        eligible = repairable and phase in ("worker", "snapshot", "check", "review")
+        eligible = repairable and phase in ("worker", "snapshot", "check", "review", "no_progress")
         streak = current.get("route_rejections", 0) + int(eligible)
         target = next_worker(step, active) if eligible and repair.get("switch_after") and streak >= repair["switch_after"] else None
         handoff = target is not None and used < self.spec["attempts"]
@@ -295,25 +613,42 @@ class Run:
         exhausted = used >= self.spec["attempts"]
         blocked = repeated or exhausted
         location = {"step": current["step"] + 1, "attempt": current["attempt"]}
-        event = None
+        event = cause = None
+        message = reason
+        if blocked:
+            # An operator reads the cause first, then the last failure, then the worker's own account.
+            cause = cause_line(phase, list(failed_gates), count, used, self.spec["attempts"], repeated)
+            message = blocked_message(cause, reason, state.get("worker_summary", current.get("worker_summary", "")))
         if handoff:
             routes = [step["worker"], *step["worker_fallbacks"]]
             event = ("repair_handoff", {**location, "from": describe(routes[active]), "to": describe(routes[target]),
                      "from_route": active, "to_route": target, "tree": signature, "phase": phase, "failed_gates": list(failed_gates)})
             state.update(worker_route=target, worker_session=None)
         elif repeated:
-            event = ("repeated_failure_stopped", {"issue": reason, "count": count})
+            event = ("repeated_failure_stopped", {"issue": reason, "count": count, "cause": cause})
         elif exhausted:
-            event = ("blocked", {"issue": reason})
+            event = ("blocked", {"issue": reason, "cause": cause})
         elif eligible and repair.get("fresh_session_after") and streak >= repair["fresh_session_after"]:
             state["worker_session"] = None
+        # Remember this milestone's rejected builds so work() can tell when the worker changed nothing.
+        trees = current.get("rejected_trees", []) if current.get("rejected_step") == current["step"] else []
+        remembered = trees[-1].get("issue", reason) if phase == "no_progress" and trees else reason
+        # A review that gave no readable feedback is not feedback the worker could have ignored.
+        kept = "review_unreadable" if phase == "review" and not finding else phase
+        older = [{"tree": item["tree"], "phase": item["phase"], "feedback": item.get("feedback", 0)} for item in trees]
+        # The feedback version a rejection answers is the one its judge worked from. A no-progress rejection judges nothing new.
+        asked = (trees[-1].get("feedback", 0) if phase == "no_progress" and trees else
+                 current.get("feedback_version", 0) if seen is None else seen)
+        state.update(rejected_trees=[*older, {"tree": signature, "phase": kept, "issue": remembered[:3000], "feedback": asked}][-4:],
+                     rejected_step=current["step"])
         delay = min(self.spec.get("retry", {}).get("max_seconds", 60),
                     self.spec.get("retry", {}).get("initial_seconds", 2) * 2 ** min(current.get("attempts_used", 1) - 1, 10))
         self.set("attempt_rejected", {**location, "phase": phase, "issue": reason, "same_failure_count": count, "exit": exit_code,
                  "tree": signature, "route": active, "failed_gates": list(failed_gates), "worker": describe(self.route(current, step, "worker")),
-                 "changed_paths": changed[:12], "changed_path_count": len(changed), "diagnostic_log": current.get("log")},
-                 following_event=event, phase="blocked" if blocked else "ready", last_error=reason,
-                 failure_fingerprint=None if handoff else fingerprint, route_rejections=0 if handoff else streak,
+                 "changed_paths": changed[:12], "changed_path_count": len(changed), "diagnostic_log": current.get("log"),
+                 **({"finding": redact(finding)[:3000]} if finding else {})},
+                 following_event=event, phase="blocked" if blocked else "ready", last_error=message,
+                 failure_fingerprint=None if handoff else identity, route_rejections=0 if handoff else streak,
                  failure_count=0 if handoff else count, retry_at=None if blocked else (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(), **state)
 
     def worker_prompt(self, state, step):
@@ -321,10 +656,13 @@ class Run:
         checks = "\n".join("- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in step["gates"])
         following = self.spec["milestones"][state["step"] + 1:state["step"] + 2]
         next_task = (f"Next milestone after acceptance: {following[0]['title']} — {following[0]['task'][:800]}"
-                     if following else "This is the final milestone.")
+                     if following else "This is the last planned milestone. The goal is judged afterwards and more milestones may follow."
+                     if self.spec.get("pursue") else "This is the final milestone.")
         prior = []
+        from .pursuit import reachable
+        ours = reachable(self, state) if state.get("judgments") else None
         for item in self.store.accepted_milestones(self.id):
-            if item["step"] <= state["step"]:
+            if item["step"] <= state["step"] and (ours is None or item["commit"] in ours):
                 line = f"- {self.spec['milestones'][item['step'] - 1]['title']} ({item['commit']})"
                 if item.get("verified_checks"):
                     line += " · Passed: " + ", ".join(item["verified_checks"])
@@ -332,8 +670,16 @@ class Run:
         prior_summary = "\n".join(prior) or "None yet"
         from .repair import failure_brief
         history = failure_brief(self.store, self.id, state, self.spec.get("repair", {}).get("history", 0))
+        from .pursuit import worker_brief
+        pursuit = worker_brief(self.spec, state)
+        from .repair import conflict_brief
+        notes = conflict_brief(state.get("pursuit_conflicts"))
+        advice = state.get("advice_note")
+        if advice and state.get("advice_step") in (state["step"], state["step"] - 1):
+            which = "this milestone's previous review" if state.get("advice_step") == state["step"] else "the previous milestone"
+            notes += f"{chr(10) * bool(notes)}Local reviewer note from {which}: {advice}"
         return (
-            f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}\n"
+            f"Project goal\n{self.spec['objective']}\n{self.acceptance_brief()}{chr(10) + pursuit if pursuit else ''}\n"
             f"Accepted milestones in this checkout\n{prior_summary}\n\n"
             f"Milestone {state['step'] + 1}/{len(self.spec['milestones'])}: {step['title']}\n{step['task']}\n\n"
             f"{next_task}\n\n"
@@ -345,6 +691,7 @@ class Run:
             f"{checks}\n\n{context.brief(self.store, self.id)}\n\n"
             f"Budget remaining before this call: {budget_status(self.spec, state)['remaining']}\n"
             f"Operator updates\n{self.store.feedback_text(self.id) or 'None'}\n\n"
+            f"{notes + chr(10) + chr(10) if notes else ''}"
             f"{history}Last observed failure (if any)\n{state['last_error'] or 'None'}\n"
             f"Previous diagnostic log: {state.get('log') if state.get('last_error') else 'None'}"
         )
@@ -367,12 +714,43 @@ class Run:
                  worker_feedback_version=state.get("feedback_version", 0))
         code, session, answer = self.call_provider(config, "worker", path, log, self.worker_prompt(state, step),
                                                    state.get("worker_session"))
+        summary = redact(answer or "").strip()[:1500]
+        stalls = state.get("worker_stalls", 0)
+        if code == 125 and stalls < 2:
+            # A stalled worker is a transient, not a product failure: refund the attempt and start a fresh session.
+            policy = self.spec.get("retry", {})
+            delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** stalls)
+            self.set("worker_stalled", {"attempt": next_state["attempt"], "stall": stalls + 1, "stalls_allowed": 2, "exit": code,
+                     "log": str(log), "seconds": delay}, phase="ready", attempts_used=used, worker_session=None,
+                     worker_stalls=stalls + 1, log=state.get("log"),
+                     retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat())
+            return
         if code:
             label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None)
+            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None,
+                        worker_stalls=0, worker_summary=summary)
             return
         self.set("worker_finished", {"exit": code, "session": session, "log": str(log)},
-                 phase="checking", worker_session=session, transient_failures=0)
+                 phase="checking", worker_session=session, transient_failures=0, worker_stalls=0, review_parse_failures=0,
+                 worker_summary=summary)
+        previous = self.unchanged_since_rejection(state, path)
+        if previous:
+            self.reject("The worker made no change after the previous rejection. The same build was already rejected, so the "
+                        "checks and the reviewer were not run again.\nPrevious rejection:\n" + previous.get("issue", "")[:3000],
+                        "no_progress")
+
+    def unchanged_since_rejection(self, state, path):
+        """The previous rejected build of this milestone if a reviewer turned it down and the worker left it untouched."""
+        trees = state.get("rejected_trees") or []
+        if state.get("rejected_step") != state["step"] or not trees or trees[-1].get("phase") not in ("review", "no_progress"):
+            return None
+        if trees[-1].get("feedback", 0) != self.store.get(self.id)["state"].get("feedback_version", 0):
+            return None  # the operator has said something since (maybe during the call just made); the reviewer must be asked again
+        try:
+            stage(path, state["accepted"], self.spec["milestones"][state["step"]]["paths"])
+            return trees[-1] if git(path, "write-tree") == trees[-1]["tree"] else None
+        except (ValueError, OSError):
+            return None
 
     def verify(self, state, step, path):
         try:
@@ -481,8 +859,8 @@ class Run:
                  blocked_from="checking", last_error=reason)
         return None
 
-    def observe_gate(self, check, path, state, step, snapshot, location):
-        folder = evidence_folder(self.evidence_dir(state), location["gate_index"])
+    def observe_gate(self, check, path, state, step, snapshot, location, evidence=None):
+        folder = evidence_folder(evidence or self.evidence_dir(state), location["gate_index"])
         log = folder / "gate.log"
         self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
                  "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
@@ -523,6 +901,11 @@ class Run:
         evidence = self.evidence_dir(state)
         try:
             raw = (evidence / "checks.json").read_bytes()
+            # The manifest of a direction or rescue strategy that won its tournament holds receipts from that candidate's evidence folder.
+            digest = hashlib.sha256(raw).hexdigest()
+            won = next((w for w in (state.get("exploration"), state.get("rescue")) if w and w.get("evidence") and w.get("checks_sha256") == digest
+                        and w.get("step", 0) == state["step"]), None)
+            root = Path(won["evidence"]) if won else evidence
             if state.get("checks_sha256") and hashlib.sha256(raw).hexdigest() != state["checks_sha256"]:
                 raise ValueError("The accepted check manifest changed")
             checks = json.loads(raw)
@@ -533,7 +916,7 @@ class Run:
                     raise ValueError("The legacy check manifest does not match its recorded verification")
             for receipt in checks:
                 for sample in [receipt, *receipt.get("prior_mixed_round", [])]:
-                    verify_saved_sample(sample, evidence)
+                    verify_saved_sample(sample, root)
             return raw.decode("utf-8")
         except (ValueError, OSError, KeyError) as error:
             self.set("blocked", {"during": "checking", "issue": str(error)}, phase="blocked",
@@ -553,57 +936,74 @@ class Run:
         if checks is None:
             return
         diff = git(path, "diff", "--cached", "--stat", state["accepted"])
+        note = None
+        if self.spec.get("advisory_ollama"):
+            if state.get("advice_tree") == snapshot and state.get("advice_step") == state["step"]:
+                note = state.get("advice_note")  # asked about this build already: a retry, a fallback or a park wake-up does not ask again
+            elif state.get("advice_failed_tree") != snapshot:
+                # The local model speaks first so the reviewer can use what it noticed.
+                note, stop = self.local_note(state, step, snapshot, evidence, diff, checks)
+                if stop:
+                    return
+                self.check_budget()
         decision = (f"Goal: {self.spec['objective']}\n{self.acceptance_brief()}"
                     f"Budget remaining before review: {budget_status(self.spec, state)['remaining']}\nTask: {step['task']}\nChanges:\n{diff}\nChecks:\n{checks}\n"
                     f"{context.brief(self.store, self.id)}\nOperator updates\n{self.store.feedback_text(self.id) or 'None'}")
         if self.spec.get("reviewer"):
-            log = evidence / f"review-{state.get('provider_calls', 0) + 1:04d}.jsonl"
+            from .repair import prior_findings
+            from .verdicts import extract_verdict
             config = self.route(state, step, "reviewer")
-            self.set("review_started", {"adapter": config["kind"], "tree": snapshot}, log=str(log), retry_at=None)
+            self.independence(state, "reviewer", config, self.route(state, step, "worker"))
+            material, images = self.review_material(path, state, evidence)
+            findings = prior_findings(self.store, self.id, state)
             prompt = (
                 "Independently review these uncommitted, already tested changes. Read actual source and review "
                 "the supplied check logs and artifacts, including screenshots when UI is part of the task. "
                 "If required evidence cannot be read or has not been inspected, return REVISE and explain. Remain read-only. "
-                'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision
+                'Return only JSON {"verdict":"PASS" or "REVISE","reason":"specific findings"}.\n\n' + decision + "\n\n" + material
             )
-            if state["step"] + 1 == len(self.spec["milestones"]):
+            if note:
+                prompt += f"\n\nA local model suggested checking: {note}. Verify it if relevant."
+            if findings:
+                prompt += ("\n\nYour own earlier findings on this milestone\n" + "\n".join(findings)
+                           + "\nVerify these earlier findings were addressed. Return REVISE only for defects that matter for the task, "
+                           "the acceptance requirements or the goal; mention minor polish inside the reason of a PASS. "
+                           "Do not raise new nitpicks about code that did not change.")
+            if state["step"] + 1 == len(self.spec["milestones"]) and not self.spec.get("pursue"):
                 prompt += ("\nThis is the final milestone. Also check the complete project objective against the current "
                            "worktree and supplied evidence. Return REVISE for any unfulfilled part of that objective.")
-            code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence)
-            try:
-                review = json_response(answer) if code == 0 else {}
-                accepted = review.get("verdict") == "PASS" and bool(review.get("reason", "").strip())
-            except (ValueError, AttributeError):
-                accepted, review = False, {}
-            if not accepted:
-                self.reject("Independent review requested changes or returned no valid PASS.\n"
-                            + str(review.get("reason") or answer or tail(log))[:3600], "review")
+            failures = state.get("review_parse_failures", 0)
+            while True:
+                log = evidence / f"review-{self.store.get(self.id)['state'].get('provider_calls', 0) + 1:04d}.jsonl"
+                self.set("review_started", {"adapter": config["kind"], "tree": snapshot}, log=str(log), retry_at=None)
+                code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence, images=images)
+                excerpt = redact(answer or tail(log)).strip()[:1200]
+                if code:
+                    label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code)
+                    self.set("reviewer_failed", {"attempt": state["attempt"], "exit": code, "log": str(log), "excerpt": excerpt[:600]},
+                             review_parse_failures=0)
+                    self.reviewer_unavailable(f"the reviewer stopped at its {label}" if label else f"the reviewer exited with code {code}", excerpt)
+                try:
+                    review = extract_verdict(answer, ("PASS", "REVISE"))
+                except ValueError:
+                    review = None
+                reason = review.get("reason") if review and isinstance(review.get("reason"), str) else ""
+                if review and (review["verdict"] != "PASS" or reason.strip()):
+                    break
+                # The reviewer answered, but with no verdict we can read or a PASS that says nothing. That is not a rejection
+                # of the work: ask once more, then treat the reviewer as unavailable instead of charging the worker.
+                failures += 1
+                self.set("review_unparseable", {"attempt": state["attempt"], "count": failures, "log": str(log), "excerpt": excerpt[:600],
+                         "problem": "passed the build without a reason" if review else "gave no readable verdict"},
+                         review_parse_failures=failures if failures < 2 else 0)
+                if failures >= 2:
+                    self.reviewer_unavailable("its answer could not be read after two tries", excerpt)
+            if review["verdict"] != "PASS":
+                text = str(reason.strip() or answer or tail(log))[:3600]
+                self.reject("Independent review requested changes.\n" + text, "review", finding=text, review_parse_failures=0,
+                            seen=state.get("feedback_version", 0))
                 return
-            self.set("review_passed", {"reason": review["reason"], "tree": snapshot, "log": str(log)})
-        if self.spec.get("advisory_ollama"):
-            self.check_budget(call=True)
-            current = self.store.get(self.id)["state"]
-            pending = {"call": current.get("provider_calls", 0) + 1, "role": "advisory", "provider": "ollama",
-                       "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
-                       "step": state["step"] + 1, "attempt": state["attempt"],
-                       "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
-            self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
-            try:
-                config = dict(self.spec["advisory_ollama"])
-                if self.spec.get("budgets", {}).get("max_seconds"):
-                    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
-                    config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
-                summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
-                note = advisory(config,
-                                f"In one sentence, suggest any missing validation.\n"
-                                f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}")
-                self.set("local_advice", {"note": note, "tree": snapshot})
-                write_json(Path(pending["log"]), {"note": redact(note)})
-            except (OSError, ValueError) as error:
-                self.set("local_advice_unavailable", {"reason": str(error)})
-            finally:
-                self.finish_call(pending)
-            self.check_budget()
+            self.set("review_passed", {"reason": reason, "tree": snapshot, "log": str(log)}, review_parse_failures=0)
         if self.snapshot(path, state, step) != snapshot:
             self.set("snapshot_changed", {"previous": snapshot}, phase="checking")
             return
@@ -614,8 +1014,96 @@ class Run:
         self.set("promotion_prepared", {"commit": commit, "tree": snapshot},
                  phase="promoting", candidate=commit)
 
+    def reviewer_unavailable(self, problem, excerpt):
+        """The reviewer failed, not the work. Nothing is charged to the worker: the run retries the review as a transient
+        (the reviewer fallbacks first, then retry.transient_attempts) and, when those are spent, blocks naming the reviewer."""
+        raise ProviderUnavailable(f"Reviewer unavailable: {problem}. The worker's attempt was not charged; resume with --retry once the reviewer works."
+                                  + (f"\nLast output:\n{excerpt}" if excerpt else ""), "transient")
+
+    def local_note(self, state, step, snapshot, evidence, diff, checks):
+        """One sentence from the loopback model. Returns (note, stop); stop means a required local review failed."""
+        self.check_budget(call=True)
+        current = self.store.get(self.id)["state"]
+        pending = {"call": current.get("provider_calls", 0) + 1, "role": "advisory", "provider": "ollama",
+                   "model": self.spec["advisory_ollama"]["model"], "started": timestamp(),
+                   "step": state["step"] + 1, "attempt": state["attempt"],
+                   "log": str(evidence / f"advice-{current.get('provider_calls', 0) + 1:04d}.json")}
+        if "think" in self.spec["advisory_ollama"]:
+            pending["think"] = self.spec["advisory_ollama"]["think"]
+        self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
+        note = None
+        try:
+            config = dict(self.spec["advisory_ollama"])
+            if self.spec.get("budgets", {}).get("max_seconds"):
+                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
+                config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
+            summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
+            inference = {}
+            note = advisory(config,
+                            f"In one sentence, suggest any missing validation.\n"
+                            f"Task: {step['task']}\nChanges: {diff}\nChecks: {summary}", receipt=inference)
+            self.set("local_advice", {"note": note, "tree": snapshot, "inference": inference},
+                     advice_note=redact(note)[:1500], advice_step=state["step"], advice_tree=snapshot)
+            write_json(Path(pending["log"]), {"note": redact(note), "inference": inference})
+        except (OSError, ValueError) as error:
+            note = None
+            required = self.spec["advisory_ollama"].get("required")
+            # An optional advisory that failed is not asked again about this build; a required one is asked again on --retry.
+            self.set("local_advice_unavailable", {"reason": str(error)}, **({} if required else {"advice_failed_tree": snapshot}))
+            if required:
+                self.set("local_advice_required", {"model": self.spec["advisory_ollama"]["model"]},
+                         phase="blocked", blocked_from="reviewing", last_error=f"Required local review failed: {error}")
+                return None, True
+        finally:
+            self.finish_call(pending)
+        return note and redact(note)[:1500], False
+
+    def review_material(self, path, state, evidence):
+        """The real change as a saved patch with an inline excerpt, and the screenshots this attempt produced."""
+        from .pursuit import image_block, screenshots
+        raw = git_bytes(path, "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", state["accepted"])
+        cap = 400 * 1024
+        body = raw[:cap]
+        notice = f"\n[Diff truncated at 400 KB; {len(raw) - cap} bytes omitted.]\n".encode() if len(raw) > cap else b""
+        patch = evidence / "review-diff.patch"
+        atomic_write(patch, body + notice)
+        excerpt = body[:16 * 1024].decode("utf-8", "replace")
+        text = (f"Full change: the complete staged diff is saved at {patch} ({len(raw)} bytes"
+                f"{'; truncated to 400 KB' if notice else ''}). Read that file for anything beyond the first 16 KB shown here.\n"
+                + excerpt + ("\n[Excerpt truncated.]" if len(body) > 16 * 1024 else ""))
+        images = screenshots(evidence)
+        if images:
+            text += ("\n\nScreenshots produced by this attempt's checks. OPEN each image file listed here with your file-reading tool "
+                     "and judge what you actually see, not what any log claims:\n" + image_block(images))
+        return text, images
+
+    def independence(self, state, role, config, worker):
+        """Warn once per role and pair when the checker is the same known vendor family as the worker. A command route has no
+        known vendor, so it never warns."""
+        from .repair import describe, family
+        if family(config) is None or family(config) != family(worker):
+            return
+        pair = f"{role}:{json.dumps(describe(worker), sort_keys=True)}>{json.dumps(describe(config), sort_keys=True)}"
+        warned = self.store.get(self.id)["state"].get("independence_warned", [])
+        if pair not in warned:
+            self.set("independence_degraded", {"role": role, "worker": {**describe(worker), "family": family(worker)},
+                     "reviewer_or_judge": {**describe(config), "family": family(config)},
+                     "issue": f"The {role} comes from the same vendor family as the worker, so its verdict is less independent."},
+                     independence_warned=[*warned, pair])
+
     def snapshot(self, path, state, step):
-        return tree(path, state["accepted"], step["paths"], self.spec.get("protected_paths", []))
+        removed = []
+        try:
+            return tree(path, state["accepted"], step["paths"], self.spec.get("protected_paths", []), removed)
+        finally:
+            if removed:  # deleted from the worktree so that no check can pass on a file the accepted commit will not contain
+                known = self.store.get(self.id)["state"].get("droppings") or {}
+                kept = known["paths"] if (known.get("step"), known.get("attempt")) == (state["step"] + 1, state["attempt"]) else []
+                paths = [*kept, *(name for name in removed if name not in kept)][:20]
+                # Kept in the state too, so a rejection can tell the worker why a file its checks want is gone.
+                self.set("tool_droppings_removed", {"step": state["step"] + 1, "attempt": state["attempt"], "count": len(removed),
+                                                    "paths": removed[:20]},
+                         droppings={"step": state["step"] + 1, "attempt": state["attempt"], "paths": paths})
 
     def promote(self, state):
         if state.get("feedback_version", 0) != state.get("worker_feedback_version", 0):
@@ -637,16 +1125,20 @@ class Run:
         number = state["step"] + 1
         finished = number == len(self.spec["milestones"])
         passed = [gate["name"] for gate in self.spec["milestones"][number - 1]["gates"]]
-        completion = ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None
+        pursuing = finished and bool(self.spec.get("pursue"))
+        wave = state.get("wave", 1)
+        completion = (("wave_completed", {"wave": wave, "commit": candidate, "branch": self.ref}) if pursuing else
+                      ("run_completed", {"branch": self.ref, "commit": candidate}) if finished else None)
         self.set("milestone_accepted", {"step": number, "commit": candidate, "branch": self.ref,
                  "tree": state.get("candidate_tree"), "verified_checks": passed},
-                 following_event=completion,
-                 phase="done" if finished else "ready", step=number, accepted=candidate,
+                 following_event=completion, **({"wave": wave, "judge_attempts": 0, "judge_route": 0} if pursuing else {}),
+                 phase="judging" if pursuing else "done" if finished else "ready", step=number, accepted=candidate,
                  attempt=0, attempts_used=0, candidate=None, candidate_tree=None,
                  worker_session=None, last_error="", log=None, retry_at=None, failure_count=0,
                  failure_fingerprint=None, worker_route=0, reviewer_route=0, transient_failures=0, route_rejections=0)
 
     def run(self, *, retry=False, defer_retries=False, only_operational=False):
+        use_git_timeout(self.spec)  # before any git call: a fresh process, or a dispatcher that ran another plan, holds another run's value
         with run_lock(self.root / "runner.lock"), ExitStack() as project_lock:
             row = self.store.get(self.id)
             state = row["state"]
@@ -678,7 +1170,9 @@ class Run:
             if state["phase"] == "blocked" and retry:
                 self.set("blocked_run_retried", {}, phase=state.get("blocked_from") or "ready",
                          attempts_used=0, blocked_from=None, provider_issue=None, retry_at=None, verification_batch=None,
-                         transient_failures=0, failure_count=0, failure_fingerprint=None, route_rejections=0)
+                         transient_failures=0, failure_count=0, failure_fingerprint=None, route_rejections=0,
+                         rejected_trees=[], review_parse_failures=0,  # a resumed run asks the reviewer again, even about an unchanged build
+                         **({"judge_attempts": 0, "plan_attempts": 0, "judge_ledger": None} if self.spec.get("pursue") else {}))
             if state.get("pending_call"):
                 self.finish_call(state["pending_call"], recovered=True)
             if not state.get("started_at"):
@@ -692,13 +1186,16 @@ class Run:
                 if self.store.get(self.id)["pause"]:
                     self.set("runner_stopped", {"phase": phase})
                     return "paused"
-                step = self.spec["milestones"][state["step"]]
+                use_git_timeout(self.spec)  # judging, planning and a wave plan reload the spec; every phase reads the plan's limit
+                if phase in ("judging", "planning", "rescuing") and not self.spec.get("pursue"):
+                    raise ValueError(f"Unrecognized run state: {phase}")
+                step = None if phase in ("judging", "planning", "rescuing") else self.spec["milestones"][state["step"]]
                 try:
                     self.check_budget()
-                    if state.get("retry_at") and datetime.fromisoformat(state["retry_at"]) > datetime.now(timezone.utc):
+                    if state.get("retry_at") and (wait := (datetime.fromisoformat(state["retry_at"]) - datetime.now(timezone.utc)).total_seconds()) > 0:
                         if defer_retries:
                             return "waiting"
-                        time.sleep(.2)
+                        time.sleep(min(2, max(.2, wait)))  # a parked run may wait hours; poll gently but still notice a pause
                         continue
                     if not context_checked:
                         if self.spec.get("context_sha256"):
@@ -708,6 +1205,18 @@ class Run:
                         context_checked = True
                     if phase == "promoting":
                         self.promote(state)
+                        continue
+                    if phase in ("judging", "planning"):
+                        from . import pursuit
+                        (pursuit.judge if phase == "judging" else pursuit.plan_wave)(self, state)
+                        continue
+                    if phase == "rescuing":
+                        from . import rescue
+                        rescue.advance(self, state)
+                        continue
+                    if phase in ("queued", "ready", "exploring") and self.explores(state):
+                        from . import explore
+                        explore.advance(self, state)
                         continue
                     path = self.worktree(state)
                     if phase == "working":
@@ -744,10 +1253,20 @@ class Run:
                 except ProviderUnavailable as error:
                     current = self.store.get(self.id)["state"]
                     actual = current["phase"]
-                    role = "reviewer" if actual == "reviewing" else "worker"
-                    config = self.route(current, step, role)
+                    role = {"reviewing": "reviewer", "judging": "judge", "planning": "planner"}.get(actual, "worker")
+                    if actual in ("exploring", "rescuing"):
+                        from . import explore, rescue
+                        role, config = (explore if actual == "exploring" else rescue).active_route(self, current)
+                    elif actual == "judging" and self.spec.get("pursue"):
+                        from . import pursuit
+                        role, config = pursuit.active_route(self, current)  # the confirmation judgment has its own route
+                    else:
+                        config = self.route(current, step, role)
                     provider = {**describe_provider(config), "role": role, "reason": error.kind}
-                    routes = step.get("worker_fallbacks", []) if role == "worker" else self.spec.get("reviewer_fallbacks", [])
+                    pursue = self.spec.get("pursue", {})
+                    routes = {"worker": [] if actual in ("exploring", "rescuing") else (step or {}).get("worker_fallbacks", []),
+                              "reviewer": self.spec.get("reviewer_fallbacks", []),
+                              "judge": pursue.get("judge_fallbacks", []), "planner": []}[role]
                     index = current.get(role + "_route", 0)
                     next_phase = "ready" if actual == "working" else actual
                     refund = {"attempts_used": max(0, current.get("attempts_used", 1) - 1) , "worker_session": None} if role == "worker" else {}
@@ -756,9 +1275,19 @@ class Run:
                                  phase=next_phase, **{role + "_route": index + 1}, **({"route_rejections": 0} if role == "worker" else {}),
                                  last_error=str(error), transient_failures=0, retry_at=None, **refund)
                         continue
+                    if error.kind == "usage_limit":
+                        plan = park_plan(self.spec, current, error, datetime.now(timezone.utc), config["kind"])
+                        if plan["block"] is None:
+                            self.set("provider_parked", {"issue": str(error), **{k: plan[k] for k in ("until", "reset", "seconds", "parsed", "park")},
+                                     **provider}, phase=next_phase, parks=plan["park"], retry_at=plan["until"], **refund)
+                            continue
+                        self.set("provider_unavailable", {"issue": plan["block"], "provider_message": str(error), **provider}, phase="blocked",
+                                 blocked_from="ready" if actual == "working" else actual, last_error=plan["block"],
+                                 provider_issue=provider, parks=0)
+                        return "blocked"
                     failures = current.get("transient_failures", 0)
                     policy = self.spec.get("retry", {})
-                    if error.kind in ("usage_limit", "transient") and failures < policy.get("transient_attempts", 2):
+                    if error.kind == "transient" and failures < policy.get("transient_attempts", 2):
                         delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** failures)
                         self.set("provider_retry_scheduled", {"issue": str(error), "seconds": delay, **provider},
                                  phase=next_phase, transient_failures=failures + 1, **refund,

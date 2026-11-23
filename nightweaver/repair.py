@@ -1,6 +1,10 @@
 """Bounded, evidence-based worker handoffs and their durable history."""
 
+import hashlib
+
 from .spec import fields, integer
+
+FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google"}
 
 
 def policy(raw):
@@ -95,4 +99,73 @@ def combined_failure(failures):
     size = max(100, 4400 // len(failures))
     return "\n\n".join(
         f"{item['gate'][:160]} {item['diagnostic'][:size]}" for item in failures
+    )
+
+
+def family(route):
+    """The vendor family of a route, or None when it is not known: a command route may wrap any vendor or none."""
+    return FAMILIES.get(route.get("kind"))
+
+
+def fingerprint(phase, signature, failed_gates=(), exit_code=None, reason="", feedback=0):
+    """Identify a failure by what failed on which build. Free text never counts: a paraphrase is the same failure."""
+    parts = [phase, ",".join(sorted(set(failed_gates))), signature]
+    if phase == "worker":
+        parts.append(str(exit_code))
+    if phase == "feedback":
+        parts.append(str(feedback))
+    if signature == "unknown":
+        parts.append(reason)
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def cause_line(phase, failed_gates, count, used, attempts, repeated):
+    if phase == "no_progress":
+        return "Stopped: no change after review feedback"
+    if repeated and phase == "check" and failed_gates:
+        names = ", ".join(failed_gates)[:160]
+        return f"Stopped: gate{'s' * (len(failed_gates) > 1)} {names} failed {count} times on the same build"
+    if repeated and phase == "review":
+        return f"Stopped: the reviewer asked for changes {count} times on the same build"
+    if repeated:
+        return f"Stopped: the same {phase} failure happened {count} times on the same build"
+    return f"Stopped: {used} of {attempts} attempts used"
+
+
+def droppings_note(droppings, step, attempt):
+    """What to tell a worker whose checks failed after tool droppings were deleted from its worktree, or "" when none were this attempt."""
+    if not droppings or (droppings.get("step"), droppings.get("attempt")) != (step, attempt) or not droppings.get("paths"):
+        return ""
+    names = ", ".join(droppings["paths"][:6]) + (" ..." if len(droppings["paths"]) > 6 else "")
+    return (f"Note: tool droppings were deleted before the checks ran (new debug.log, chrome_debug.log, *.dmp or .playwright-mcp/ files "
+            f"the milestone paths do not name): {names}. Name a path in the milestone paths to keep it.\n\n")
+
+
+def blocked_message(cause, reason, summary):
+    """What an operator reads first: the cause, the last failure, then the worker's own account."""
+    parts = [cause, reason[:3600]]
+    if summary:
+        parts.append("Worker's last explanation:\n" + summary)
+    return "\n\n".join(parts)
+
+
+def prior_findings(store, run_id, state, count=3, size=700):
+    """The reviewer's own recent REVISE findings for the milestone in progress."""
+    rows = [
+        e["details"]
+        for e in store.events(run_id, limit=60, kinds=["attempt_rejected"])
+        if e["details"].get("phase") == "review"
+        and e["details"].get("step") == state["step"] + 1
+        and e["details"].get("finding")
+    ]
+    return [f"- Attempt {row.get('attempt')}: {row['finding'][:size]}" for row in rows[-count:]]
+
+
+def conflict_brief(conflicts):
+    if not conflicts:
+        return ""
+    return (
+        "Planner notes\nThe planner flagged these requirements as contradictory or not satisfiable as stated. "
+        "Choose the most reasonable reading that serves the goal, and say in your summary how you resolved each:\n"
+        + "\n".join(f"- {item}" for item in conflicts)
     )

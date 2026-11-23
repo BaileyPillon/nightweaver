@@ -22,6 +22,18 @@ def command(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, timeout=45, **kwargs).stdout
 
 
+def claude_host_env(environ, profile=None):
+    """The Claude coordinator's environment. A command route that inherits credentials hands over every one it has, so the other
+    vendors' keys are dropped here, and an explicit profile keeps its own login instead of an inherited CLAUDE_CODE_OAUTH_TOKEN."""
+    env = {name: value for name, value in environ.items() if not (
+        name.upper().startswith(("OPENAI_", "CODEX_", "GEMINI_", "GOOGLE_", "DEEPSEEK_"))
+        and re.search(r"(?:KEY|TOKEN|SECRET)(?:_FILE)?$", name, re.I))}
+    if profile:
+        env["CLAUDE_CONFIG_DIR"] = str(profile.resolve(strict=True))
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    return env
+
+
 def host_errors(path):
     failures = []
     with path.open("rb") as log:
@@ -232,8 +244,7 @@ def evaluate(args):
                       + "\n\nBenchmark goal and independent checks:\n" + task)
             env = os.environ.copy()
             if args.host == "claude":
-                if args.profile:
-                    env["CLAUDE_CONFIG_DIR"] = str(args.profile.resolve(strict=True))
+                env = claude_host_env(env, args.profile)
                 argv = ["claude", "--print", "--strict-mcp-config", "--mcp-config", str(evidence / "mcp.json"),
                         "--permission-mode", "acceptEdits", "--tools", "Read,Write,Edit", "--allowedTools",
                         "mcp__agtx__*", "Read", "Write", "Edit", "--output-format", "stream-json", "--verbose"]

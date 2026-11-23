@@ -10,7 +10,7 @@ import time
 
 from .process import ProcessLimit, execute
 from .journeys import browser_cases, case_prefix
-from .safety import redact, write_json
+from .safety import mask_tokens, redact, scrub_env, write_json
 from .spec import read_json
 
 
@@ -325,6 +325,12 @@ def read_browser_evidence(config, out, receipt, max_bytes):
             )
     if report["passed"] == bool(failures):
         raise ValueError("Browser verdict disagrees with viewport results")
+    if "sweep" in config:
+        from .sweep import coverage as sweep_coverage, validate_receipt
+        receipt["browser_sweep"] = validate_receipt(config["sweep"], report, nonempty_files, report["passed"])
+        receipt["browser_sweep_coverage"] = sweep_coverage(report)
+    elif any(key.startswith("sweep") for key in report):
+        raise ValueError("Browser receipt carries sweep evidence the plan did not ask for")
     receipt["browser_coverage"] = coverage
     if failures:
         receipt["browser_failures"] = failures
@@ -354,7 +360,8 @@ def _single_gate(check, path, folder, tree, *, baseline=None, **process_options)
 
     log = folder / "gate.log"
     env = {
-        **os.environ,
+        # Gate code is written or changed by the worker. It never sees a provider credential.
+        **scrub_env(os.environ),
         "NIGHTWEAVER_EVIDENCE": str(folder.parent),
         "NIGHTWEAVER_TREE": tree,
         "ROOKLINE_EVIDENCE": str(folder.parent),
@@ -409,6 +416,8 @@ def _single_gate(check, path, folder, tree, *, baseline=None, **process_options)
         except OSError as error:
             receipt["execution_error"] = True
             raise ValueError(f"Cannot start gate executable: {error}") from error
+        finally:
+            mask_tokens(log)  # a token the gate printed from anywhere never stays in evidence that reviewers and workers read
         verify_inputs(check, path)
         receipt["artifacts"] = preserve_artifacts(path, folder, check["artifacts"], before, max_bytes)
         if "junit" in check:

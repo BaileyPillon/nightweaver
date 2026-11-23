@@ -28,6 +28,17 @@ class FeatureTest(unittest.TestCase):
     setUp = fixtures.WindowsRunTest.setUp
     configured = fixtures.WindowsRunTest.configured
 
+    def test_required_local_advice_can_resume_after_service_recovers(self):
+        run = self.configured(fixture("good"), advisory_ollama={"model": "local", "think": True, "required": True})
+        with patch("nightweaver.engine.advisory", side_effect=OSError("local server offline")):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        state = self.store.get(run)["state"]
+        self.assertEqual(state["blocked_from"], "reviewing")
+        self.assertIn("local server offline", state["last_error"])
+        with patch("nightweaver.engine.advisory", return_value="Check empty input") as advise:
+            self.assertEqual(Run(Store(self.store.root), run).run(retry=True), "done")
+            self.assertIs(advise.call_args.args[0]["think"], True)
+
     def test_budget_survives_restart_and_cannot_be_reset_by_retry(self):
         run = self.configured(fixture("good"), budgets={"max_calls": 1},
                               reviewer={"kind": "command", "argv": fixture("review")})

@@ -9,17 +9,19 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 from io import BytesIO
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
 from time import monotonic
 from urllib.parse import quote, urlparse
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nightweaver import journeys
+from nightweaver import journeys, stall, sweep as interaction
 from nightweaver.spec import strict_json
 from nightweaver.safety import redact, write_json
 from nightweaver.server import CandidateStartupFailure
@@ -27,7 +29,7 @@ from nightweaver.server import CandidateStartupFailure
 
 def validate_browser(raw):
     from nightweaver.spec import array, artifact, fields, integer, text
-    fields(raw, "page url server heading steps viewports channel timeout_ms wait_until offline network scenarios", "browser")
+    fields(raw, "page url server root heading steps viewports channel timeout_ms wait_until offline network scenarios sweep", "browser")
     if sum(key in raw for key in ("page", "url", "server")) != 1:
         raise ValueError("Browser needs exactly one of page, loopback url or owned server")
     out = dict(raw)
@@ -40,8 +42,14 @@ def validate_browser(raw):
             raise ValueError("network.require_success must be boolean")
         if "max_requests" in network:
             integer(network["max_requests"], "max_requests", 0, 100000)
+    if "root" in raw and ("page" not in raw or raw.get("offline")):
+        raise ValueError("Browser root names the folder an online local page is served from")
     if "page" in raw:
         out["page"] = artifact(raw["page"])
+        if "root" in raw:
+            out["root"] = artifact(raw["root"])
+            if not PurePosixPath(out["page"]).is_relative_to(out["root"]):
+                raise ValueError("The browser page must be inside the browser root")
     elif "url" in raw:
         url = urlparse(text(raw, "url"))
         try:
@@ -66,6 +74,8 @@ def validate_browser(raw):
     validate_steps(out["steps"], out.get("offline", False))
     if "scenarios" in out:
         journeys.validate_scenarios(out, validate_steps)
+    if "sweep" in raw:
+        out["sweep"] = interaction.validate_sweep(raw["sweep"])
     out["viewports"] = array(raw.get("viewports", [
         {"name": "desktop", "width": 1440, "height": 900}, {"name": "mobile", "width": 390, "height": 844}
     ]), "viewports", 8)
@@ -157,6 +167,24 @@ class QuietHandler(SimpleHTTPRequestHandler):
         pass
 
 
+def site_handler(site, checkout):
+    """Serve `site` as the web root. A path it does not have comes from the rest of `checkout`, so a page in docs/ that loads
+    ../dist/lib.js or /docs/style.css, the way it did when the whole checkout was served, still finds them."""
+    class Handler(QuietHandler):
+        def translate_path(self, path):
+            found = super().translate_path(path)
+            if os.path.lexists(found):
+                return found
+            self.directory = str(checkout)
+            try:
+                other = super().translate_path(path)
+            finally:
+                self.directory = str(site)
+            return other if os.path.lexists(other) else found
+
+    return partial(Handler, directory=str(site))
+
+
 @contextmanager
 def local_page(config, root, output):
     if "server" in config:
@@ -168,16 +196,18 @@ def local_page(config, root, output):
         yield config["url"], lambda: None
         return
     page = (root / config["page"]).resolve()
-    if not page.is_relative_to(root) or not page.is_file():
+    site = (root / config["root"]).resolve() if "root" in config else root  # Where the site is deployed from: root-absolute URLs start here, then the checkout.
+    if not page.is_relative_to(root) or not page.is_relative_to(site) or not page.is_file():
         raise CandidateStartupFailure(f"Expected a page inside the candidate checkout: {config['page']}")
     if config.get("offline"):
         yield page.as_uri(), lambda: None
         return
-    with ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(root))) as server:
+    handler = site_handler(site, root) if site != root else partial(QuietHandler, directory=str(root))
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield f"http://127.0.0.1:{server.server_port}/{quote(page.relative_to(root).as_posix())}", lambda: None
+            yield f"http://127.0.0.1:{server.server_port}/{quote(page.relative_to(site).as_posix())}", lambda: None
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -194,11 +224,16 @@ def semantic_locator(page, step):
     return page.get_by_test_id(loc["test_id"])
 
 
-def visual_match(locator, contract, root, output, prefix, result):
+def image_tools():
     try:
         from PIL import Image, ImageChops
     except ImportError as error:
         raise BrowserRuntimeUnavailable("Visual comparisons require Pillow in the Nightweaver browser environment") from error
+    return Image, ImageChops
+
+
+def visual_match(locator, contract, root, output, prefix, result):
+    Image, ImageChops = image_tools()
     baseline = (root / contract["baseline"]).resolve(strict=True)
     if not baseline.is_relative_to(root) or not baseline.is_file() or baseline.stat().st_size > 32 * 1024 * 1024:
         raise ValueError("Invalid visual baseline file")
@@ -272,43 +307,218 @@ class BrowserRuntimeUnavailable(RuntimeError):
     """The verification browser could not start."""
 
 
+FALLBACK_CHANNELS = ("msedge", "chrome")
+_FALLBACKS = {}  # Per process: the installed channel that replaced a missing bundled Chromium.
+
+
+def bundled_missing(error):
+    text = str(error)
+    return "Executable doesn't exist" in text or "playwright install" in text
+
+
+def fallback_allowed():
+    """Setting PLAYWRIGHT_BROWSERS_PATH asks for exactly the Chromium kept there, so that stays fail-closed."""
+    return not os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+
+
+def first_line(error):
+    return str(redact(next((l.strip() for l in str(error).splitlines() if l.strip()), type(error).__name__)))[:300]
+
+
+def uses_visual(config):
+    """Whether any step compares a pixel baseline. A baseline is pinned to the browser build that drew it."""
+    steps = [*config.get("steps", []), *(s for scenario in config.get("scenarios", []) for s in scenario.get("steps", []))]
+    return any(step.get("action") == "visual_match" for step in steps)
+
+
+def launch_browser(driver, channel, timeout, allow_fallback=True):
+    """Return (browser, channel used, fallback). Only the bundled default may fall back to an installed Edge or Chrome."""
+    if channel is not None:
+        return driver.chromium.launch(channel=channel, timeout=timeout), channel, None
+    pinned = not fallback_allowed()
+    allow_fallback = allow_fallback and not pinned
+    cached = _FALLBACKS.get("bundled") if allow_fallback else None
+    if cached:
+        try:
+            return driver.chromium.launch(channel=cached["used"], timeout=timeout), cached["used"], dict(cached)
+        except Exception:
+            _FALLBACKS.clear()
+    try:
+        return driver.chromium.launch(timeout=timeout), "bundled", None
+    except Exception as error:
+        if not bundled_missing(error):
+            raise
+        if pinned:
+            raise RuntimeError(f"{error}\nPLAYWRIGHT_BROWSERS_PATH is set, so no installed Edge or Chrome fallback was tried.") from error
+        if not allow_fallback:
+            raise RuntimeError(f"{error}\nvisual_match baselines are pinned to the browser build that drew them, so no installed Edge or Chrome "
+                               "fallback was tried. Install the bundled Chromium, or set the gate's channel to the browser the baselines came from.") from error
+        failures = []
+        for alternate in FALLBACK_CHANNELS:
+            try:
+                browser = driver.chromium.launch(channel=alternate, timeout=timeout)
+            except Exception as other:
+                failures.append(f"{alternate}: {first_line(other)}")
+                continue
+            fallback = {"requested": "bundled", "used": alternate, "reason": first_line(error)}
+            _FALLBACKS["bundled"] = fallback
+            return browser, alternate, dict(fallback)
+        raise RuntimeError(f"{error}\nInstalled browser fallbacks also failed: {'; '.join(failures)}") from error
+
+
+NEW_CONTEXT_SECONDS, CLOSE_CONTEXT_SECONDS = 60, 30  # What a context may take to open and to close before the browser counts as wedged.
+TEARDOWN_SECONDS = 30  # What closing the browser and stopping Playwright's driver may take before the verifier stops waiting for them.
+
+
+def driver_manager(driver):
+    """The context manager behind sync_playwright(): its stop() is the one the driver carries. None for anything else."""
+    return getattr(getattr(driver, "stop", None), "__self__", None)
+
+
+def driver_pid(manager):
+    """The process id of Playwright's driver while it is still running, looked up where its releases have kept the process
+    (1.64 and 1.65 differ). A driver that has exited is left alone: its id may belong to someone else by now."""
+    for path in (("_client", "_transport", "_proc"), ("_connection", "_transport", "_proc")):
+        found = manager
+        for name in path:
+            found = getattr(found, name, None)
+        if type(getattr(found, "pid", None)) is int and getattr(found, "returncode", 0) is None:
+            return found.pid
+    return None
+
+
+def kill_tree(pid):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=20)
+        else:
+            os.kill(pid, 9)
+    except Exception:
+        pass  # Already gone, or not ours to kill.
+
+
+def kill_driver(driver):
+    """Stop Playwright's driver, and the browser under it, so that every call waiting for them fails instead of waiting for ever."""
+    pid = driver_pid(driver_manager(driver))
+    if pid is not None:
+        kill_tree(pid)
+
+
+def enforce(driver, done, seconds, forced):
+    """Watch the teardown from a thread that never calls Playwright: past the deadline it kills the driver (and the browser under
+    it), which fails any call still waiting for them, and drops the operations asyncio's Windows proactor still lists. Closing the
+    loop waits for every listed operation, and one whose completion was already consumed never reports again (a Playwright object
+    used from a second thread is enough to leave one behind), so without this the close has no end."""
+    if done.wait(seconds):
+        return
+    forced.append(seconds)
+    manager = driver_manager(driver)
+    kill_driver(driver)
+    pending = getattr(getattr(getattr(manager, "_loop", None), "_proactor", None), "_cache", None)
+    for _ in range(30):
+        if done.wait(2):
+            return
+        if pending is not None:
+            pending.clear()
+
+
+def close_bounded(stack, driver, seconds=None):
+    """Unwind the runtime's ExitStack (close the browser, stop the driver) within `seconds`. Nothing in that sequence takes a
+    timeout of its own. Once the deadline has forced it, a failure of the unwinding is the shutdown's, not the verdict's."""
+    done, forced = Event(), []
+    Thread(target=enforce, args=(driver, done, TEARDOWN_SECONDS if seconds is None else seconds, forced), daemon=True).start()
+    try:
+        stack.close()
+    except Exception:
+        if not forced:
+            raise
+    finally:
+        done.set()
+    if forced:
+        print(f"Nightweaver: the browser did not shut down within {forced[0]} seconds and was stopped.", file=sys.stderr)
+
+
 @contextmanager
-def browser_runtime(channel, *, timeout=None):
-    with ExitStack() as stack:
+def browser_runtime(channel, *, timeout=None, info=None, allow_fallback=True):
+    """Start the verification browser. `info`, when given, receives the requested and used channel and any fallback."""
+    stack, started = ExitStack(), []
+    try:
         try:
             from playwright.sync_api import sync_playwright
 
             driver = stack.enter_context(sync_playwright())
-            browser = driver.chromium.launch(channel=channel, timeout=timeout)
+            started.append(driver)
+            stall.watch.bind(lambda: kill_driver(driver))  # A call the browser never answers ends here, not at the job's timeout.
+            browser, used, fallback = launch_browser(driver, channel, timeout, allow_fallback)
             stack.callback(browser.close)
         except Exception as error:
             raise BrowserRuntimeUnavailable(
                 f"Cannot start {channel or 'bundled Chromium'}: {error}"
             ) from error
+        if info is not None:
+            info.update(requested=channel or "bundled", used=used, fallback=fallback)
         yield browser
+    finally:
+        stall.watch.unbind()
+        close_bounded(stack, started[0] if started else None)
+
+
+def warm_up(browser):
+    """Installed Edge and Chrome draw their first screenshot slowly. Pay that once, outside the timed cases."""
+    try:
+        context = browser.new_context()
+        try:
+            page = context.new_page()
+            page.set_content("<!doctype html><title>Nightweaver warm-up</title>")
+            page.screenshot(timeout=30000)
+        finally:
+            context.close()
+    except Exception:
+        pass  # A browser that is really broken fails the first case with its own diagnosis.
+
+
+def favicon_failure(message, page_url, requested=()):
+    """Installed Edge and Chrome fetch /favicon.ico on the first page. The headless shell never does, so it is not a page error.
+
+    Only that fetch is exempt: a same-origin (or file:) /favicon.ico that answered 404 or failed, which the page did not ask for
+    itself. Another origin, another status and any request a script or the page's markup made (`requested` holds their URLs) stay errors."""
+    url = (getattr(message, "location", None) or {}).get("url", "")
+    seen, page = urlparse(url), urlparse(page_url)
+    same_origin = seen.scheme == page.scheme and (seen.scheme == "file" or seen.netloc.lower() == page.netloc.lower())
+    return bool(same_origin and seen.path == "/favicon.ico" and not seen.query and url not in requested
+                and re.match(r"Failed to load resource: (?:the server responded with a status of 404\b|net::ERR_)", message.text))
+
+
+# A page that names its favicon, or draws it from inline code, is asking for the file itself.
+NAMES_FAVICON = "document.documentElement.outerHTML.toLowerCase().includes('favicon.ico')"
+# Every page of the case reports once it has parsed, so a page the journey leaves behind (a navigation, a popup) still counts.
+NAMES_BINDING = "__nightweaverNamesFavicon"
+REPORT_FAVICON = (f"addEventListener('DOMContentLoaded', () => {{ try {{ if (window === top && {NAMES_FAVICON}) "
+                  f"Promise.resolve(window.{NAMES_BINDING}()).catch(() => {{}}) }} catch (e) {{}} }})")
 
 
 def run_case(
-    browser, config, scenario, viewport, steps, root, output, url, server_check
+    browser, config, scenario, viewport, steps, root, output, url, server_check, sweep=None
 ):
     from playwright.sync_api import expect
 
     case = journeys.case_prefix(scenario.get("name"), viewport["name"])
     timeout, offline = config["timeout_ms"], config.get("offline", False)
-    context = browser.new_context(
-        viewport={k: viewport[k] for k in ("width", "height")},
-        **{
-            "reduced_motion": "reduce",
+    with stall.watch.limit(NEW_CONTEXT_SECONDS):  # A browser that cannot make a context is stuck, not slow.
+        context = browser.new_context(
+            viewport={k: viewport[k] for k in ("width", "height")},
             **{
-                k: v
-                for k, v in viewport.items()
-                if k not in ("name", "width", "height")
+                "reduced_motion": "reduce",
+                **{
+                    k: v
+                    for k, v in viewport.items()
+                    if k not in ("name", "width", "height")
+                },
             },
-        },
-        offline=offline,
-        storage_state=journeys.storage_state(url, scenario),
-        service_workers="block" if offline else "allow",
-    )
+            offline=offline,
+            storage_state=journeys.storage_state(url, scenario),
+            service_workers="block" if offline else "allow",
+        )
     result = {
         "viewport": viewport["name"],
         "passed": False,
@@ -321,8 +531,10 @@ def run_case(
         result["scenario"] = scenario["name"]
     stage = {"action": "navigate"}
     error_counts = Counter()
+    events = []  # (category, message) in arrival order; the sweep attributes errors to the control it just clicked.
     first_error_stage = None
     started = monotonic()
+    base_traffic = None
 
     def issue(category, message):
         nonlocal first_error_stage
@@ -330,17 +542,90 @@ def run_case(
         if first_error_stage is None:
             first_error_stage = stage.copy()
         message = str(redact(str(message)))[:2000]
+        if len(events) < 500:
+            events.append((category, message))
+        if "control" in stage:
+            message = f"After clicking '{stage['control']}': {message}"
         if len(result["errors"]) < 20 and message not in result["errors"]:
             result["errors"].append(message)
+
+    requested = set()  # /favicon.ico URLs that a script, the parser or a preload asked for. The browser's own fetch has no such initiator.
+    # Whether any page of the case names its favicon, and the exempt errors held until that is known. Popups are listed to be awaited.
+    favicon, popups = {"names": False, "hidden": [], "blind": False}, []
+
+    def on_request(event):
+        if urlparse(event["request"]["url"]).path == "/favicon.ico" and event["initiator"]["type"] != "other":
+            requested.add(event["request"]["url"])
+
+    def names_favicon():
+        """Some page names /favicon.ico, so a failed fetch of it is that page's own broken reference, now and from here on."""
+        favicon["names"] = True
+        for text in favicon["hidden"]:
+            issue("console", text)
+        favicon["hidden"].clear()
+
+    def on_console(msg, own=True):
+        # A popup's other console errors have never counted. Only its favicon failure does, when some page names the icon.
+        if msg.type != "error":
+            return
+        if favicon["blind"] or not favicon_failure(msg, url, requested):
+            if own:
+                issue("console", msg.text)
+        elif favicon["names"]:
+            issue("console", msg.text)
+        else:
+            favicon["hidden"].append(msg.text)
+
+    def judge_favicon(page):
+        """The last look at the page the case ends on, after a popup has had time to load and ask for its icon."""
+        for popup in popups:
+            try:
+                popup.wait_for_load_state("load", timeout=2000)
+            except Exception:
+                pass  # Closed, or too slow to matter.
+        try:
+            if popups:
+                page.wait_for_timeout(300)
+        except Exception:
+            pass
+        try:
+            if page.evaluate(NAMES_FAVICON):
+                names_favicon()
+        except Exception:
+            names_favicon()  # A page that cannot be read cannot be excused.
+        favicon["hidden"].clear()
+
+    def watch_popup(popup):
+        try:
+            popup.on("console", lambda msg: on_console(msg, False))
+            popup.on("popup", watch_popup)
+            popups.append(popup)
+        except Exception:
+            pass  # A popup that cannot be watched is left alone, as every popup was before.
+
+    try:
+        context.expose_function(NAMES_BINDING, names_favicon)
+        context.add_init_script(REPORT_FAVICON)
+    except Exception:
+        favicon["blind"] = True  # Without the report nothing can be excused.
 
     def watch_page(page):
         page.set_default_timeout(timeout)
         page.on("pageerror", lambda err: issue("page_error", err))
-        page.on(
-            "console",
-            lambda msg: issue("console", msg.text) if msg.type == "error" else None,
-        )
+        page.on("console", on_console)
+        page.on("popup", watch_popup)
+        try:
+            # Playwright's own request events leave out /favicon.ico, so the initiator comes from the protocol.
+            session = context.new_cdp_session(page)
+            session.on("Network.requestWillBeSent", on_request)
+            session.send("Network.enable")
+        except Exception:
+            favicon["blind"] = True  # Without the initiator nothing can be excused.
         return page
+
+    def mark(new):
+        nonlocal stage
+        stage = new
 
     def navigate(page):
         response = page.goto(url, wait_until=config["wait_until"], timeout=timeout)
@@ -419,6 +704,9 @@ def run_case(
             result["failed_at"] = stage.copy()
             issue("journey", error)
         finally:
+            if result["passed"]:
+                stage = {"action": "favicon"}
+                judge_favicon(page)
             stage = {"action": "screenshot"}
             try:
                 file = f"{case}.png"
@@ -430,14 +718,30 @@ def run_case(
                 issue("screenshot", f"Screenshot unavailable: {error}")
             stage = {"action": "trace"}
             try:
+                # The trace records the load and the steps. The sweep's pictures are its evidence; tracing them too makes
+                # an animated page's trace.zip outgrow the artifact limit.
                 file = f"{case}.trace.zip"
                 context.tracing.stop(path=str(output / file))
                 result["trace"] = file
             except Exception as error:
                 issue("trace", f"Trace unavailable: {error}")
+            if sweep is not None and result["passed"] and not error_counts:
+                # Only a page that loaded cleanly is exercised; the network budget below counts the load, not the clicking.
+                base_traffic, stage = traffic.summary(), {"action": "sweep"}
+                try:
+                    interaction.run(page, sweep, limit=config["sweep"]["max_controls"], timeout=config["timeout_ms"], output=output,
+                                    restore=lambda: navigate(page), events=events, mark=mark, issue=issue,
+                                    writes=config["sweep"].get("allow_writes", False), stepped=bool(steps),
+                                    overflow=result.get("overflow_px", 0))
+                except Exception as error:
+                    issue("sweep", f"Interaction sweep failed: {interaction.brief(error)}")
     finally:
-        context.close()
-    result["network_summary"] = traffic.summary()
+        try:
+            with stall.watch.limit(CLOSE_CONTEXT_SECONDS):
+                context.close()
+        except stall.Stall:
+            pass  # A wedged browser: the shutdown that follows stops it.
+    result["network_summary"] = base_traffic or traffic.summary()
     total = result["network_summary"]["requests"]
     network = config.get("network", {})
     if "network" in config:
@@ -484,14 +788,26 @@ def _verify_browser(config, root, output):
     config = validate_browser(config)
     root = Path(root).resolve()
     results = []
-    with browser_runtime(config.get("channel")) as browser:
+    channel = {}
+    if uses_visual(config):
+        image_tools()  # A missing dependency is reported before any browser is started.
+    sweep_viewport = next((v["name"] for v in config["viewports"] if v["name"] == "desktop"), config["viewports"][0]["name"])
+    sweep_out, swept = ({"sweep": [], "sweep_found": 0, "sweep_skipped": [], "sweep_unvisited": []} if "sweep" in config else None), False
+    with browser_runtime(config.get("channel"), info=channel, allow_fallback=not uses_visual(config)) as browser:
         runtime = {
             "chromium": browser.version,
             "playwright": version("playwright"),
-            "channel": config.get("channel", "bundled"),
+            "channel": channel["used"],
         }
+        if channel["fallback"]:
+            runtime["browser_channel_fallback"] = channel["fallback"]
+        if channel["used"] != "bundled":
+            warm_up(browser)
         with local_page(config, root, output) as (url, server_check):
             for scenario, viewport, steps in journeys.browser_cases(config):
+                # One sweep per gate: the desktop viewport (else the first one) of the first scenario.
+                sweeps = sweep_out if sweep_out is not None and not swept and viewport["name"] == sweep_viewport else None
+                swept = swept or sweeps is not None
                 results.append(
                     run_case(
                         browser,
@@ -503,14 +819,20 @@ def _verify_browser(config, root, output):
                         output,
                         url,
                         server_check,
+                        sweeps,
                     )
                 )
     receipt = {
         "schema": "nightweaver.browser.v2",
         "runtime": runtime,
+        "browser_channel": channel["used"],
         "passed": bool(results) and all(r["passed"] for r in results),
         "viewports": results,
     }
+    if channel["fallback"]:
+        receipt["browser_channel_fallback"] = channel["fallback"]
+    if sweep_out is not None:
+        receipt.update(sweep_out)
     write_json(output / "browser.json", receipt)
     return receipt
 

@@ -111,7 +111,10 @@ def handoff(store, run_id):
     state, spec = row["state"], row["spec"]
     index = state["step"]
     step = spec["milestones"][index] if index < len(spec["milestones"]) else None
-    accepted = store.accepted_milestones(run_id)
+    accepted = store.accepted_milestones(run_id)  # the current build's: a pursuit that reverted no longer counts a discarded wave's
+    gone = set(store.discarded_commits(run_id))
+    discarded = [{"title": spec["milestones"][entry["step"] - 1]["title"], "commit": entry["commit"]}
+                 for entry in store.accepted_milestones(run_id, discarded=True) if entry.get("commit") in gone] if gone else []
     recent = store.events(run_id, limit=1, kinds=["gate_finished"])
     gate = recent[0]["details"] if recent else None
     if gate and step:
@@ -141,6 +144,7 @@ def handoff(store, run_id):
                 for entry in accepted
                 if entry["step"] <= index
             ],
+            **({"discarded": discarded} if discarded else {}),
             "current": {
                 "title": step["title"],
                 "task": step["task"],
@@ -158,6 +162,11 @@ def handoff(store, run_id):
             "operator_feedback": store.feedback_text(run_id),
             "budget": budget_report(store, run_id),
             "waiting_for": pending_dependencies(store, state),
+            **({"pursuit": {"wave": state.get("wave", 1), "max_waves": spec["pursue"]["max_waves"], "target_score": spec["pursue"]["target_score"],
+                            "best_score": state.get("best_score"), "best_commit": state.get("best_commit"),
+                            "judgments": state.get("judgments", []), "open_gaps": state.get("pursuit_gaps", []),
+                            "rescues_used": state.get("rescues_used", 0)}}
+               if spec.get("pursue") else {}),
         }
     )
 
@@ -169,11 +178,19 @@ def handoff_markdown(data):
     if data["completed"]:
         lines += ["", "## Accepted milestones", ""]
         lines += [f"- {m['title']} ({m['commit']})" for m in data["completed"]]
+    if data.get("discarded"):
+        lines += ["", "## Discarded milestones (not part of the accepted build)", ""]
+        lines += [f"- {m['title']} ({m['commit']})" for m in data["discarded"]]
     if step := data["current"]:
         lines += ["", f"## Next milestone · {step['title']}", "", step["task"]]
         for label, items in (("Allowed paths", step["paths"]), ("Checks", step["checks"])):
             if items:
                 lines += ["", label, *[f"- {item}" for item in items]]
+    if pursuit := data.get("pursuit"):
+        lines += ["", "## Goal pursuit", "", f"Wave {pursuit['wave']} of at most {pursuit['max_waves'] + 1}; target score {pursuit['target_score']}; "
+                  f"best score {pursuit['best_score']}" + (f"; plateau rescues used {pursuit['rescues_used']}" if pursuit.get("rescues_used") else "")]
+        lines += [f"- Wave {j['wave']}: {j['score']}/100 {j['verdict']}" for j in pursuit["judgments"]]
+        lines += [f"- Open gap: {g['title']}" for g in pursuit["open_gaps"][:5]]
     if data["acceptance"]:
         lines += ["", "## Acceptance requirements", "", *[f"- {item}" for item in data["acceptance"]]]
     if data["waiting_for"]:
@@ -217,7 +234,7 @@ def audit_evidence(store, run_id):
     store.get(run_id)
     root = (store.directory(run_id) / "evidence").resolve()
     files = []
-    for event in store.events(run_id, limit=None, kinds=["gate_finished"]):
+    for event in store.events(run_id, limit=None, kinds=["gate_finished", "judge_gate_finished"]):
         detail = event["details"]
         artifacts = [(a, "artifact") for a in detail.get("artifacts", [])]
         if detail.get("log_sha256"):

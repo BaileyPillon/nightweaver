@@ -1,6 +1,56 @@
 # Nightweaver
 
-**Version 0.18** can restart a crashed Windows runner at its saved milestone. Give a dedicated run a restart allowance, inspect its accepted commit, and trace a crash from the dashboard or offline report. [The 40 ranked changes, recent research and Windows recovery trials](docs/v0.18-research.md)
+An autonomous workshop for your code, built for Windows.
+
+Windows-native orchestration for coding agents. Give Nightweaver a goal with checked milestones. It hands off work between agents, sends failed checks back for repair, and advances after the result passes verification. With `--pursue`, an independent judge then scores the finished build against the goal and a planner adds further waves of milestones until the goal is met or progress stops. `nightweaver wish` starts such a run from one line. Close the desktop dashboard whenever you need to. The runner keeps its place in SQLite.
+
+## What's new in 0.19 — goal pursuit
+
+Until 0.19 a run ended when its fixed milestone list was accepted, and a person decided what came next. Version 0.19 adds that outer loop. After the last planned milestone is accepted, the controller re-runs every check that applies to the finished build and collects screenshots. This is the evidence ledger. An independent, read-only judge then returns `MET` or `NOT_MET`, a 0–100 score, a result for each criterion and a ranked list of gaps. The run is done only when the judge says `MET` at or above `target_score`, every ledger check passes and, by default, a second, independent judgment of the same build confirms it. (`confirm: false` turns the confirmation off, and if the call, time or token budget cannot fund it, the first judgment stands and the run records `confirmation_skipped`.) Otherwise a read-only planner turns the gaps into the next wave of milestones, which inherit the last milestone's checks and workers, and the paths of all plan milestones together (no path limit if any milestone had none).
+
+A pursuit stops when the goal is met, when the score stops improving (`plateau`, after one [plateau rescue](#rescue-a-plateau) by default), when the wave allowance is spent (`max_waves`) or at the 50-milestone cap. A wave that scores more than `regression_margin` below the best build is discarded to a `nightweaver/<run-id>-discarded-wNN` ref, and the result branch returns to the best build. A stopped run always leaves the best build on its result branch. `nightweaver pursuit RUN_ID --add-waves N` grants more waves and resumes a run that stopped on a judged build.
+
+```powershell
+nightweaver wish C:\src\my-project "Make the pricing page feel finished" --start --wait
+nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
+nightweaver pursuit RUN_ID
+nightweaver pursuit RUN_ID --add-waves 2
+```
+
+**The pursuit loop**
+
+- **Goal pursuit.** A judge, an evidence ledger, waves, keep-best with green builds ranked first, typed stop rules and `--add-waves`. [Details](#pursue-a-goal-until-it-is-met)
+- **A judge that is not told the pass mark.** Every judge scores against one fixed rubric. A judgment that would finish the run is confirmed by a second, independent judgment of the same build before `MET` stands (`confirm`, `confirm_margin`, `confirm_judge`). [Details](#the-pursue-block)
+- **Design-direction tournament.** Before milestone 1, `pursue.explore` (`oneshot --explore N`) builds N deliberately different versions, judges them pairwise in both orders and promotes the winner. [Details](#explore-design-directions-before-building)
+- **Plateau rescue.** When scores stop improving, one read-only call diagnoses the stall, divergent strategies are built from the best build, and one replaces it only if it wins (`pursue.rescue`, `--rescue-strategies`). [Details](#rescue-a-plateau)
+- **`nightweaver wish`.** One line becomes a brief, acceptance requirements, checks, a model roster and a pursuit run. [Details](#start-from-one-line)
+
+**Browser evidence**
+
+- **Interaction sweep.** A browser gate clicks a page's controls itself and photographs every state, so reviewers and judges see what sits behind a control instead of only the first load. [Details](#interaction-sweep)
+- **Smoke gates.** Web repositories without tests get a browser smoke gate. A `--web` / `--no-web` hint settles whether a new repository's goal is a page. A gate's `root` field serves a site from `public/` or `docs/` as it is deployed. Browser gates fall back to Edge or Chrome when the bundled Chromium is missing. A visual wish on a tested repository gets a baseline-probed `Visual smoke` gate beside its tests. [Details](#smoke-gates-and-the-web-hint)
+
+**Unattended runs.** These fix what an audit of 118 runs on one machine, 13 of them real work, showed, plus what the adversarial review found. [Details](#run-unattended)
+
+- A provider usage limit parks the run until the provider's reset time and resumes it automatically. Before, the run blocked within seconds.
+- Failure identity is the phase, the failed checks and the build tree, not the wording of a message. The repeated-failure stop that never fired in those runs now does. When a worker changes nothing after a review rejection, that attempt is rejected as `no_progress` without re-running the checks or the reviewer. It still uses an attempt, and the run blocks after `retry.repeated_failure_limit` identical failures (default 3) or when attempts run out.
+- A reviewer receives the staged diff (the first 16 KB inline and the whole patch, up to 400 KB, in a saved file it is told to read), the attempt's screenshots, its own earlier findings and the local model's advice. Approvals with prose before the JSON verdict are no longer read as rejections, and an answer that cannot be read fails closed. A reviewer that fails is retried without costing the worker an attempt.
+- A worker that goes silent for 900 seconds is retried in a fresh session without costing an attempt (plans written by 0.19). Resumed Codex sessions count only their own tokens. `git_timeout` governs git, and a checkout of a large repository survives a runner crash. Chromium `debug.log` files and similar tool droppings are deleted, so no check passes on a file the accepted commit lacks.
+- Claude can run unattended with a long-lived token, in Nightweaver's own config directory so an operator's interactive `CLAUDE.md` cannot steer it. Gates, git and `command` routes get an environment with no credential-shaped variable.
+- Each provider call records the model that was actually served, and a route served a different model than it asked for raises `model_mismatch`.
+- Opt-in phone notifications over ntfy, with quiet hours, an on-demand digest (`notify digest`; nothing schedules it) and automatic release of messages held overnight. [Details](#phone-notifications)
+
+**What has been measured.** The [research record](docs/v0.19-research.md) holds the numbers and their limits.
+
+- An adversarial review put 53 candidate defects to three skeptics each. 51 were upheld (6 blocker, 21 major, 24 minor) and fixed in five fix groups, and every fix was attacked again by two skeptics. The interaction sweep and the plateau rescue had their own reviews, with 22 and 10 upheld findings, all fixed.
+- One live run built a page from a repository holding only a README in about 70 minutes. It accepted four milestones, rejected one milestone once for missing evidence, which the worker repaired, and judged the goal `MET` at 88/100 on the first wave. That judge had been shown the target score of 88 and returned exactly 88, a flaw this release removes. The run did not use later waves, the rescue, exploration, the sweep, the confirmation, `wish` or notifications.
+- A blind head-to-head on the same brief compared that build with standalone Codex and standalone Claude builds. Two LLM judges, each in both orders, picked Nightweaver's build in all 8 pairwise calls it was in. Scored alone against the fixed rubric, the three builds averaged 91 (Nightweaver), 90.5 (Codex) and 86 (Claude). Nightweaver took 4.3 times the Codex build's wall time and 11.6 times its observed tokens (mostly cached input; 16.1 times counting only non-cache tokens), measured while the three builds ran at overlapping times on one machine. It is one brief and one build per contender, and both judges come from the builders' families, so it is one data point, not a general result.
+
+Before this release no matched evidence existed that a OneShot beats standalone Codex or Claude Code. The one matched pair was parity on acceptance at about 2.8 times the time and 4.8 times the tokens, on a trivial task. [The 40 ranked changes, field evidence, research sources, adversarial review, trial results and what is not yet built](docs/v0.19-research.md)
+
+## Earlier releases
+
+Version 0.18 can restart a crashed Windows runner at its saved milestone. Give a dedicated run a restart allowance, inspect its accepted commit, and trace a crash from the dashboard or offline report. [The 40 ranked changes, recent research and Windows recovery trials](docs/v0.18-research.md)
 
 ```powershell
 nightweaver oneshot C:\src\my-project "Fix the broken share link" --guard-restarts 2 --wait
@@ -50,17 +100,13 @@ Run a [head-to-head benchmark of AGTX OneShot, Codex and Claude Code](docs/head-
 
 Version 0.4 adds owned application servers for browser checks, direct standalone CLI comparisons, complete standalone task handoffs, per-task matched outcomes, and explicit account/environment blockers. See the [0.4 guide and comparison starter](docs/v0.4-guide.md). Version 0.3 introduced the [ranked 10 features and 10 improvements with research sources](docs/upgrade-plan.md); its [guide](docs/v0.3-guide.md) remains applicable except where superseded.
 
-An autonomous workshop for your code, built for Windows.
-
-Windows-native orchestration for coding agents. Give Nightweaver a goal with checked milestones. It hands off work between agents, sends failed checks back for repair, and advances after the result passes verification. Close the desktop dashboard whenever you need to. The runner keeps its place in SQLite.
-
 ## What runs on Windows
 
 - A WPF dashboard for starting a plan or OneShot, watching attempts, opening evidence, and pausing or resuming runs.
 - Native Codex, Claude Code, and DeepSeek adapters. Use your existing CLI logins or select a specific installed profile for a role. DeepSeek runs through Claude Code's tools with a separate API key and configuration directory. An optional local Ollama model supplies advisory feedback. You can also plug in a custom executable.
 - A pinned Git baseline and a separate worktree per milestone. Accepted commits land on `nightweaver/<run-id>` for inspection or integration.
 - Independent operator-defined checks, with optional required screenshots or other files and a separate reviewer. Check receipts bind artifacts and decisions to a Git tree. Failed checks feed the next attempt automatically.
-- A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair.
+- A configured reviewer checks the whole objective at the final milestone and can send unfulfilled requirements back for repair. In a pursuit run, the judge decides whether the whole goal is met and the final-milestone reviewer checks only that milestone.
 - A background runner with Windows Job Objects for child process cleanup. Relaunch a failed or interrupted runner against the same durable state, worktree, and recorded provider session where available.
 - A persistent queue with run prerequisites, recovery after interruption, and an optional dispatcher launched by Windows Task Scheduler at sign-in.
 
@@ -110,6 +156,8 @@ dotnet run --project Nightweaver.Desktop -c Release
 
 The compiled desktop app accepts `--home <runtime-directory>` and `--python <python.exe>` for shortcuts that need explicit paths.
 
+The activity list names goal pursuit and unattended-run events in plain words, for example "Goal judged 72/100", "Waiting for usage reset until 18:40", "Worker stalled; retrying fresh" and "Reviewer shares the worker's vendor". Rescue, exploration, confirmation (`goal_confirming`, `met_unconfirmed`, `confirmation_skipped`) and `model_mismatch` events appear there under their event names. The New OneShot dialog does not offer pursuit, exploration or `wish` yet. Start those from the command line and watch the run in the dashboard.
+
 ## Use it on a project
 
 Choose the repository root with the committed base you want. Set `repository`, `title`, `objective`, `worker`, `gates`, and ordered `milestones` in a local JSON plan. A milestone can specify a different `worker`, its own extra `gates`, and its allowed `paths`. `protected_paths` defends tracked checks and project boundaries during promotion. Run with trusted plans and projects. Custom commands run with your Windows permissions, and provider tool calls use the provider's permissions.
@@ -138,9 +186,181 @@ python -m nightweaver doctor --plan plan.json --planner deepseek --live
 python -m nightweaver doctor --planner claude --profile-dir 'C:\Profiles\claude-work' --live
 ```
 
-The report resolves the plan's checkout and identifies which executable, profile and model each role will use. A non-live report checks local configuration. With `--live`, Nightweaver sends a small test prompt per distinct model route from an empty directory. A successful model reply confirms access at the time of the check. Live requests use your normal subscription limits or API balance. Ollama is checked by listing local models. Custom commands are checked for executable availability and run only as part of the plan.
+The report resolves the plan's checkout and identifies the executable, profile, model and configured reasoning effort for each role. A non-live report checks local configuration. With `--live`, Nightweaver sends a small test prompt per distinct model route. Live requests use your normal subscription limits or API balance. For Ollama, the live report also records the responding model and whether it returned thinking. Custom commands are checked for executable availability and run only as part of the plan.
+
+Set `effort` on a Claude, Codex or DeepSeek worker or reviewer. Use `--effort` for a CLI planner. For example, Opus 5.5 and Astra 6.2 accept `xhigh`. DeepSeek's highest native level is `max`. Explicit settings apply to the child process, including resumed calls.
 
 The command exits with status 3 if a required model route is blocked or a live request could not be verified. On a run, a missing CLI, missing selected profile, or recognized account, model, or usage-limit error blocks with the affected role and profile. Correct that route and retry the existing run. [Claude profile settings](https://code.claude.com/docs/en/settings) · [Ollama model listing](https://docs.ollama.com/api/tags)
+
+## Pursue a goal until it is met
+
+A OneShot normally ends when its planned milestones are accepted. Add `--pursue` to keep going until an independent judge accepts the result.
+
+```powershell
+nightweaver oneshot C:\src\my-project "Build a polished pricing page" --pursue --judge claude --judge-model claude-opus-5-5 --judge-effort xhigh --waves 3 --wait
+```
+
+`--judge` chooses the judging provider. The default is a different model family from the worker: Claude, or Codex when the worker is Claude. `--judge-model`, `--judge-effort` and `--judge-profile` pick its model, reasoning effort and signed-in profile. The judge also plans each wave unless `--planner-kind` names another provider, with `--planner-model`, `--planner-effort` and `--planner-profile`. `--waves` sets the additional waves allowed after the initial plan (1–20, default 3). `--target-score` sets the score that counts as done (default 85). `--reference IMAGE` gives the judge a target to compare screenshots with, repeated up to six times. `--explore N` builds N design directions before milestone 1 and `--rescue-strategies N` sets the plateau rescue's strategy count (`0` turns it off). These flags require `--pursue`. `--planner-model`, `--planner-effort` and `--planner-profile` also require `--planner-kind`, and `--explore-workers` also requires `--explore`. `--reviewer` adds a reviewer for each milestone, with or without `--pursue`. Every provider call counts against `budgets.max_calls`. Each wave costs a planner call, a worker call for each attempt at each milestone, a reviewer call for each attempt if a reviewer is set, an advisory call for each reviewed build if a local advisory model is set and a judge call. A judgment that would finish the run adds a confirmation call. The live trial's one wave made 16 calls: 5 worker, 5 reviewer, 1 judge and 5 advisory. With `--pursue`, a OneShot whose budgets are still the default (15 calls, 1 hour) gets 80 calls and 6 hours, and `wish` uses the same limits. Set `budgets` in a template for other limits. `plan-lint` counts the confirmation in `minimum_calls_for_acceptance`.
+
+### The `pursue` block
+
+Plans and OneShot templates take the same settings in a `pursue` block beside `worker` and `gates`. Only `judge` is required. The judge, its fallbacks and the planner take the same provider settings as a worker or reviewer: `kind`, `model`, `effort` and `profile_dir`.
+
+```json
+"pursue": {
+  "judge": {"kind": "claude", "model": "claude-opus-5-5", "effort": "xhigh"},
+  "judge_fallbacks": [{"kind": "codex"}],
+  "planner": {"kind": "claude"},
+  "max_waves": 3,
+  "wave_size": 3,
+  "target_score": 85,
+  "plateau": 2,
+  "regression_margin": 5,
+  "references": ["reference/pricing-target.png"],
+  "criteria": [
+    "Three pricing tiers are readable at 390 px width",
+    "The recommended tier is visually distinct"
+  ]
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `judge` | required | The independent, read-only judge. A judge from the worker's own vendor works but is recorded as less independent. |
+| `judge_fallbacks` | none | Up to five other routes tried in order when the judge's provider fails. |
+| `planner` | the judge | Plans each wave from the judged gaps. It stays read-only. |
+| `max_waves` | 3 (1–20) | Additional waves after the initial plan. |
+| `wave_size` | 3 (1–5) | Most milestones one wave may add. |
+| `target_score` | 85 (0–100) | The score a `MET` verdict must reach. Every ledger check must also pass. The controller applies it; no prompt ever shows it. |
+| `confirm` | true | A judgment that would finish the run is confirmed by one more independent judgment of the same build. |
+| `confirm_margin` | 3 (0–20) | The confirmation must say `MET` at `target_score` minus this or better. |
+| `confirm_judge` | the judge | Another route for the confirmation, which falls back to `judge_fallbacks`. |
+| `plateau` | 2 (1–5) | Consecutive judgments that fail to beat the best score before the pursuit stops. |
+| `regression_margin` | 5 (0–50) | A wave scoring this far below the best build is discarded and the best build restored. |
+| `references` | none | Up to six `.png`, `.jpg`, `.jpeg` or `.webp` images, relative to the plan file. |
+| `criteria` | the plan's `acceptance` | What defines done. The judge answers each one. |
+| `explore` | off | Builds divergent versions of milestone 1 first and keeps the winner. See [Explore design directions](#explore-design-directions-before-building). |
+| `rescue` | on: 3 strategies, 1 rescue | What happens when the score plateaus. See [Rescue a plateau](#rescue-a-plateau). |
+
+The judge reads the source, the check logs and up to twelve distinct screenshots from the ledger checks, plus any reference images. The ledger runs the checks that apply to the finished build: the plan's checks, its final checks and the checks retained from earlier milestones, not a check local to an earlier milestone. Each judgment keeps its own evidence folder, so one build's screenshots never reach another's judgment. A judge only sees stills: motion and timing are judged from source and logs, and a browser gate without a [sweep](#interaction-sweep) shows only each page as first loaded.
+
+Every judge scores against one fixed rubric: 95–100 exceptional, 85–94 finished with only polish-level gaps, 70–84 solid with visible gaps, 50–69 partial, below 50 major gaps. In the live trial, a judge that was shown the pass mark (88) returned exactly 88, so `target_score` stays a threshold in the controller and no prompt shows it. `MET` needs every criterion fully met. When a judgment would finish the run, a second judge call looks at the same build in a fresh session with the screenshots in reverse order and without the first verdict. `MET` stands only if the confirmation also says `MET` at `target_score - confirm_margin` or better. Otherwise the pursuit records `met_unconfirmed`, continues as `NOT_MET` with the gaps of both judgments and scores the build by the lower of the two. By default the confirmation uses the judge's own route, so it guards against one noisy call but shares that model's blind spots; `confirm_judge` names another route. A failure of the confirmation route (a usage limit, a sign-in, a missing executable) is reported against that route, not the judge, and uses the same fallbacks and parking as the judge. When the call, time or token budget cannot fund the confirmation call, the judgment that met every condition stands without it: the run records `confirmation_skipped` with the reason, `pursuit` and `metrics` show it, and `plan-lint` reports the shortfall beforehand.
+
+Builds are ranked by whether every ledger check passed, then by score, so a build that fails its own checks never replaces a green one. A judgment lists at most 30 gaps and 60 criteria, and `criteria` or `acceptance` may name at most 60. Planned waves inherit every plan milestone's paths together, or no path limit when any milestone had none, and the planner is told those paths and the protected paths.
+
+A pursuit stops with `wave_limit` when `max_waves` is spent, `plateau` when progress stalls, or `milestone_limit` at 50 milestones. It leaves the best build on `nightweaver/<run-id>`. A milestone-limit stop cannot be extended with `--add-waves`.
+
+### Explore design directions before building
+
+For a goal judged by looking at it, the first build sets the look of everything after. `pursue.explore` builds several deliberately different versions of milestone 1 before one is kept. It is off unless set. `oneshot --pursue --explore N` turns it on with N directions (2–4), `--explore-workers codex,claude` names the workers that take the directions in turn (default: the primary worker), and `wish` turns it on, with three directions, for a visual goal.
+
+1. **Directions.** One read-only planner call names N divergent directions, each with a name and a brief. Two unreadable answers skip the tournament and milestone 1 is built as planned.
+2. **Build.** Each direction is built once, one after another, in its own worktree from the base commit, and must pass milestone 1's checks. A direction that passes is committed and saved at `nightweaver/<run-id>-direction-NN`. If none passes, milestone 1 is built as planned.
+3. **Compare.** The judge route compares the passing directions, each pair in both orders (`"comparisons": "pairwise"`, the default), or ranks them all in one call (`"single"`). It is told that every candidate passed the same checks and to weigh visual quality first. A win scores one point and a tie half a point per call. A pair whose two orders disagree is reported as position bias. Two unreadable answers record an unscored tie.
+4. **Promote.** The top-ranked direction is promoted as milestone 1, and the pursuit goes on from there. A single passing direction is promoted without a judge call. The winner is promoted after its checks and the judge comparison (after its checks alone when only one direction passed). The milestone reviewer, if configured, is not run on a direction winner, so no reviewer looks at it before the next goal judgment.
+
+```json
+"explore": {"directions": 3, "workers": [{"kind": "codex"}, {"kind": "claude"}], "comparisons": "pairwise", "brief": "Differ in palette, layout and motion, not only in color."}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `directions` | 3 (2–4) | Directions planned and built. |
+| `workers` | milestone 1's worker | Up to four workers that take the directions in turn. |
+| `comparisons` | `pairwise` | `pairwise` judges each pair twice, in both orders. `single` ranks every passing direction in one call. |
+| `brief` | none | Up to 4000 characters of guidance on how the directions should differ. |
+
+Exploration costs one planner call, N worker calls and, with three passing directions, six judge calls (twelve with four); `single` costs one judge call. `pursuit` shows each direction, whether it passed, its score and the winner, and `report` adds a Design exploration section. A hook for the owner to choose between the two best directions exists but returns no choice yet, so the judge always decides. Nothing measured so far shows that exploring beats building one direction and criticising it, and neither the live trial nor the head-to-head used it.
+
+### Rescue a plateau
+
+When the score stops improving, repeating the same kind of wave rarely helps. Before a pursuit stops with `plateau`, Nightweaver runs one plateau rescue:
+
+1. **Diagnose.** One read-only call explains why progress stalled and proposes N genuinely different strategies, at least one a bold rethink. It sees the goal, the criteria, every judgment with its top gaps, the milestones built in each wave, recent rejection reasons and the best build's screenshots. The planner diagnoses unless it comes from the worker's vendor family, in which case the judge does. Two unreadable answers skip the rescue and the pursuit stops as before; two failed calls (a timeout or a crash) block the run instead, so `--retry` diagnoses again with the rescue unspent.
+2. **Fork.** Each strategy gets one attempt in its own worktree at the best commit, by a rotating worker (default: the last milestone's worker). It runs the last milestone's checks and, on a pass, is committed on the best build and saved at `nightweaver/<run-id>-rescue-wNN-II` (a second rescue at the same wave adds its number, `-wNN-r2-II`, so the first one's refs and evidence stay).
+3. **Select.** The judge compares the best build with each passing strategy in both orders. A strategy qualifies only by scoring strictly more than half the points over a pair the judge read in both orders, so an answer that depends on the order shown never wins, and neither does a strategy whose other order was unreadable. If the judge cannot be read at all, the run blocks for `--retry` and the rescue is not spent. The controller runs the last milestone's checks on the best build as well, so both candidates are shown screenshots from the same checks. Qualifiers with equal scores meet each other, and the lower number breaks any remaining tie.
+4. **Promote or stop.** A winner is appended as the milestone `Rescue: <strategy>` and promoted after its checks and the judge comparison, then judged as the next wave. The milestone reviewer, if configured, is not run on a rescue winner, so no reviewer looks at it before that judgment. If none wins, the pursuit stops with `plateau` on the best build, exactly as it would have.
+
+```json
+"rescue": {"strategies": 3, "max_rescues": 1, "workers": [{"kind": "codex"}, {"kind": "claude"}]}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `strategies` | 3 (2–4) | Strategies the diagnosis proposes and the rescue builds. |
+| `max_rescues` | 1 (0–3) | Rescues one run may start. `0` turns the rescue off and keeps the earlier behavior exactly. |
+| `workers` | the last milestone's worker | Up to four workers that build the strategies in turn. |
+
+`oneshot --pursue --rescue-strategies N` sets the strategy count, and `--rescue-strategies 0` turns the rescue off (`--rescue` still names an alternate repair worker). A rescue costs one diagnosis call, one worker call per strategy and two judge calls per passing strategy, and the judgment of the winner (plus its confirmation) must still fit after that; when `budgets.max_calls` has fewer calls left than that minimum, or the time or token budget is spent, the rescue is skipped and the pursuit stops as a plateau, so `--add-waves` still works. `pursuit` shows the diagnosis, the strategies, their scores and the winner, and `metrics` reports `rescue`: how many were attempted and won, the winning strategy and the score before and after the next judgment, so you can see whether rescues pay off.
+
+### Read and extend a pursuit
+
+```powershell
+nightweaver pursuit RUN_ID
+nightweaver pursuit RUN_ID --add-waves 2
+```
+
+`pursuit` prints each wave with its milestones, the judgment, the top gaps, any failed ledger checks, any revert, and the design exploration and any rescue. Add `--json` for the same data as JSON. `--add-waves N` raises `max_waves` by N (1–20). A run that stopped after judging a build goes back to the planner with that build's gaps and a fresh plateau count, because judging the same build again would add no evidence; resume it or let the dispatcher continue it. Milestones of a discarded wave are listed as discarded (not accepted) by `handoff`, `pursuit` and `timeline`, and `fork` and `replay` leave them out; `metrics` and `report` count only the build's own milestones. A run that discarded a wave under an earlier version is read from its `pursuit_reverted` events and recorded the next time it resumes. `report` adds a Goal pursuit section and `handoff` lists the scores and open gaps. `doctor` and `preflight` check the judge, its fallbacks, the confirmation judge and the planner.
+
+### Start from one line
+
+`nightweaver wish` turns one line into a complete pursuit run. The target is a repository folder or a bound project name.
+
+```powershell
+nightweaver wish C:\src\my-project "Make the pricing page feel finished" --preview
+nightweaver wish C:\src\my-project "Make the pricing page feel finished" --start --wait
+```
+
+`--preview` writes the brief and the template and stops before the pursuit planner is called, but it still makes the one brief-writer model call (step 1 below) and spends usage on it. With neither flag, `wish` saves the same files and prints the exact commands to start the run. `--start` plans with the pursuit planner and starts a dedicated runner (`--wait` returns the outcome, `--guard-restarts N` adds crash recovery). `--waves`, `--target-score` and `--reference IMAGE` work as they do for `oneshot --pursue`.
+
+1. **Brief.** A read-only brief-writer call (Claude `claude-opus-5-5` at `xhigh`; change it with `--brief-kind`, `--brief-model` and `--brief-effort`) reads the wish, a repository map, README, DESIGN, AGENTS and CLAUDE excerpts (12 KB in all) and the checks discovery found, and may read the repository with read-only tools. It returns an objective, 4 to 8 observable acceptance requirements, a `visual` flag, a `web` flag and any conflicts it resolved.
+2. **Roster.** `--roster default` uses Codex (`gpt-6.2-astra`, `xhigh`) as the worker, Claude (`claude-opus-5-5`, `xhigh`) as reviewer and judge and DeepSeek (`deepseek-v4-pro`, `max`) as the wave planner, plus a local advisory model when an Ollama server on `127.0.0.1:11435` (not the default 11434) lists `qwen3.8:27b` within 2 seconds (think `xhigh`, 4096 output tokens, 600 seconds, not required). Otherwise it is left out and the summary says why. `--roster fast` keeps every CLI default and has a Codex worker and a Claude judge, with no reviewer and no advisory.
+3. **Pursuit settings.** Up to 3 additional waves of 2 milestones, target score 88, a stop after 2 flat judgments, 80 model calls, 6 hours, 3 attempts per milestone and 30 minutes per call. A visual goal also gets a three-direction [exploration](#explore-design-directions-before-building), whose winner is promoted without the milestone reviewer, so when a direction wins, the wish's only initial milestone is not reviewed.
+4. **Saved files.** `<home>/wishes/<id>/` holds `brief.json`, `template.json`, `objective.txt` and the raw brief-writer log. The printed summary shows the brief, the checks, the roster and the limits. If the plan is refused after the brief is written, the files stay and the message says where.
+
+**Visual evidence for a wish.** Only a browser gate gives the judge and the milestone reviewer screenshots, so a visual wish gets one when its discovered checks have none.
+
+- A visual wish on a repository whose discovered checks include no browser gate, such as one with committed tests, gets a `Visual smoke` browser gate beside them, never instead of them. It runs on the first of `index.html`, `public/index.html`, `docs/index.html`, `dist/index.html`, `build/index.html`, `site/index.html` and `www/index.html` that is tracked at HEAD, served from that page's folder, with the [sweep](#interaction-sweep) on.
+- The brief writer's `web` flag says whether a committed page is what the wish changes. A repository that imports a desktop or game toolkit (`tkinter`, `pygame`, `PyQt`, `PySide`, `kivy`, `curses` and the like) is taken not to have one unless the brief says `web: true`.
+- A page is skipped when a bare file server cannot show it as the site: one that only redirects (a `meta refresh` or a tiny `location` assignment), template source with front matter, generated output (a `generator` meta tag, Sphinx, MkDocs, Doxygen and similar), and `dist/` or `build/` pages when `package.json` has a `build` script, because nothing in the run rebuilds them and the screenshots would never show the worker's edits.
+- The gate is run on the committed baseline in a throwaway checkout that is deleted afterwards (its evidence stays in `visual-probe/` beside the brief), and run a second time if the first run fails for a reason other than horizontal overflow. It is added only when it passes there, or fails only on horizontal overflow, which the worker can fix. A page that calls a backend, a bundler's bare module imports or any other console error on the untouched baseline would fail every milestone, so no gate is added for it.
+- With no usable page, no browser on the machine, a `dev`, `start`, `preview` or `serve` package script, or a failing baseline, nothing is added. The summary then notes that the judge (and the reviewer, if any) will have no screenshots and suggests a template with a browser check that owns the server, and `--start` goes on without the gate.
+- The acceptance line that the page loads cleanly at both sizes is added unless one brief line already names both viewports, no console or page errors and no horizontal overflow.
+- For a new repository the brief's `visual` flag decides, since there is no page to inspect. A non-visual wish for a new repository is refused after the brief is written, with nothing saved, because there is nothing to check yet.
+
+The tests exercise the brief writer, the roster and the Visual smoke gate with scripted routes. Neither the live trial nor the head-to-head started from a wish.
+
+### Run unattended
+
+- **Usage limits.** When a provider reports a usage limit, Nightweaver reads its reset time, parks the run and retries 90 seconds after the reset. The worker attempt is refunded. If the message gives no time, the retry comes after 30 minutes, doubling up to 2 hours. `retry.max_parks` (default 8 consecutive waits, `0` turns waiting off) and `retry.max_park_seconds` (default 21600, range 60–604800) bound the waiting. A reset that falls after the run's time budget blocks with a clear message. Parked runs resume through the runner, the dispatcher and the guard. A parked inline runner keeps the repository lock while it waits.
+- **Silent workers.** Plans written by 0.19 mark themselves (`idle_default`), and their workers, reviewers, judges and planners get a `budgets.idle_timeout` of 900 seconds unless the plan sets one (1–14400). A plan saved by 0.18 keeps the behavior it was approved with; add `budgets.idle_timeout` to opt in. A worker that goes silent is retried in a fresh session and its attempt is refunded, at most twice in a row.
+- **Reviewer failures are not worker failures.** A reviewer that stalls, times out, crashes, answers unreadably twice or passes without a reason is retried like any transient provider failure (`retry.transient_attempts`, after any `reviewer_fallbacks`). The worker's attempt is never charged. If the retries run out, the run blocks in `reviewing` with a `Reviewer unavailable` cause, and `--retry` resumes the review. An answer that holds several verdict objects that disagree, or one that cannot be read (cut off, a stray quote, a trailing comma) next to one that can and says something else, counts as unreadable, wherever the broken one stands, and so does an object-shaped fragment left dangling after the verdict. A format reminder such as `"PASS" or "REVISE"` describes nothing.
+- **Big repositories.** A top-level `git_timeout` (30–3600 seconds, default 90) governs git calls. `git worktree add` always gets at least 900 seconds, and a timed-out checkout ends git's whole process tree, is unlocked, removed and pruned, and is explained, so `--retry` starts clean. A runner that dies during the checkout does not take git with it: git finishes and releases its lock, and a resume that finds a checkout still locked as initializing waits for it, or clears it away when no process holds it any more. Every run applies its own `git_timeout` from its first git call, also when a restart resumes it in judging, planning or promoting.
+- **Tool droppings.** A new `debug.log`, `chrome_debug.log`, `*.dmp` file or `.playwright-mcp/` folder that the base lacks is not a candidate change. These files are deleted from the milestone worktree before the checks run, so no check passes on a file the accepted commit lacks. A milestone that names the file, or a folder holding it, in its `paths` keeps it, and so does a tracked file the milestone moved. A check that fails after a deletion says which files went and how to keep one, in the rejection and in the next worker prompt. Failure fingerprints and the no-progress check use the same filtered build. Only these names count as droppings.
+- **Claude sign-in.** A Claude login can expire while a run is unattended. Run `claude setup-token` once. Keep the result in the user environment variable `CLAUDE_CODE_OAUTH_TOKEN`, which Nightweaver also reads from the registry when a process started before it was set, or in a file named by the route's `oauth_token_file`. The route's `oauth_token_file` wins over the variable. A running dispatcher or guard prefers the registry's value over its older process copy, so a token you rotate reaches new Claude calls without a restart. A route with its own `profile_dir` uses that profile's login and never receives the ambient or registry token (its own `oauth_token_file` still applies). Only Claude routes receive the token: a `command` route gets it only with `inherit_credentials`, gates and git never do, and key-shaped tokens are masked in gate logs. `doctor` names the source in use. An expired login blocks with the `claude setup-token` remedy instead of quietly leaving review to the worker's own vendor.
+- **Claude's own config directory.** With a long-lived token, Claude workers, reviewers, judges and planners run with `CLAUDE_CONFIG_DIR` set to `<home>/profiles/claude`, so the operator's interactive `CLAUDE.md`, skills and settings do not steer an unattended run. A standalone Claude baseline once built nothing because it obeyed an interactive rule to delegate to background subagents, which print mode then killed. The directory is not used when the route sets `profile_dir`, when `CLAUDE_CONFIG_DIR` is already set, or when `NIGHTWEAVER_CLAUDE_SHARED_CONFIG=1`. Without a token, a Claude route uses the CLI's default profile, so the interactive configuration applies. A Claude session resumes only under the config directory that created it, and a session saved under another directory starts a fresh one, which includes runs begun by 0.18.
+- **Served model.** Each provider call records the model that was actually served as `served_model` on `provider_call_finished`: for Claude and DeepSeek from the model on each assistant message of the call's log, for Gemini from its init event and result stats, and for Codex (whose `--json` stream names none) from the session rollout's turn context. A route that asked for a particular model and was served another emits `model_mismatch` once per route and served model in a run, after normalizing case, vendor prefix, dated snapshots and family aliases. `insights` and the report list it as a problem and it is a default notification event. It records the difference. It does not change the route or stop the run.
+- **Independence.** When a reviewer or judge comes from the same known vendor family as the worker (Codex, Claude, DeepSeek or Gemini; a `command` route has no known vendor and never warns), the run records `independence_degraded` once for that pair and continues.
+- **Credentials.** Each model process keeps only its own vendor's credentials: Claude keeps `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_*` (plus AWS or Google credentials when `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX` is on), Codex keeps `OPENAI_*` and `CODEX_*`, Gemini keeps `GEMINI_*` and `GOOGLE_*`, DeepSeek keeps `DEEPSEEK_*`. Gates, judge-ledger gates, git, suite adapters and `command` routes (which include external contenders) get an environment without any variable whose name says it holds a credential (ending in `_TOKEN`, `_API_KEY`, `_SECRET`, `_PASSWORD`, `_CREDENTIALS`, `_ACCESS_KEY` and similar, with or without `_FILE`, plus `AWS_BEARER_TOKEN_*`) nor Claude Code's session socket, so worker-written test code cannot read them. The scrub works by name. A secret in a file or in a variable with an unremarkable name is not removed, and a check that needs a credential from the environment will not find it. A `command` route that really needs one, such as a Claude coordinator that signs in with `CLAUDE_CODE_OAUTH_TOKEN`, sets `"inherit_credentials": true`; `examples/create_comparison.py` does this for its AGTX Claude coordinator.
+
+### Phone notifications
+
+Nothing is sent until you run `nightweaver notify setup`. Notifications use [ntfy](https://docs.ntfy.sh): Nightweaver posts to a topic and the ntfy phone app subscribes to it.
+
+```powershell
+nightweaver notify setup
+nightweaver notify test
+nightweaver notify status
+nightweaver notify digest --hours 12
+nightweaver notify off
+```
+
+- **Setup.** `setup` writes the configuration to the runtime's `providers.json` with fresh random topic names (a message topic and a private reply topic), prints how to subscribe and sends nothing. The server is `https://ntfy.sh` unless you pass `--server`, and a server that is not https is flagged because messages then cross the network unencrypted. `--events` chooses events, `--quiet-hours HH:MM-HH:MM` sets the night window (default 23:00-07:00, `''` turns it off), `--max-per-night N` sets the allowance (default 3), `--no-images` never attaches screenshots and `--rotate` replaces the topics. `status` shows the configuration with the topics partly masked, `test` sends one message and `off` removes the configuration.
+- **Privacy.** An ntfy topic has no password: anyone who knows the topic name can read what is posted to it. The generated names are random, so treat them as secrets, do not paste them into chats, issues or screenshots, run `setup --rotate` if one leaks, and use your own server if you do not want a public one to see the messages. A message carries the run's title, a one-line summary and the run id. Raw error text is cut to its plain leading words, and known failures become fixed phrases, so file contents, paths, tokens and provider log text are not sent.
+- **Events.** By default: `goal_met`, `run_completed`, `pursuit_stopped`, `blocked`, `provider_unavailable`, `provider_parked`, `model_mismatch`, `budget_exhausted`, `repeated_failure_stopped`, `verification_inconsistent`, `local_advice_required`, `guard_stopped` (only when the restart limit is reached) and `dispatcher_run_failed`. These cover the stops a live runner, guard or dispatcher can report, though a failed send or a quiet-hours hold can delay a message. A runner that dies with neither a guard nor a dispatcher is not reported. `notify digest` lists it as still running for as long as its last update falls inside the digest window. Also available: `wave_completed`, `milestone_accepted`, `judge_invalid`, `plan_invalid` and `independence_degraded`. A list saved before the newer stops existed is upgraded; a customised list is kept, and `setup` names what it leaves out.
+- **Quiet hours.** During quiet hours at most `--max-per-night` messages go out, and a usage-limit wait never uses the allowance and appears only in the digest. The rest are held and sent as one message soon after quiet hours end, by whichever dispatcher or run is active then, or by `notify digest`, which sends (or with `--print` prints) a summary of the last 12 hours by default.
+- **Failures.** A failed send never raises, retries in a loop or stops a run. The run records one `notify_failed` event, and the held message waits for the next release.
+- **Decision inbox.** The notification module can send a question with up to three buttons and read the tapped answer from the private reply topic. No run asks the owner a question yet. The design-direction tournament's owner choice is not connected to it, so treat the inbox as a building block, not a feature you can use.
 
 ## Queue and recover runs on Windows
 
@@ -175,11 +395,42 @@ For static HTML, [check_static_page.py](examples/check_static_page.py) checks th
 
 Put this gate in `gates` or `final_gates`. For an app with a build step or interactions, supply a project-specific Playwright check that launches the candidate and exercises the relevant flows. Configure a reviewer that can inspect screenshots and describe the visual requirements in `acceptance`. A failed check, missing screenshot, or review requesting changes sends the issue back for repair.
 
+### Smoke gates and the web hint
+
+A OneShot for a repository with no committed tests gets a `Browser smoke` gate when the repository is a static web project (an `index.html` at the root, in `public/` or in `docs/`) or a new repository holding only a README, license or ignore files whose goal is a web page. The gate loads the page at desktop (1440x900) and phone (390x844) sizes and keeps the screenshots, so a goal can start from nothing.
+
+- **Is a new repository's goal a page?** The OneShot reads what the objective asks for. A page, site, landing page, dashboard, game or calculator is a web goal, while a command line tool, script, library or scraper never is, whatever pages it handles. This is a keyword heuristic over the objective's first sentence, so an unusual phrasing reads as not a page and the OneShot asks for `--web`. `--web` or `--no-web` overrides the heuristic, and `oneshot` says on stderr when it judged a goal to be a page. `wish` has no such flag. The brief writer's visual flag decides there.
+- **Site root.** A page in `public/` or `docs/` is served with that folder as the site root, set by the gate's `root` field, so root-absolute asset URLs resolve as they do when deployed. A file that folder does not have is served from the rest of the checkout, so `../dist/lib.js` or `/docs/style.css` still load. In your own gate, `root` is a folder in the checkout, needs a local `page` inside it and cannot be combined with `offline`.
+- **Never in place of real tests.** A repository that has tests discovery cannot run is never given a smoke gate, because a smoke check would stand in for its real tests. That covers a `go.mod` beside Go files, `Cargo.toml`, `pom.xml`, a `Gemfile` that names a test gem, `tox.ini`, a `*_test.*` or `*.spec.*` file, a `tests/` folder holding anything but documents and pictures, a `.bats`, `.robot` or `.feature` file, a Makefile `test` or `check` target, a test runner's config and similar. A script merely named like a test, such as `typing-test.js`, counts only when its text calls a test runner. Such a repository keeps the "No supported committed test suite found" failure, which shows how to add a template gate.
+- **Apps with a server.** A repository whose `package.json` has a `dev`, `start`, `preview` or `serve` script is not given a smoke gate either, because a bare file server cannot render it. The failure message points to a browser gate that owns the server.
+- **Visual wishes.** A visual `wish` on a repository that has tests gets its own baseline-probed `Visual smoke` gate. See [Start from one line](#start-from-one-line).
+
+### Edge or Chrome fallback
+
+- When the bundled Chromium is missing, a browser gate that uses the default retries with Microsoft Edge and then Chrome. The channel that ran and the reason are recorded in `browser.json` and the gate receipt's `browser_runtime`.
+- An explicit `channel` or a `PLAYWRIGHT_BROWSERS_PATH` pin still fails closed, and so does a gate with a `visual_match` step, because pixel baselines differ between browser builds. `preflight` and the browser check `goal --start` makes before planning both report it.
+- A non-bundled browser takes one throwaway screenshot before the timed cases, because Edge draws its first screenshot slowly.
+- The favicon exemption covers only the browser's own failed same-origin `/favicon.ico` fetch when no page of the case (one the journey leaves, or a popup) names that file. Another origin, another status, a script's or the page's own request and a declared icon still count as console errors.
+- `doctor` reports `browser` as `ready`, `ready_fallback` or `unavailable` from the install folders without starting a browser.
+
+### Interaction sweep
+
+Add `"sweep": {"max_controls": 8}` (1 to 16, default 8) to a browser gate, and the OneShot smoke gate carries `"sweep": {}`. After the desktop viewport (the one named `desktop`, else the first) loads cleanly, the supervisor clicks up to that many visible, enabled controls and photographs every state, so reviewers and judges see what sits behind a control instead of only the first load. Without a `sweep` key a browser gate behaves as before.
+
+- **What it clicks.** In page order: `button`, `[role=button|tab|radio|switch|checkbox]`, `input[type=button]`, radio and checkbox inputs, `summary`, `[aria-pressed]`, `[aria-expanded]`, `[onclick][tabindex]`, hash-only anchors that act as widgets, and up to 6 other options of each `select`. A radio or checkbox hidden behind a styled label is clicked through its label. After each click it waits until the page stops changing and saves a `sweep-NN-<name>.png`. It lists the page again after every click, so controls an intro overlay or a menu was hiding are swept once they appear. It clicks and selects. It does not type or drag, and it stops at the control limit or a 45-second budget.
+- **What it leaves alone.** Real links, submit buttons inside forms, disabled, hidden, covered or off-screen controls, duplicates of the same role and name, and anything with a word in its name, or in its `id`, `name`, `data-testid`, `title` or `aria-label` (split into words, so `btnDelete` counts), that starts with delete, remove, reset, clear, erase, log out, sign out, buy, pay, purchase, submit, send, subscribe, cancel, empty, discard, archive, drop, destroy, wipe, revoke, deactivate, disconnect, publish, deploy, confirm, checkout, order, donate, transfer or withdraw. The match is on any word, so it also skips a control such as `Night mode reset`.
+- **Containment.** While the sweep runs, every write (anything but GET and HEAD) and every navigation to another site is answered locally with an empty success, so nothing leaves the machine, and each row counts its `blocked_requests`. Add `"allow_writes": true` to let writes to the page's own origin through.
+- **What a click can do.** A click that navigates away (even a moment later), opens a popup, a native dialog or a modal is recorded, and the original page is reloaded before the next control. A gate with `steps` cannot replay them, so there the sweep ends with a note instead of reloading. A popup is credited to the control whose click led to it, however late it comes: it follows the page's own timers (`setTimeout`, `setInterval`, animation frames, and the code after an `await` of one) back to the click, so a popup that opens three seconds later, or on every tick of an interval, is that control's and not the next one's. A popup that follows a network round trip is credited to whichever control was clicked last. Every popup, and any it opened in turn, is closed after each control; a page that opens popups faster than they can be closed ends the sweep with a failure that says so. A click that hangs the page ends the sweep with a failure that names the control, instead of hanging the gate, and so does a browser that stops answering altogether (a page that ran out of memory can leave it so): every call the sweep makes to the browser has a deadline of its own, 10 seconds past the call's timeout, and a call that misses it is abandoned. A console error, page error or new horizontal overflow caused by a click fails the gate like a load-time one, and the failure names the control (`After clicking 'Night': ...`).
+- **Evidence.** The sweep screenshots are hashed with the other gate artifacts. `browser.json` gains a `sweep` list, and the gate receipt gains a `browser_sweep` summary and a `browser_sweep_coverage` (found, clicked, not clicked, left alone, never reached, why it stopped). The trace and the request budget cover the page load only. Reviewers and judges see the first load of each viewport first (labelled with the steps it followed, or the point of failure), then the swept states in order, each labelled with the control it shows, then one line of sweep coverage so a partial sweep never reads as a full one.
+- **Not used in the live trial.** The sweep was added after it. The tests exercise the sweep on local test pages.
+
+## Runtime data and local advice
+
 Run data, model output, and evidence live under `%LOCALAPPDATA%\Nightweaver` or the directory chosen through `--home` or `NIGHTWEAVER_HOME`. Treat them as local project data. The engine creates a result branch locally. Review its commits before merging them into your branch or pushing them to a remote.
 
 Upgrading from the original Rookline release preserves its existing runtime directory, run history, evidence, provider configuration, and result branches. New runs use `nightweaver/<run-id>`. The old `python -m rookline` command and `ROOKLINE_HOME` remain supported for existing scripts. No history or worktrees are moved automatically.
 
-For a slow local model, set `timeout` and `max_tokens` inside `advisory_ollama`. Defaults are 90 seconds and 100 tokens. Model timeouts are recorded in the activity log and independent verification continues.
+For local advice, set `think` to a value supported by the installed Ollama model and allow room for both thinking and its final answer with `max_tokens`. Defaults are thinking off, 100 output tokens and a 90-second timeout. Set `required` to `true` when every accepted milestone needs a local response. A failed required call blocks at review and can be retried with `resume --retry`.
 
 [Design rationale and current limits](docs/design-rationale.md)
 
@@ -188,4 +439,10 @@ For a slow local model, set `timeout` and `max_tokens` inside `advisory_ollama`.
 ```powershell
 python -m unittest discover -s tests -v
 dotnet build Nightweaver.Desktop -c Release
+```
+
+The suite has 837 tests. Version 0.19 added 635 in sixteen modules, counted from the test methods. `test_release_019_pursuit` has 25, `_browser` 30, `_runtime` 55, `_repair` 24, `_notify` 54, `_wish` 25, `_explore` 37, `_sweep` 60, `_rescue` 35, `_wish_visual` 25, `_isolation` 4 and the review-fix modules `_fix_pursuit` 62, `_fix_repair` 53, `_fix_browser` 45, `_fix_env` 50 and `_fix_notify` 51. They use scripted workers, judges and planners and mocked provider processes, with no paid model requests. To run only those:
+
+```powershell
+python -m unittest discover -s tests -p "test_release_019*.py"
 ```

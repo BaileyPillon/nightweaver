@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .safety import atomic_write, redact
 from .insights import provider_totals
+from .store import current_stop
 from .checks import observed_pass
 
 
@@ -70,7 +71,7 @@ def _metrics(store, run_id):
     if row["state"]["phase"] == "blocked":
         terminal = next((event for event in reversed(events) if event["kind"] in (
             "blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed",
-            "repeated_failure_stopped", "verification_inconsistent")), None)
+            "repeated_failure_stopped", "verification_inconsistent", "pursuit_stopped")), None)
         if terminal:
             stop = terminal["time"]
     seconds = None
@@ -95,6 +96,8 @@ def _metrics(store, run_id):
             outcome = "verification_inconsistent"
         elif terminal and terminal["kind"] == "provider_unavailable":
             outcome = "provider_blocked"
+        elif terminal and terminal["kind"] == "pursuit_stopped":
+            outcome = "pursuit_stopped"
         elif terminal and terminal["kind"] == "budget_exhausted":
             outcome = "budget_exhausted"
             recovered = next((event["seq"] for event in reversed(events) if event["kind"] == "interrupted_worker_recovered"), 0)
@@ -110,14 +113,39 @@ def _metrics(store, run_id):
                     rejected.get("exit"), outcome)
         else:
             outcome = "execution_blocked"
+    current = store.accepted_milestones(run_id)
+    discarded = len(store.accepted_milestones(run_id, discarded=True)) - len(current)  # a revert's milestones are neither accepted nor part of the plan
+    pursuit = None
+    if row["spec"].get("pursue"):
+        judged = row["state"].get("judgments", [])
+        stopped = current_stop(events)  # a stop that an extension, a retry or a later block has superseded is not the run's stop
+        pursuit = {"waves": row["state"].get("wave", 1), "judgments": len(judged), "last_score": judged[-1]["score"] if judged else None,
+                   "best_score": row["state"].get("best_score"), "goal_met": "goal_met" in kinds, "reverts": kinds.count("pursuit_reverted"),
+                   "stop_reason": stopped["reason"] if stopped and phase == "blocked" else None,
+                   "confirmations": kinds.count("goal_confirming"), "met_unconfirmed": kinds.count("met_unconfirmed"),
+                   "confirmations_skipped": kinds.count("confirmation_skipped"), "discarded_milestones": discarded}
+    exploration = None
+    if {"direction_planned", "exploration_skipped"} & set(kinds):
+        chosen = next((e["details"] for e in reversed(events) if e["kind"] == "direction_chosen"), None)
+        exploration = {"directions": kinds.count("direction_planned"), "built": kinds.count("direction_built"),
+                       "failed": kinds.count("direction_failed"), "comparisons": kinds.count("direction_compared"),
+                       "winner": chosen["winner"] if chosen else None, "chosen_by": chosen["chosen_by"] if chosen else None,
+                       "position_bias_pairs": len(chosen["position_bias_pairs"]) if chosen else 0,
+                       "outcome": "chosen" if chosen else "failed" if "exploration_failed" in kinds else
+                                  "skipped" if "exploration_skipped" in kinds else "in progress"}
+    from .rescue import summary as rescue_summary
+    rescue = rescue_summary(events) if {"rescue_started", "rescue_skipped"} & set(kinds) else None
     return {
         **recovery_metrics(events),
+        **({"pursuit": pursuit} if pursuit else {}),
+        **({"exploration": exploration} if exploration else {}),
+        **({"rescue": rescue} if rescue else {}),
         "provider_usage": provider_totals(events),
         "run_id": run_id, "title": row["spec"]["title"], "phase": row["state"]["phase"],
         "outcome": outcome, "block_reason": row["state"].get("last_error") if phase == "blocked" else None,
         "last_rejection_stage": rejection.get("phase"),
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
-        "accepted_milestones": len(store.accepted_milestones(run_id)), "total_milestones": len(row["spec"]["milestones"]),
+        "accepted_milestones": len(current), "total_milestones": len(row["spec"]["milestones"]) - discarded,
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
         "queue_seconds": interval(queued, start), "seconds_to_first_acceptance": interval(start, first_acceptance),
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
@@ -178,11 +206,83 @@ def _run_report(store, run_id, output, include_images):
             value = f"{value['name']} ({value['duration_ms']:,} ms)"
         elif key == "mixed_gate_results":
             value = ", ".join(f"{g['name']} at {g['tree'][:12]}" for g in value) or "None observed"
+        elif key == "pursuit":
+            value = (f"{value['waves']} waves, {value['judgments']} judgments, last {value['last_score']}, best {value['best_score']}, "
+                     f"{'goal met' if value['goal_met'] else 'stopped: ' + value['stop_reason'] if value['stop_reason'] else 'in progress'}, "
+                     f"{value['reverts']} reverts"
+                     + (f", {value['confirmations']} confirmations ({value['met_unconfirmed']} not confirmed)" if value["confirmations"] else "")
+                     + (f", {value['confirmations_skipped']} without a confirmation (budget)" if value["confirmations_skipped"] else "")
+                     + (f", {value['discarded_milestones']} milestones discarded" if value["discarded_milestones"] else ""))
+        elif key == "exploration":
+            value = (f"{value['outcome']}: {value['built']} of {value['directions']} directions passed their checks, "
+                     f"{value['comparisons']} judge comparisons"
+                     + (f", direction {value['winner']} chosen by {value['chosen_by']}" if value["winner"] else "")
+                     + (f", position bias in {value['position_bias_pairs']} pairs" if value["position_bias_pairs"] else ""))
+        elif key == "rescue":
+            value = (f"{value['attempted']} attempted, {value['won']} won, {value['failed']} failed, {value['skipped']} skipped; latest {value['outcome']}"
+                     + (f", strategy {value['winner']}" if value["winner"] else "") + f", best score before {value['score_before']}"
+                     + (f", next judgment {value['score_after']}" if value["score_after"] is not None else ""))
         elif key == "provider_usage":
             value = " · ".join(f"{r['role']} / {r['provider']} ({r['model'] or 'default'}), "
                                f"{r['measured_calls']}/{r['calls']} calls with usage" for r in value) or "No finished calls"
         body += f'<tr><th scope="row">{escape(key.replace("_", " ").capitalize())}</th><td>{escape(str(value) if value is not None else "Unavailable")}</td></tr>'
     body += '</tbody></table></div>'
+    if row["spec"].get("pursue"):
+        from .pursuit import report as pursuit_report
+        data = pursuit_report(store, run_id)
+        body += ('<h2>Goal pursuit</h2><div class="table"><table><thead><tr><th>Wave</th><th>Milestones</th><th>Judgment</th>'
+                 '<th>Top gaps</th></tr></thead><tbody>')
+        for wave in data["waves"]:
+            verdict = wave["judgment"]
+            summary = "Not judged" if verdict is None else f'{verdict["verdict"]} {verdict["score"]}/100'
+            if verdict and verdict.get("confirmation"):
+                sure = verdict["confirmation"]
+                summary += (f" · confirmed ({sure['score']}/100)" if sure["confirmed"] else f" · MET not confirmed ({sure['verdict']} {sure['score']}/100)")
+            if verdict and verdict.get("confirmation_skipped"):
+                summary += " · MET stood without a confirmation (budget)"
+            if wave["reverted"]:
+                summary += " · reverted to the best build"
+            gaps = "; ".join(g["title"] for g in verdict["gaps"][:3]) if verdict else ""
+            body += (f'<tr><td>{wave["wave"]}</td><td>{escape("; ".join(m["title"] + (" (discarded)" if m["discarded"] else "") for m in wave["milestones"]))}</td>'
+                     f'<td>{escape(summary)}</td><td>{escape(gaps)}</td></tr>')
+        body += '</tbody></table></div>'
+        if data.get("exploration"):
+            ex = data["exploration"]
+            body += (f'<h2>Design exploration</h2><p>{escape(ex["status"].replace("_", " ").capitalize())}'
+                     + (f' · winner chosen by {escape(str(ex["chosen_by"]))}' if ex["chosen_by"] else "")
+                     + f' · {ex["judge_calls"]} judge calls'
+                     + (' · position bias in pairs ' + escape(", ".join(f"{a} vs {b}" for a, b in ex["position_bias_pairs"])) if ex["position_bias_pairs"] else "")
+                     + (f' · {escape(str(ex["reason"]))}' if ex["reason"] else "")
+                     + '</p><div class="table"><table><thead><tr><th>Direction</th><th>Worker</th><th>Checks</th><th>Score</th><th>Result</th>'
+                       '</tr></thead><tbody>')
+            for row in ex["directions"]:
+                worker = row["worker"] or {}
+                checks = "Not built yet" if row["passed"] is None else "Passed" if row["passed"] else "Failed: " + str(row["reason"] or "")[:160]
+                body += (f'<tr><td>{row["index"]}. {escape(row["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
+                         f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
+                         f'<td>{"" if row["score"] is None else format(row["score"], "g")}</td><td>{"Winner" if row["winner"] else ""}</td></tr>')
+            body += '</tbody></table></div>'
+        for wave, rescue in ((w, r) for w in data["waves"] for r in w.get("rescues", [])):
+            status = {"chosen": f"strategy {rescue['winner_name']} chosen", "failed": "no strategy beat the best build", "skipped": "skipped",
+                      "in_progress": "in progress"}[rescue["status"]]
+            again = f" (rescue {rescue['n']})" if rescue["n"] > 1 else ""
+            body += (f'<h2>Plateau rescue after wave {wave["wave"]}{again}</h2><p>{escape(status[0].upper() + status[1:])} · best score before {rescue["best_score"]}/100'
+                     + (f' · next judgment {rescue["next_score"]}/100' if rescue["next_score"] is not None else "")
+                     + f' · {rescue["judge_calls"]} judge calls'
+                     + (' · position bias in pairs ' + escape(", ".join(f"{'best build' if a == 0 else a} vs {b}" for a, b in rescue["position_bias_pairs"]))
+                        if rescue["position_bias_pairs"] else "")
+                     + (f' · {escape(str(rescue["reason"]))}' if rescue["reason"] and rescue["status"] == "skipped" else "") + '</p>'
+                     + (f'<p>{escape(rescue["diagnosis"])}</p>' if rescue["diagnosis"] else "")
+                     + '<div class="table"><table><thead><tr><th>Strategy</th><th>Worker</th><th>Checks</th><th>Score</th><th>Result</th></tr></thead><tbody>')
+            for item in rescue["strategies"]:
+                worker = item["worker"] or {}
+                checks = "Not built yet" if item["passed"] is None else "Passed" if item["passed"] else "Failed: " + str(item["reason"] or "")[:160]
+                read = item["readable"]
+                result = "Winner" if item["winner"] else f"Judge read {read} of 2 orders" if read is not None and read < 2 else ""
+                body += (f'<tr><td>{item["index"]}. {escape(item["name"])}</td><td>{escape(str(worker.get("kind", "")))}'
+                         f'{" / " + escape(str(worker["model"])) if worker.get("model") else ""}</td><td>{escape(checks)}</td>'
+                         f'<td>{"" if item["score"] is None else format(item["score"], "g")}</td><td>{result}</td></tr>')
+            body += '</tbody></table></div>'
     from .junit import history
     observations = history(store, run_id)["observations"]
     if observations:
@@ -230,7 +330,7 @@ def _run_report(store, run_id, output, include_images):
         unavailable = Counter()
         evidence_root = (store.directory(run_id) / "evidence").resolve()
         for event in events:
-            if event["kind"] != "gate_finished":
+            if event["kind"] not in ("gate_finished", "judge_gate_finished"):
                 continue
             for artifact in event["details"].get("artifacts", []):
                 if not isinstance(artifact, dict) or not str(artifact.get("path", "")).lower().endswith(".png"):

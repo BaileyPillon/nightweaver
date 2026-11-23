@@ -8,7 +8,11 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -16,10 +20,39 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+      - run: python -m pip install -e ".[browser]"
+      - run: python -m playwright install chromium
+      - name: Run test shard ${{ matrix.shard }} of 4
+        shell: pwsh
+        run: |
+          $modules = Get-ChildItem tests -Filter 'test_*.py' | Sort-Object Name | ForEach-Object Name
+          $failed = @()
+          for ($i = 0; $i -lt $modules.Count; $i++) {
+            if ($i % 4 -ne ${{ matrix.shard }}) { continue }
+            $module = $modules[$i]
+            # Each module is its own process with its own 20 minutes. A module that stops answering is killed with everything it started
+            # (its browser included) and recorded as failed, instead of holding the shard until the job's 60 minutes cancel it. After 19
+            # minutes the runner writes every thread's stack to the log, so the hang names the call it is stuck in.
+            $process = Start-Process python -ArgumentList @('tests/_module_runner.py', $module, '1140') -NoNewWindow -PassThru
+            $null = $process.Handle  # Without this the exit code is empty after a WaitForExit with a timeout.
+            if (-not $process.WaitForExit(1200000)) {
+              taskkill /F /T /PID $process.Id | Out-Null
+              "::error title=Timed out::$module did not finish within 20 minutes and was killed"
+              $failed += "$module (timed out)"
+            } elseif ($process.ExitCode) {
+              $failed += $module
+            }
+          }
+          if ($failed) { "Failed modules: $($failed -join ', ')"; exit 1 }
+
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.x'
-      - run: python -m pip install -e ".[browser]"
-      - run: python -m playwright install chromium
-      - run: python -m unittest discover -s tests -v
       - run: dotnet build Nightweaver.Desktop -c Release

@@ -8,6 +8,7 @@ import re
 
 IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
 REVIEWERS = IMPLEMENTERS
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def strict_json(data, *, parse_float=None):
@@ -46,6 +47,20 @@ def scoped_milestones(raw):
 
 def anchor_provider_paths(raw, folder):
     """A generated plan might be opened outside the template's directory."""
+    pursue = raw.get("pursue")
+    if isinstance(pursue, dict):
+        if isinstance(pursue.get("references"), list):
+            pursue["references"] = [str((folder / Path(item).expanduser()).resolve()) if isinstance(item, str) and item.strip() else item
+                                    for item in pursue["references"]]
+        explore, rescue = pursue.get("explore"), pursue.get("rescue")
+        routes = [pursue.get("judge"), pursue.get("planner"), pursue.get("confirm_judge"), *array(pursue.get("judge_fallbacks", []), "judge_fallbacks", 5),
+                  *(array(explore.get("workers", []), "explore workers", 4) if isinstance(explore, dict) else []),
+                  *(array(rescue.get("workers", []), "rescue workers", 4) if isinstance(rescue, dict) else [])]
+        for route in routes:
+            if isinstance(route, dict):
+                for key in ("profile_dir", "api_key_file", "oauth_token_file"):
+                    if key in route:
+                        route[key] = str((folder / Path(text(route, key)).expanduser()).resolve())
     for section in [raw, *array(raw.get("milestones", []), "milestones", 50)]:
         if not isinstance(section, dict):
             raise ValueError("A milestone must be an object")
@@ -54,7 +69,7 @@ def anchor_provider_paths(raw, folder):
             routes.extend(array(section.get(key, []), key, 5))
         for route in routes:
             if isinstance(route, dict):
-                for key in ("profile_dir", "api_key_file"):
+                for key in ("profile_dir", "api_key_file", "oauth_token_file"):
                     if key in route:
                         route[key] = str((folder / Path(text(route,key)).expanduser()).resolve())
 
@@ -94,30 +109,48 @@ def text(obj, key):
 
 
 def provider(value, choices, label, relative_to=None):
-    fields(value, "kind argv executable model api_key api_key_file profile_dir unavailable_exit_code", label)
+    fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code inherit_credentials", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
         raise ValueError(f"Invalid {label} adapter")
     out = {"kind": value["kind"]}
     if value["kind"] == "command":
-        if set(value) - {"kind", "argv", "unavailable_exit_code"}:
+        if set(value) - {"kind", "argv", "unavailable_exit_code", "inherit_credentials"}:
             raise ValueError("Unsupported command provider field")
         out["argv"] = command(value.get("argv"), label)
+        if "inherit_credentials" in value:
+            if type(value["inherit_credentials"]) is not bool:
+                raise ValueError("inherit_credentials must be true or false")
+            if value["inherit_credentials"]:
+                out["inherit_credentials"] = True
         if "unavailable_exit_code" in value:
             out["unavailable_exit_code"] = integer(value["unavailable_exit_code"], "unavailable_exit_code", 1, 123)
     elif "unavailable_exit_code" in value:
         raise ValueError("Only command providers support unavailable_exit_code")
+    elif "inherit_credentials" in value:
+        raise ValueError("Only command providers support inherit_credentials")
     elif "argv" in value:
         raise ValueError("Only command providers accept argv")
     elif value.get("executable"):
         out["executable"] = text(value, "executable")
     if value.get("model"):
         out["model"] = text(value, "model")
+    if "effort" in value:
+        levels = {"claude": ("low", "medium", "high", "xhigh", "max"),
+                  "codex": ("low", "medium", "high", "xhigh", "max", "ultra"),
+                  "deepseek": ("low", "high", "max")}
+        if value["effort"] not in levels.get(value["kind"], ()):
+            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}")
+        out["effort"] = value["effort"]
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
     if value.get("api_key_file"):
         if value["kind"] != "deepseek":
             raise ValueError("api_key_file is supported by the DeepSeek adapter")
         out["api_key_file"] = str(((relative_to or Path.cwd()) / Path(text(value, "api_key_file")).expanduser()).resolve())
+    if value.get("oauth_token_file"):
+        if value["kind"] != "claude":
+            raise ValueError("oauth_token_file is supported by the Claude adapter")
+        out["oauth_token_file"] = str(((relative_to or Path.cwd()) / Path(text(value, "oauth_token_file")).expanduser()).resolve())
     if value.get("profile_dir"):
         profile = ((relative_to or Path.cwd()) / Path(text(value, "profile_dir")).expanduser()).resolve()
         if value["kind"] == "command":
@@ -193,6 +226,82 @@ def gate_spec(item):
     return result
 
 
+def exploration(raw, relative_to):
+    """The design-direction tournament that runs before milestone 1. Workers default to milestone 1's worker (filled in by validate)."""
+    fields(raw, "directions workers brief comparisons", "pursue.explore")
+    out = {"directions": integer(raw.get("directions", 3), "directions", 2, 4)}
+    if "workers" in raw:
+        workers = array(raw["workers"], "explore workers", 4)
+        if not workers:
+            raise ValueError("explore workers must list at least one worker")
+        out["workers"] = [provider(item, IMPLEMENTERS, "explore worker", relative_to) for item in workers]
+    if "brief" in raw:
+        if not isinstance(raw["brief"], str) or not raw["brief"].strip() or len(raw["brief"]) > 4000:
+            raise ValueError("explore brief must be 1 to 4000 characters of guidance on how the directions should differ")
+        out["brief"] = raw["brief"].strip()
+    if raw.get("comparisons", "pairwise") not in ("pairwise", "single"):
+        raise ValueError("explore comparisons must be pairwise or single")
+    out["comparisons"] = raw.get("comparisons", "pairwise")
+    return out
+
+
+def rescuing(raw, relative_to):
+    """The plateau rescue that runs when progress stalls: a diagnosis, N strategies forked from the best build and a tournament.
+
+    Workers default to the last milestone's worker, chosen when a rescue starts. max_rescues 0 turns the rescue off."""
+    fields(raw, "strategies max_rescues workers", "pursue.rescue")
+    out = {"strategies": integer(raw.get("strategies", 3), "strategies", 2, 4), "max_rescues": integer(raw.get("max_rescues", 1), "max_rescues", 0, 3)}
+    if "workers" in raw:
+        workers = array(raw["workers"], "rescue workers", 4)
+        if not workers:
+            raise ValueError("rescue workers must list at least one worker")
+        out["workers"] = [provider(item, IMPLEMENTERS, "rescue worker", relative_to) for item in workers]
+    return out
+
+
+MAX_CRITERIA = 60  # what a judgment can list; more would never fit one answer
+
+
+def pursuit(raw, relative_to, acceptance):
+    fields(raw, "judge judge_fallbacks planner max_waves wave_size target_score plateau regression_margin references criteria explore rescue "
+           "confirm confirm_judge confirm_margin", "pursue")
+    if "judge" not in raw:
+        raise ValueError("pursue requires a judge")
+    judge = provider(raw["judge"], REVIEWERS, "judge", relative_to)
+    references = []
+    for item in array(raw.get("references", []), "references", 6):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("references must be paths of image files")
+        path = (relative_to or Path.cwd()) / Path(item.strip()).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(f"Reference image not found: {item}") from error
+        if not path.is_file() or path.suffix.casefold() not in IMAGE_SUFFIXES:
+            raise ValueError(f"Reference images must be .png, .jpg, .jpeg or .webp files: {item}")
+        if str(path) not in references:
+            references.append(str(path))
+    criteria = raw.get("criteria", acceptance)
+    if not isinstance(criteria, list) or any(not isinstance(item, str) or not item.strip() for item in criteria):
+        raise ValueError("pursue criteria must be a list of nonempty strings")
+    if len(criteria) > MAX_CRITERIA:
+        raise ValueError(f"pursue criteria (or acceptance, which they default to) must list at most {MAX_CRITERIA} requirements")
+    if type(raw.get("confirm", True)) is not bool:
+        raise ValueError("confirm must be true or false")
+    return {"judge": judge, **({"explore": exploration(raw["explore"], relative_to)} if "explore" in raw else {}),
+            "rescue": rescuing(raw.get("rescue", {}), relative_to),
+            "confirm": raw.get("confirm", True), "confirm_margin": integer(raw.get("confirm_margin", 3), "confirm_margin", 0, 20),
+            **({"confirm_judge": provider(raw["confirm_judge"], REVIEWERS, "confirm judge", relative_to)} if "confirm_judge" in raw else {}),
+            "judge_fallbacks": [provider(p, REVIEWERS, "judge fallback", relative_to) for p in array(raw.get("judge_fallbacks", []), "judge_fallbacks", 5)],
+            "planner": provider(raw["planner"], IMPLEMENTERS, "pursuit planner", relative_to) if "planner" in raw else dict(judge),
+            "max_waves": integer(raw.get("max_waves", 3), "max_waves", 1, 20),
+            "wave_size": integer(raw.get("wave_size", 3), "wave_size", 1, 5),
+            "target_score": integer(raw.get("target_score", 85), "target_score", 0, 100),
+            "plateau": integer(raw.get("plateau", 2), "plateau", 1, 5),
+            "regression_margin": integer(raw.get("regression_margin", 5), "regression_margin", 0, 50),
+            "references": references, "criteria": [item.strip() for item in criteria]}
+
+
 def resolve_repository(raw, relative_to=None, store=None):
     if not isinstance(raw, dict):
         raise ValueError("A plan must be a JSON object")
@@ -216,7 +325,7 @@ def resolve_repository(raw, relative_to=None, store=None):
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
-           "reviewer_fallbacks context_files repository_map source_issue repair", "plan")
+           "reviewer_fallbacks context_files repository_map source_issue repair pursue git_timeout", "plan")
     if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
         raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
@@ -285,12 +394,15 @@ def validate(raw, relative_to=None, store=None):
     bounds = {"max_calls": (1, 10000), "max_seconds": (1, 604800), "max_observed_tokens": (1, 1000000000),
               "idle_timeout": (1, 14400), "max_log_bytes": (1024, 256 * 1024 * 1024)}
     out["budgets"] = {key: integer(value, key, *bounds[key]) for key, value in budgets.items()}
+    out["idle_default"] = True  # written by 0.19 only: the engine applies its idle watchdog to plans that carry this, never to saved older ones
+    if "git_timeout" in raw:
+        out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
     retry = raw.get("retry", {})
-    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit", "retry")
-    defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3}
-    out["retry"] = {key: integer(retry.get(key, value), key, 1 if key in ("initial_seconds", "max_seconds") else 0,
-                                  3600 if key in ("initial_seconds", "max_seconds") else 20)
-                    for key, value in defaults.items()}
+    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds", "retry")
+    defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3,
+                "max_parks": 8, "max_park_seconds": 21600}
+    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800)}
+    out["retry"] = {key: integer(retry.get(key, value), key, *limits.get(key, (0, 20))) for key, value in defaults.items()}
     if "repair" in raw:
         from .repair import policy
         out["repair"] = policy(raw["repair"])
@@ -314,8 +426,12 @@ def validate(raw, relative_to=None, store=None):
         out["expected_base"] = base
     if "reviewer" in raw:
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
+    if "pursue" in raw:
+        out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
+        if "explore" in out["pursue"]:
+            out["pursue"]["explore"].setdefault("workers", [dict(steps[0]["worker"])])
     if "advisory_ollama" in raw:
-        fields(raw["advisory_ollama"], "model port timeout max_tokens", "advisory_ollama")
+        fields(raw["advisory_ollama"], "model port timeout max_tokens think required", "advisory_ollama")
         model = text(raw["advisory_ollama"], "model")
         if not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model):
             raise ValueError("Invalid Ollama model name")
@@ -326,9 +442,19 @@ def validate(raw, relative_to=None, store=None):
         max_tokens = raw["advisory_ollama"].get("max_tokens", 100)
         if type(local_timeout) is not int or not 1 <= local_timeout <= 600:
             raise ValueError("Ollama timeout must be between 1 and 600 seconds")
-        if type(max_tokens) is not int or not 1 <= max_tokens <= 1024:
-            raise ValueError("Ollama max_tokens must be between 1 and 1024")
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 16384:
+            raise ValueError("Ollama max_tokens must be between 1 and 16384")
         out["advisory_ollama"] = {"model": model, "port": port, "timeout": local_timeout, "max_tokens": max_tokens}
+        if "required" in raw["advisory_ollama"]:
+            required = raw["advisory_ollama"]["required"]
+            if type(required) is not bool:
+                raise ValueError("Ollama required must be true or false")
+            out["advisory_ollama"]["required"] = required
+        if "think" in raw["advisory_ollama"]:
+            think = raw["advisory_ollama"]["think"]
+            if type(think) is not bool and think not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError("Invalid Ollama thinking setting")
+            out["advisory_ollama"]["think"] = think
     return out
 
 
