@@ -9,12 +9,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tempfile
+from time import monotonic
 from urllib.request import Request, urlopen
 
 from .process import CONTROLLER_EXITS, execute
 from .store import default_home
-from .safety import json_events, own_credentials, redact, scrub_env
+from .safety import atomic_write, json_events, own_credentials, redact, scrub_env
 
 
 READ_ONLY = ("reviewer", "judge", "replanner", "brief", "directions", "comparison", "ranking", "diagnosis")
@@ -112,7 +114,7 @@ def reset_after(message, now=None):
     if epochs:
         value = int(epochs[-1])
         return datetime.fromtimestamp(value / 1000 if value > 10 ** 11 else value, timezone.utc)
-    seconds = re.search(r"(?:retry[_-]?after(?:_seconds)?|reset[s_]?_?in(?:_seconds)?|reset_?after(?:_seconds)?)\W{0,4}(\d+(?:\.\d+)?)(?![\d:])", message, re.I)
+    seconds = re.search(r"(?:retry[_-]?after(?:_seconds)?|retry_?delay|reset[s_]?_?in(?:_seconds)?|reset_?after(?:_seconds)?)\W{0,4}(\d+(?:\.\d+)?)(?![\d:])", message, re.I)
     if seconds:
         return now + timedelta(seconds=float(seconds.group(1)))
     for found in re.finditer(CUE + ISO, message, re.I):
@@ -249,7 +251,15 @@ def provider_executable(config):
     kind = config["kind"]
     if kind == "command":
         return config["argv"][0]
+    if kind == "antigravity":
+        return config.get("executable") or antigravity_executable()
     return config.get("executable", "claude" if kind == "deepseek" else kind)
+
+
+def antigravity_executable():
+    """The Antigravity CLI where its installer puts it (%LOCALAPPDATA%/agy/bin, which is not added to PATH), else whatever agy is on PATH."""
+    installed = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "agy" / "bin" / "agy.exe"
+    return str(installed) if installed.is_file() else "agy"
 
 
 def find_executable(config, cwd):
@@ -262,6 +272,8 @@ def find_executable(config, cwd):
 
 def profile_override(config):
     kind = config["kind"]
+    if kind == "antigravity":
+        return None  # agy keeps its sign-in in the operating system's credential store, not in a directory a route can choose
     variable = {"codex": "CODEX_HOME", "gemini": "GEMINI_CLI_HOME"}.get(kind, "CLAUDE_CONFIG_DIR")
     inherited = None if kind == "deepseek" else os.environ.get(variable)
     return config.get("profile_dir") or inherited
@@ -279,7 +291,8 @@ def describe_provider(config):
             profile = None
     if not profile:
         profile = (default_home() / "profiles" / "deepseek" if kind == "deepseek" else
-                   Path.home() if kind == "gemini" else Path.home() / f".{kind}")
+                   Path.home() if kind == "gemini" else Path.home() / ".gemini" / "antigravity-cli" if kind == "antigravity"
+                   else Path.home() / f".{kind}")
     return {"provider": kind, "executable": provider_executable(config),
             "profile_dir": str(Path(profile).expanduser().resolve()),
             **({"effort": config["effort"]} if "effort" in config else {}),
@@ -301,7 +314,96 @@ def check_provider(config, cwd):
         deepseek_key(config)
     if config["kind"] == "claude":
         claude_auth(config)
+    if config["kind"] == "antigravity":
+        antigravity_login(executable)
     return executable
+
+
+NPM_PACKAGE = "node_modules/@google/gemini-cli"
+GEMINI_ENTRIES = ("bundle/gemini.js", "dist/index.js")  # 0.70 ships the first; older packages the second
+
+
+def gemini_entrypoint(launcher):
+    """The JavaScript file behind npm's gemini.cmd, so it can start under node without a shell: the package's own bin entry,
+    then bundle/gemini.js and dist/index.js. None when the package is not installed beside the launcher."""
+    package = Path(launcher).parent / NPM_PACKAGE
+    try:
+        declared = json.loads((package / "package.json").read_text(encoding="utf-8-sig")).get("bin")
+    except (OSError, ValueError, AttributeError):
+        declared = None
+    names = [declared] if isinstance(declared, str) else [declared.get("gemini")] if isinstance(declared, dict) else []
+    for name in [*names, *GEMINI_ENTRIES]:
+        entry = package / name if isinstance(name, str) and name else None
+        if entry and entry.is_file() and entry.resolve().is_relative_to(package.resolve()):
+            return entry
+    return None
+
+
+def gemini_auth(config):
+    """How a Gemini CLI route signs in, from the environment and the profile alone: an API key, Google Cloud or saved login. Never a secret."""
+    env = scrub_env(os.environ, own_credentials("gemini", os.environ))
+    given = {name.upper(): str(value).strip() for name, value in env.items()}
+    if given.get("GEMINI_API_KEY") or given.get("GOOGLE_API_KEY"):
+        return "api_key"
+    if any(given.get(name, "").lower() in ("1", "true", "yes") for name in ("GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA")):
+        return "google_cloud"
+    home = Path(profile_override(config) or Path.home()).expanduser()
+    return "oauth_login" if (home / ".gemini" / "oauth_creds.json").is_file() else "none_found"
+
+
+SIGNED_OUT = re.compile(r"sign in|signed in|log in|login required|authentication required|not authenticated", re.I)
+AGY_SIGNED_IN = {}  # agy path -> when `agy models` last succeeded
+
+
+def agy_run(executable, env, *args, timeout=30):
+    """(exit code, output) of one short agy command, or (None, "") when it could not run in time."""
+    try:
+        done = subprocess.run([executable, *args], capture_output=True, stdin=subprocess.DEVNULL, env=env, timeout=timeout, text=True,
+                              encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return done.returncode, done.stdout + done.stderr
+
+
+def antigravity_source(env):
+    """How an agy route signs in, judged from its environment: an API key, Application Default Credentials or the CLI's own login."""
+    given = {name.upper(): str(value).strip() for name, value in env.items()}
+    if given.get("GEMINI_API_KEY") or given.get("GOOGLE_API_KEY"):
+        return "api_key"
+    return "adc" if given.get("AGY_ADC_AUTH", "").lower() in ("1", "true", "yes", "on") else "cli_login"
+
+
+def antigravity_login(executable):
+    """Stop a call that would sign in on its own. Signed out, agy prints an OAuth link and waits a minute for a code that a
+    headless run can never give, so `agy models` (exit 1, "Please sign in") is asked first. An API key or ADC route is not checked:
+    which of those agy actually uses depends on its settings.json, so it is left to the call and its error text."""
+    env = scrub_env(os.environ, own_credentials("antigravity", os.environ))
+    if antigravity_source(env) != "cli_login" or monotonic() - AGY_SIGNED_IN.get(executable, -1e9) < 300:
+        return
+    code, output = agy_run(executable, env, "models")
+    if code == 0:
+        AGY_SIGNED_IN[executable] = monotonic()
+    elif code is not None and SIGNED_OUT.search(output):
+        raise ProviderUnavailable("The Antigravity CLI is not signed in. Run agy once and sign in with the Google account that has the "
+                                  "model (Gemini 4 Neon needs Google AI Pro or Ultra), or use an API key: set GEMINI_API_KEY and "
+                                  "\"modelProvider\": \"gemini\" in ~/.gemini/antigravity-cli/settings.json. Then resume this run "
+                                  "with --retry.", "authentication")
+
+
+def antigravity_report(config, cwd):
+    """What doctor shows for an agy route besides its executable: version, how it signs in, whether it is signed in (None when agy
+    could not say) and, when signed in and the route names a model, whether `agy models` lists it. Never a secret."""
+    executable = find_executable(config, cwd)
+    if not executable:
+        return {}
+    env = scrub_env(os.environ, own_credentials("antigravity", os.environ))
+    _, version = agy_run(executable, env, "--version", timeout=15)
+    code, listing = agy_run(executable, env, "models")
+    report = {"auth": antigravity_source(env), "version": (version.strip().splitlines() or [None])[0],
+              "signed_in": True if code == 0 else False if code is not None and SIGNED_OUT.search(listing) else None}
+    if report["signed_in"] and config.get("model"):
+        report["model_listed"] = config["model"].strip().lower() in listing.lower()
+    return report
 
 
 def deepseek_key(config):
@@ -353,6 +455,24 @@ def renewal(config):
             "oauth_token_file at a file holding it).")
 
 
+def schema_file(mode):
+    """The JSON schema of a structured mode as a file in Nightweaver's own home, which agy's --json-schema reads by path. The content
+    is fixed per mode, so concurrent calls write the same bytes and a stale copy is rewritten."""
+    target = default_home() / "provider-temp" / f"agy-schema-{mode}.json"
+    body = json.dumps(SCHEMAS[mode], indent=2) + "\n"
+    try:
+        current = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        current = None
+    if current != body:
+        try:
+            atomic_write(target, body)
+        except OSError:
+            if current is None:  # another call holds the file open on Windows; a readable copy is good enough
+                raise
+    return target
+
+
 def adapter(config, mode, session=None, images=()):
     kind = config["kind"]
     if kind == "command":
@@ -386,12 +506,33 @@ def adapter(config, mode, session=None, images=()):
     if config.get("profile_dir"):
         env[{"codex": "CODEX_HOME", "gemini": "GEMINI_CLI_HOME"}.get(kind, "CLAUDE_CONFIG_DIR")] = config["profile_dir"]
     if kind == "gemini":
+        # A Nightweaver worktree is never in the CLI's trusted-folders list, and a headless run in an untrusted folder exits at
+        # startup. The variable is honoured by 0.70 and ignored by older versions; --skip-trust would fail on those.
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
         argv = [exe, "--output-format", "stream-json", "--approval-mode", "auto_edit" if mode == "worker" else "plan",
                 "--prompt", "Follow the task supplied on standard input."]
         if model:
             argv += ["--model", model]
         if session:
             argv += ["--resume", session]
+        return argv, env
+    if kind == "antigravity":
+        # The task goes in on stdin as one stream-json user message. --print takes its prompt as a flag value and then ignores stdin
+        # (and --input-format stream-json rejects a flag prompt), so a task of any length can only travel this way.
+        # Writes are confined to the worktree by Nightweaver; accept-edits lets the worker edit files, and commands that need a
+        # review are soft-denied in a headless run, while every other mode is read-only plan mode.
+        argv = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
+                "--mode", "accept-edits" if mode == "worker" else "plan"]
+        if config.get("effort"):
+            argv += ["--effort", config["effort"]]
+        if model:
+            argv += ["--model", model]
+        if mode in SCHEMAS:
+            argv += ["--json-schema", str(schema_file(mode))]
+        if session:
+            argv += ["--conversation", session]
+        if os.environ.get("NIGHTWEAVER_ANTIGRAVITY_SANDBOX") == "1":
+            argv.append("--sandbox")  # opt-in: on Windows the CLI's sandbox needs Windows 11 24H2 or later
         return argv, env
     if kind == "codex":
         sandbox = "workspace-write" if mode == "worker" else "read-only"
@@ -435,6 +576,41 @@ def adapter(config, mode, session=None, images=()):
     return argv, env
 
 
+def agy_stream(path, mode=None):
+    """What an Antigravity `--output-format stream-json` log says: conversation id, final answer, usage, model and how the call ended.
+
+    PENDING LIVE VERIFICATION. Written from agy's docs, changelog and help text; no signed-in run has been seen yet, so every field
+    is read defensively and a missing one is simply absent. Events are {"event": "init" | "step_update" | "result", "<event>": {...}},
+    with the same fields accepted beside "event". The answer is the result's structured_output (a schema mode) or response, else
+    the text deltas of the last agent_response step. A result whose status is not SUCCESS, or that names a finished_reason such as
+    print_timeout, is a failed call. Returns {session, answer, usage, model, failed, status}."""
+    found = {"session": None, "answer": "", "usage": None, "model": None, "failed": False, "status": None}
+    step, streamed = None, ""
+    for event in json_events(path):
+        label = event.get("event")
+        body = event.get(label) if isinstance(event.get(label), dict) else event
+        for holder in (event, body):  # a step may belong to a subagent's conversation, so only init and result name this one
+            if isinstance(holder.get("conversation_id"), str) and holder["conversation_id"].strip() and (
+                    label in ("init", "result") or not found["session"]):
+                found["session"] = holder["conversation_id"].strip()
+        if label == "init" and isinstance(body.get("model"), str) and body["model"].strip():
+            found["model"] = body["model"].strip()
+        elif label == "step_update" and body.get("step_type") == "agent_response" and isinstance(body.get("text_delta"), str):
+            if body.get("step_index") != step:
+                step, streamed = body.get("step_index"), ""
+            streamed = (streamed + body["text_delta"])[-100000:]
+        elif label == "result":
+            status = str(body.get("status") or "").upper()
+            structured = body.get("structured_output")
+            reply = (json.dumps(structured) if mode in SCHEMAS and isinstance(structured, dict) else
+                     structured if mode in SCHEMAS and isinstance(structured, str) and structured.strip() else body.get("response"))
+            found.update(status=status or None, usage=body.get("usage") if isinstance(body.get("usage"), dict) else found["usage"],
+                         failed=bool((status and status != "SUCCESS") or body.get("finished_reason")),
+                         answer=reply if isinstance(reply, str) and reply.strip() else streamed)
+    found["answer"] = found["answer"] or streamed
+    return found
+
+
 def metadata(path, kind, mode=None):
     """(session id, last answer) of one provider call's log. A Claude id carries its config directory as id@tag; see resumable()."""
     session, last = None, ""
@@ -444,6 +620,9 @@ def metadata(path, kind, mode=None):
         with path.open("rb") as stream:
             stream.seek(max(0, path.stat().st_size - 10000))
             return None, stream.read().decode("utf-8", "replace")
+    if kind == "antigravity":
+        found = agy_stream(path, mode)
+        return found["session"], found["answer"][-100000:]
     for event in json_events(path):
         if kind == "gemini":
             if event.get("type") == "init":
@@ -488,10 +667,13 @@ def usage(path, kind):
             stats = event.get("stats", {})
             if isinstance(stats, dict):
                 values = stats
+        elif kind == "antigravity" and event.get("event") == "result":
+            body = event["result"] if isinstance(event.get("result"), dict) else event
+            values = body.get("usage")
         if not isinstance(values, dict):
             continue
         names = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
-                 "cached_input_tokens", "cached", "input", "output")
+                 "cached_input_tokens", "cached", "input", "output", "thinking_tokens", "cache_read_tokens")
         reported = {k: values[k] for k in names if type(values.get(k)) is int}
         if any(n < 0 for n in reported.values()):
             continue
@@ -508,6 +690,8 @@ def usage(path, kind):
                 continue
             count = sum(available)
         if count >= 0:
+            if kind == "antigravity":
+                total, channels = 0, {}  # a later result's usage is cumulative, so it replaces the earlier one
             total += count
             seen = True
             for key, value in reported.items():
@@ -540,11 +724,19 @@ def gemini_alias(name):
     return re.sub(r"-(?:preview|exp|experimental|latest|\d{3})(?:-.*)?$", "", found.group(1)) if found else None
 
 
+def effortless(name):
+    """A Gemini 4 id without the reasoning-level suffix agy appends: gemini-4-neon-xhigh is gemini-4-neon at xhigh."""
+    return re.sub(r"^(gemini-4-[a-z]+)-(?:low|medium|high|xhigh|max)$", r"\1", name)
+
+
 def same_model(requested, served):
     """Whether a reported model id is the one a route asked for. A bare family alias such as sonnet matches claude-sonnet-5-5,
-    and a Gemini alias such as pro matches gemini-2.5-pro. auto and auto-gemini-* routes name no model to check."""
+    and a Gemini alias such as pro matches gemini-2.5-pro. auto and auto-gemini-* routes name no model to check. A Gemini 4 id
+    matches its slug with a level (gemini-4-neon, gemini-4-neon-xhigh) unless both name a level and the levels differ."""
     asked, got = canonical_model(requested), canonical_model(served)
     if asked == got or asked in UNVERIFIABLE or asked.startswith("auto-") or (asked in FAMILIES and asked in got.split("-")):
+        return True
+    if effortless(asked) == effortless(got) and (asked == effortless(asked) or got == effortless(got)):
         return True
     return asked in GEMINI_ALIASES and gemini_alias(got) == asked
 
@@ -614,6 +806,7 @@ def served_models(config, log):
     Returns {"models": [...], "source": "response" | "init" | "stream" | "codex_rollout" | None}."""
     kind = config.get("kind")
     replies, announced, thread, main = {}, {}, None, None
+    served_here = agy_stream(log)["model"] if kind == "antigravity" else None  # agy names the model in its init event, when asked with --model
 
     def note(into, name):
         if isinstance(name, str) and name.strip() and name.strip() != SYNTHETIC:
@@ -642,6 +835,7 @@ def served_models(config, log):
     if main:
         announced = {}
         note(announced, main)
+    note(announced, served_here)
     if replies:
         return {"models": sorted(replies, key=lambda name: -replies[name]), "source": "response"}
     if announced:
@@ -666,6 +860,12 @@ def texts(value):
 
 def failure_parts(event):
     """The words in one stream event that a provider uses to report how a call ended or failed, or nothing for ordinary events."""
+    if event.get("event") == "result" and "type" not in event:  # Antigravity: a result that is not SUCCESS (see agy_stream) carries the error
+        body = event["result"] if isinstance(event.get("result"), dict) else event
+        if str(body.get("status") or "SUCCESS").upper() == "SUCCESS" and not body.get("finished_reason"):
+            return []
+        error = body.get("error")
+        return [*texts(error), *([json.dumps(error)] if isinstance(error, dict) else []), *texts(body.get("finished_reason"))]
     label = event.get("type")
     if label == "result":  # the call's verdict; only a result that says it failed is the provider's error, otherwise it is the worker's answer
         failed = event.get("is_error") is True or event.get("status") == "error"
@@ -703,16 +903,71 @@ def provider_errors(log, limit=12000):
     return "\n".join(found)[-limit:]
 
 
+GOOGLE_KINDS = ("gemini", "antigravity")
+GOOGLE_AUTH = re.compile(r"please set an auth method|specify one of the following environment variables|authentication required|"
+                         r"not signed in|please sign in|sign in once with|api key (?:not valid|expired|invalid)|API_KEY_INVALID|"
+                         r"invalid api key|UNAUTHENTICATED|modelProvider is set to", re.I)
+GOOGLE_TRUST = re.compile(r"not running in a trusted directory|untrusted (?:workspace|folder|directory)|FatalUntrustedWorkspaceError", re.I)
+GOOGLE_LIMIT = re.compile(r"exhausted your (?:daily )?(?:quota|capacity)|RESOURCE_EXHAUSTED|quota will reset after|\"code\"\s*:\s*429|"
+                          r"exceeded your (?:current )?quota|daily quota|spend cap|prepaid credits|rate limit exceeded", re.I)
+GOOGLE_BUSY = re.compile(r"model is overloaded|high demand|\"status\"\s*:\s*\"UNAVAILABLE\"|\"code\"\s*:\s*50[234]", re.I)
+GOOGLE_MODEL = re.compile(r"requested entity was not found|\"code\"\s*:\s*404|is not found for API version|failed to resolve model|"
+                          r"unknown model|model not found|\"status\"\s*:\s*\"NOT_FOUND\"", re.I)
+LIMIT_WORDS = r"usage limit|hit your limit|rate.?limit|quota exceeded|too many requests|\b429\b"
+GOOGLE_LIMIT_WORDS = LIMIT_WORDS + r"|exhausted your [a-z ]{0,20}(?:quota|capacity)|RESOURCE_EXHAUSTED|quota will reset after"
+
+
+def usage_limit(kind, detail):
+    now = datetime.now(timezone.utc)
+    quote = re.search(r"[^\n\"{}]{0,120}(?:" + (GOOGLE_LIMIT_WORDS if kind in GOOGLE_KINDS else LIMIT_WORDS) + r")[^\n\"{}]{0,200}", detail, re.I)
+    note = f" Provider said: {redact(' '.join(quote.group(0).split()))}" if quote else ""
+    return ProviderUnavailable(f"{kind} reached a rate or usage limit. Retry after the limit resets.{note}", "usage_limit", reset_after(detail, now))
+
+
+def google_problem(config, code, detail):
+    """The ProviderUnavailable a Gemini CLI or Antigravity failure stands for, or None for an ordinary failed attempt.
+
+    A missing sign-in or key, an untrusted folder, an exhausted quota or capacity, a model the account cannot reach and a busy model
+    are account or service problems that another coding attempt cannot fix, so they park or block the run instead of using up attempts.
+    Gemini's own exit codes count too: 41 is no usable authentication, 52 a configuration error and 55 an untrusted folder."""
+    kind = config["kind"]
+    name = "Gemini CLI" if kind == "gemini" else "Antigravity CLI"
+    if (kind == "gemini" and code == 41) or GOOGLE_AUTH.search(detail):
+        how = ("Set GEMINI_API_KEY (a paid AI Studio key; the CLI's Google-account login is Enterprise-only now), or use Vertex with "
+               "GOOGLE_API_KEY and GOOGLE_GENAI_USE_VERTEXAI=true, or use the antigravity kind." if kind == "gemini" else
+               "Run agy once and sign in, or set GEMINI_API_KEY with \"modelProvider\": \"gemini\" in ~/.gemini/antigravity-cli/settings.json.")
+        return ProviderUnavailable(f"{name} has no usable sign-in or API key. {how} Then resume this run with --retry.", "authentication")
+    if GOOGLE_TRUST.search(detail) or (kind == "gemini" and code == 55):
+        return ProviderUnavailable(f"{name} refused to run in an untrusted folder even though Nightweaver sets GEMINI_CLI_TRUST_WORKSPACE=true. "
+                                   "Remove GEMINI_RESTRICTED_MODE and any trusted-folders override, then resume this run with --retry.", "configuration")
+    if kind == "gemini" and code == 52:
+        return ProviderUnavailable("Gemini CLI reported a configuration error (exit 52). Check its settings.json, then resume this run "
+                                   "with --retry.", "configuration")
+    if GOOGLE_LIMIT.search(detail):
+        return usage_limit(kind, detail)
+    if GOOGLE_MODEL.search(detail):
+        return ProviderUnavailable(f"{name} could not use the selected model. Check the model id and that this account or key can use it.", "model_access")
+    if GOOGLE_BUSY.search(detail):
+        return ProviderUnavailable(f"{name} reported that the model is overloaded or unavailable.", "transient")
+    return None
+
+
 def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, evidence=None, health=None, images=()):
     executable = check_provider(config, cwd)
     argv, env = adapter(config, mode, session, images)
     argv = [executable, *argv[1:]]
     if Path(executable).suffix.casefold() in (".cmd", ".bat"):
-        # npm's Windows launcher is a shell script. Resolve the known package without executing a shell.
-        entry = Path(executable).parent / "node_modules/@google/gemini-cli/dist/index.js"
-        node = shutil.which("node")
-        if config["kind"] != "gemini" or not entry.is_file() or not node:
-            raise ProviderUnavailable("Use a native executable; Gemini npm installs also require node and their package entrypoint.", "missing_executable")
+        # npm's Windows launcher is a shell script. Resolve the package's own JavaScript entrypoint without executing a shell.
+        entry = gemini_entrypoint(executable) if config["kind"] == "gemini" else None
+        node = Path(executable).with_name("node.exe")
+        node = str(node) if node.is_file() else shutil.which("node")
+        if config["kind"] != "gemini":
+            raise ProviderUnavailable("Use a native executable; npm launchers are only resolved for the Gemini CLI.", "missing_executable")
+        if not entry or not node:
+            raise ProviderUnavailable(f"Cannot start the Gemini CLI from {executable}: " + (
+                "node is not installed or not on PATH." if entry else
+                "its npm package (node_modules/@google/gemini-cli with bundle/gemini.js or dist/index.js) is not beside the launcher. "
+                "Reinstall it with npm install -g @google/gemini-cli."), "missing_executable")
         argv = [node, str(entry), *argv[1:]]
     if evidence is not None:
         env["NIGHTWEAVER_EVIDENCE"] = str(evidence)
@@ -723,7 +978,8 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if folder not in folders and not any(folder.is_relative_to(known) for known in folders):
             folders.append(folder)
     for folder in folders:
-        if config["kind"] in {"claude", "deepseek"}:
+        # agy has no image attachment: an image reaches it only as a path in the prompt, which its read tool opens from a folder added here.
+        if config["kind"] in {"claude", "deepseek", "antigravity"}:
             argv += ["--add-dir", str(folder)]
         elif config["kind"] == "gemini":
             argv += ["--include-directories", str(folder)]
@@ -744,7 +1000,8 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
                 tag_file(log).write_text(config_tag(claude_directory(env)), encoding="ascii")
             except OSError:
                 pass
-        code = execute(argv, cwd, log, timeout, prompt=prompt, env=env, paused=paused, **(health or {}))
+        message = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n" if config["kind"] == "antigravity" else prompt
+        code = execute(argv, cwd, log, timeout, prompt=message, env=env, paused=paused, **(health or {}))
     current, answer = metadata(log, config["kind"], mode)
     if config["kind"] == "command" and code == config.get("unavailable_exit_code"):
         raise ProviderUnavailable(answer.strip()[-1500:] or "External workflow unavailable", "external_environment")
@@ -752,10 +1009,14 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         for event in json_events(log):
             if (event.get("type") == "result" and (event.get("is_error") is True or event.get("status") == "error")) or event.get("type") == "turn.failed":
                 code = 1
-    if code and config["kind"] in {"claude", "codex", "deepseek", "gemini"} and code not in CONTROLLER_EXITS:
+        if config["kind"] == "antigravity" and agy_stream(log, mode)["failed"]:
+            code = 1  # a stream-json session can end on a failed turn and still exit 0
+    if code and config["kind"] in {"claude", "codex", "deepseek", "gemini", "antigravity"} and code not in CONTROLLER_EXITS:
         # Only what the provider itself reported as a failure is classified, never the worker's own prose or its tool output.
         # A call the controller ended (time, idle or output limit) was not a provider failure at all.
         detail = provider_errors(log)
+        if config["kind"] in GOOGLE_KINDS and (problem := google_problem(config, code, detail)):
+            raise problem
         if config["kind"] == "deepseek" and re.search(
                 r"invalid.*api.?key|authentication_error|authentication.fail|insufficient.balance|invalid.authentication", detail, re.I):
             raise ProviderUnavailable("DeepSeek reported an API credential or balance error. "
@@ -778,12 +1039,7 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
             raise ProviderUnavailable(f"{config['kind']} reported a billing or credit balance problem. Check the selected account.",
                                       "billing")
         if LIMIT.search(detail):
-            now = datetime.now(timezone.utc)
-            quote = re.search(r"[^\n\"{}]{0,120}(?:usage limit|hit your limit|rate.?limit|quota exceeded|too many requests|\b429\b)[^\n\"{}]{0,200}",
-                              detail, re.I)
-            note = f" Provider said: {redact(' '.join(quote.group(0).split()))}" if quote else ""
-            raise ProviderUnavailable(f"{config['kind']} reached a rate or usage limit. Retry after the limit resets.{note}",
-                                      "usage_limit", reset_after(detail, now))
+            raise usage_limit(config["kind"], detail)
         if re.search(r"ECONNRESET|ETIMEDOUT|temporarily unavailable|service unavailable|(?:HTTP|status|API error)[: ]+50[234]\b", detail, re.I):
             raise ProviderUnavailable(f"{config['kind']} reported a temporary network or service failure.", "transient")
         if re.search(r"model_not_found|unsupported model|model .*?(?:not found|does not exist|not supported|not available)", detail, re.I):

@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 
 
-IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
+IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "antigravity", "command"}
 REVIEWERS = IMPLEMENTERS
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -108,6 +108,18 @@ def text(obj, key):
     return obj[key].strip()
 
 
+# Antigravity reasoning levels per Gemini 4 family (AI Studio thinking levels, 2026-11): Neon and Hydrogen reach xhigh, Carbon and Argon stop
+# at high, and no Gemini 4 model takes max. Any other model, such as a Claude one served by agy, may take the whole range.
+EFFORT_SLUG = re.compile(r"-(low|medium|high|xhigh|max)$")
+GEMINI_4_CAPS = {"neon": ("low", "medium", "high", "xhigh"), "hydrogen": ("low", "medium", "high", "xhigh"),
+                 "carbon": ("low", "medium", "high"), "argon": ("low", "medium", "high")}
+
+
+def antigravity_levels(model):
+    found = re.match(r"(?:models/)?gemini-4-([a-z]+)", model.strip().lower()) if isinstance(model, str) else None
+    return GEMINI_4_CAPS.get(found.group(1), ("low", "medium", "high", "xhigh", "max")) if found else ("low", "medium", "high", "xhigh", "max")
+
+
 def provider(value, choices, label, relative_to=None):
     fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code inherit_credentials", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
@@ -137,9 +149,16 @@ def provider(value, choices, label, relative_to=None):
     if "effort" in value:
         levels = {"claude": ("low", "medium", "high", "xhigh", "max"),
                   "codex": ("low", "medium", "high", "xhigh", "max", "ultra"),
-                  "deepseek": ("low", "high", "max")}
+                  "deepseek": ("low", "high", "max"),
+                  "antigravity": antigravity_levels(value.get("model"))}
         if value["effort"] not in levels.get(value["kind"], ()):
-            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}")
+            hint = {"gemini": ". The Gemini CLI has no effort setting; use the antigravity kind for Gemini 4 reasoning levels",
+                    "antigravity": f" for model {value['model']}, which accepts {', '.join(levels['antigravity'])}" if value.get("model") else ""}
+            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}" + hint.get(value["kind"], ""))
+        slug = EFFORT_SLUG.search(value.get("model") or "") if value["kind"] == "antigravity" else None
+        if slug and slug.group(1) != value["effort"]:
+            raise ValueError(f"The antigravity model {value['model']} already names effort {slug.group(1)}; "
+                             f"drop the suffix from the model or set effort to {slug.group(1)}, not {value['effort']}")
         out["effort"] = value["effort"]
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
@@ -155,6 +174,8 @@ def provider(value, choices, label, relative_to=None):
         profile = ((relative_to or Path.cwd()) / Path(text(value, "profile_dir")).expanduser()).resolve()
         if value["kind"] == "command":
             raise ValueError("profile_dir is supported by model providers")
+        if value["kind"] == "antigravity":
+            raise ValueError("The antigravity adapter keeps its sign-in in the CLI's own store and has no profile_dir")
         out["profile_dir"] = str(profile)
     return out
 

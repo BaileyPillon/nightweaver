@@ -255,7 +255,7 @@ def route_config(kind, profile, model, effort, label, choices=IMPLEMENTERS):
     return provider(config, choices, label)
 
 
-EXPLORERS = ("codex", "claude", "deepseek", "gemini")
+EXPLORERS = ("codex", "claude", "deepseek", "gemini", "antigravity")
 
 
 def explore_kinds(args):
@@ -351,7 +351,7 @@ def main(argv=None):
     one = commands.add_parser("oneshot", help="Build and verify a goal from a repository's committed tests")
     one.add_argument("repository", type=Path)
     one.add_argument("objective")
-    one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
+    one.add_argument("--worker", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), default="codex")
     one.add_argument("--model", help="Model for the primary worker and planner")
     one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
     one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
@@ -359,20 +359,20 @@ def main(argv=None):
                      help="The goal is a web page, so a new repository gets a browser smoke check (default: judged from the objective)")
     one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
     one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
-    one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
+    one.add_argument("--rescue", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Alternate worker after a rejected attempt")
     one.add_argument("--rescue-profile", help="Signed-in CLI profile for the alternate")
     one.add_argument("--direct", action="store_true", help="Use the objective as one milestone and skip the planner call")
-    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "deepseek"), help="Review every milestone with this provider")
+    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Review every milestone with this provider")
     one.add_argument("--reviewer-model")
     one.add_argument("--reviewer-effort")
     one.add_argument("--reviewer-profile", help="Signed-in CLI profile for the milestone reviewer")
     one.add_argument("--pursue", action="store_true", help="Keep judging and planning further waves until the goal is met or progress stops")
-    one.add_argument("--judge", choices=("codex", "claude", "gemini", "deepseek"),
+    one.add_argument("--judge", choices=("codex", "claude", "gemini", "antigravity", "deepseek"),
                      help="Independent goal judge (default: a different model family from the worker)")
     one.add_argument("--judge-model")
     one.add_argument("--judge-effort")
     one.add_argument("--judge-profile", help="Signed-in CLI profile for the judge")
-    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "deepseek"), help="Wave planner (default: the judge)")
+    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Wave planner (default: the judge)")
     one.add_argument("--planner-model")
     one.add_argument("--planner-effort")
     one.add_argument("--planner-profile")
@@ -383,7 +383,7 @@ def main(argv=None):
     one.add_argument("--explore", type=int, metavar="N",
                      help="Before milestone 1, build N divergent design directions, compare them and keep the winner (2 to 4; requires --pursue)")
     one.add_argument("--explore-workers", metavar="KIND[,KIND...]",
-                     help="Workers that build the directions in turn: codex, claude, deepseek or gemini (default: the primary worker)")
+                     help="Workers that build the directions in turn: codex, claude, deepseek, gemini or antigravity (default: the primary worker)")
     one.add_argument("--rescue-strategies", type=int, metavar="N",
                      help="When progress stalls, try N divergent strategies from the best build (2 to 4, default 3; 0 turns the rescue off; requires --pursue)")
     launch_one = one.add_mutually_exclusive_group()
@@ -434,7 +434,7 @@ def main(argv=None):
     doctor.add_argument("--plan", help="Check the exact provider routes in a plan")
     doctor.add_argument("--live", action="store_true", help="Make a small model request per distinct provider route")
     for parser in (goal, doctor):
-        parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini"), default="claude" if parser is goal else None)
+        parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini", "antigravity"), default="claude" if parser is goal else None)
         parser.add_argument("--profile-dir")
         parser.add_argument("--model", help="Model used by the planner")
         parser.add_argument("--effort", help="Reasoning effort used by the planner")
@@ -612,7 +612,7 @@ def main(argv=None):
     fork = commands.add_parser("fork", help="Start a new run from an accepted checkpoint")
     fork.add_argument("id")
     fork.add_argument("--milestone", type=int, required=True)
-    fork.add_argument("--worker", choices=("codex", "claude", "deepseek", "gemini"))
+    fork.add_argument("--worker", choices=("codex", "claude", "deepseek", "gemini", "antigravity"))
     issue = commands.add_parser("issue", help="Import one GitHub issue into a local plan")
     issue.add_argument("template")
     issue.add_argument("--repo", required=True)
