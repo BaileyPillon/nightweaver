@@ -135,6 +135,8 @@ LABELS = {
     "rescue_candidate_started": lambda d: f"Building rescue strategy {d['index']} of {d['count']}: {d['name']}",
     "rescue_candidate_built": lambda d: f"Rescue strategy {d['index']} passed its checks: {d['name']}",
     "rescue_candidate_failed": lambda d: f"Rescue strategy {d['index']} failed its checks: {d['name']}",
+    "rescue_candidate_unscored": lambda d: f"Rescue strategy {d['index']} could not be scored, its checks ran out of time: {d['name']}",
+    "direction_unscored": lambda d: f"Direction {d['index']} could not be scored, its checks ran out of time: {d['name']}",
     "rescue_compared": lambda d: f"Rescue comparison {d['number']} judged",
     "rescue_comparison_invalid": lambda d: f"Rescue comparison unreadable (attempt {d['attempt']} of 2)",
     "rescue_chosen": lambda d: f"Rescue strategy {d['name']} beat the best build" if d.get("winner") is not None else "No rescue strategy beat the best build",

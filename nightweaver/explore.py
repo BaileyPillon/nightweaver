@@ -16,7 +16,7 @@ import shutil
 import subprocess
 
 from .checks import observed_pass
-from .engine import commit_tree, common_dir, git, tail, use_git_timeout, verify_registered_repository
+from .engine import commit_tree, common_dir, git, tail, timed_out_for_good, timeout_issue, use_git_timeout, verify_registered_repository
 from .insights import failure_excerpt
 from .process import PausedRun
 from .pursuit import screenshots
@@ -27,12 +27,12 @@ from .store import timestamp
 from .verdicts import extract_object, normalize
 
 RANK_LIMIT, JUDGE_IMAGES = 12, 6
-EVENTS = ["direction_planned", "direction_built", "direction_failed", "direction_compared", "direction_chosen",
+EVENTS = ["direction_planned", "direction_built", "direction_failed", "direction_unscored", "direction_compared", "direction_chosen",
           "exploration_skipped", "exploration_failed"]
 # What a contest of builds calls its state key, events and worktrees; the rescue contest brings its own set.
 EXPLORE = {"key": "exploration", "started": "direction_started", "worked": "direction_worker_finished",
-           "passed": "direction_built", "failed": "direction_failed", "compared": "direction_compared", "invalid": "comparison_invalid",
-           "then": "tournament"}
+           "passed": "direction_built", "failed": "direction_failed", "unscored": "direction_unscored", "compared": "direction_compared",
+           "invalid": "comparison_invalid", "then": "tournament"}
 
 
 def options(run):
@@ -227,6 +227,7 @@ def gate(run, state, step, path, snapshot, out, index, number, check):
 
 
 def run_check(run, state, step, path, snapshot, out, number, check, where):
+    """-> (the receipts, the problem or None). A problem whose last receipt is timed_out_for_good is a check that ran out of time."""
     count, receipts = check.get("stability_runs", 1), []
     for round_index in range(2 if count > 1 else 1):
         batch = []
@@ -237,6 +238,8 @@ def run_check(run, state, step, path, snapshot, out, number, check, where):
             batch.append(run.observe_gate(check, path, state, step, snapshot, location, evidence=out))
             if observed_pass(batch[-1]) is None:
                 last = batch[-1]
+                if timed_out_for_good(last):  # the check ran out of time: build_one records the candidate as unscored, not failed
+                    return [*receipts, *batch], timeout_issue(check, last)
                 return [*receipts, *batch], f"{check['name']} could not be scored: {last.get('source_error') or last.get('artifact_error') or 'no result'}"
         outcomes = [observed_pass(r) for r in batch]
         if all(outcomes):
@@ -289,17 +292,20 @@ def build_one(run, state, ex, current, *, config, path, out, step, detail, promp
     for item in out.iterdir() if out.is_dir() else ():  # a verification interrupted earlier must not leave stale evidence
         if not item.name.startswith("worker."):
             shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink(missing_ok=True)
-    outputs, reason, failed = [], None, []
+    outputs, reason, failed, unscored = [], None, [], False
     for number, check in enumerate(step["gates"], 1):
         receipts, problem = gate_fn(run, state, step, path, snapshot, out, index, number, check)
         outputs.extend(receipts)
         if problem:
-            reason, failed = problem, [check["name"]]
+            unscored = bool(receipts) and timed_out_for_good(receipts[-1])  # a check that timed out for good has not failed
+            reason, failed = problem, [] if unscored else [check["name"]]
             break
     if reason is None and run.snapshot(path, state, step) != snapshot:
         reason = "A check changed tracked evidence or implementation files after the snapshot was taken."
     detail.update(tree=snapshot, failed_checks=failed, screenshots=[str(p) for p in screenshots(out, 8)],
                   checks=[{"name": r["name"], "exit": r["exit"], "passed": observed_pass(r)} for r in outputs])
+    if unscored:
+        return record(run, ex, {**detail, "passed": None, "status": "unscored", "reason": redact(reason)[:1500]}, current, names)
     if reason is not None:
         return record(run, ex, {**detail, "passed": False, "reason": redact(reason)[:1500]}, current, names)
     write_json(out / "checks.json", outputs)
@@ -314,12 +320,26 @@ def record(run, ex, detail, current, names=EXPLORE):
     """Save one finished candidate and move on to the next, or to the contest's last stage after the final one."""
     seconds = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(current["started"])).total_seconds())
     detail = {**detail, "seconds": round(seconds, 1), "summary": current["summary"], "feedback": current["feedback"]}
-    kept = {k: detail[k] for k in ("index", "name", "worker", "passed", "tree", "commit", "evidence", "feedback", "failed_checks",
+    kept = {k: detail[k] for k in ("index", "name", "worker", "passed", "status", "tree", "commit", "evidence", "feedback", "failed_checks",
                                    "checks_sha256", "screenshots") if k in detail}
-    kept["reason"] = (detail["reason"] or "")[:300]
+    unscored = detail.get("status") == "unscored"  # passed is None: a candidate whose checks ran out of time is neither a pass nor a failure
+    kept["reason"] = (detail["reason"] or "")[:(900 if unscored else 300)]  # an unscored candidate's reason is what the block quotes, advice included
     ex = {**ex, "builds": [*ex["builds"], kept], "current": None, "stage": "build" if detail["index"] < detail["count"] else names["then"]}
-    run.set(names["passed"] if detail["passed"] else names["failed"], detail, **{names["key"]: ex}, last_error="", retry_at=None,
-            transient_failures=0)
+    run.set(names["unscored"] if unscored else names["passed"] if detail["passed"] else names["failed"], detail, **{names["key"]: ex},
+            last_error="", retry_at=None, transient_failures=0)
+
+
+def all_unscored(builds):
+    """Whether every candidate of a contest ran out of time in its checks: none passed and none failed, so nothing is known about any of them."""
+    return bool(builds) and all(b.get("status") == "unscored" for b in builds)
+
+
+def block_unscored(run, ex, key, phase, what):
+    """Block the run because no candidate could be scored. The candidates are forgotten, so --retry builds them again, and the reason says what
+    to do about the time limit. `what` names the candidates ("directions", "strategies")."""
+    issue = f"All {len(ex['builds'])} {what} ran out of time in their checks, so none could be scored or compared. " + ex["builds"][0]["reason"]
+    run.set("blocked", {"issue": issue, "during": phase}, phase="blocked", blocked_from=phase, last_error=issue,
+            **{key: {**ex, "stage": "build", "builds": [], "comparisons": [], "current": None}}, retry_at=None, transient_failures=0)
 
 
 # ---------------------------------------------------------------- stage 3: tournament
@@ -485,8 +505,11 @@ def stage_manifest(run, state, build, what):
 
 def conclude(run, state, ex, passed):
     cleanup(run)
+    if all_unscored(ex["builds"]):
+        return block_unscored(run, ex, "exploration", "exploring", "directions")
     if not passed:
-        run.set("exploration_failed", {"directions": [{"index": b["index"], "name": b["name"], "reason": b["reason"]} for b in ex["builds"]]},
+        run.set("exploration_failed", {"directions": [{"index": b["index"], "name": b["name"], "reason": b["reason"],
+                                                       **({"status": b["status"]} if "status" in b else {})} for b in ex["builds"]]},
                 phase="ready", explored=True, exploration={"stage": "failed"}, last_error="", retry_at=None, log=None,
                 judge_route=0, judge_attempts=0)
         return
@@ -502,7 +525,7 @@ def conclude(run, state, ex, passed):
     run.set("direction_chosen", {"winner": winner, "name": build["name"], "commit": build["commit"], "ref": direction_ref(state, winner),
             "chosen_by": by, "mode": options(run)["comparisons"], "judged": len(passed) > 1, "ranking": ranking,
             "position_bias_pairs": bias, "comparisons": len(valid), "invalid_comparisons": len(ex["comparisons"]) - len(valid),
-            "directions": len(ex["builds"]), "passed": len(passed)},
+            "directions": len(ex["builds"]), "passed": len(passed), "unscored": sum(b.get("status") == "unscored" for b in ex["builds"])},
             phase="promoting", candidate=build["commit"], candidate_tree=build["tree"], checks_sha256=build["checks_sha256"],
             attempt=1, attempts_used=0, explored=True, worker_feedback_version=build["feedback"], worker_session=None,
             last_error="", retry_at=None, log=None, judge_route=0, judge_attempts=0, exploration=done)
@@ -520,7 +543,7 @@ def report(store, run_id):
         d, kind = event["details"], event["kind"]
         if kind == "direction_planned":
             planned[d["index"]] = d
-        elif kind in ("direction_built", "direction_failed"):
+        elif kind in ("direction_built", "direction_failed", "direction_unscored"):
             built[d["index"]] = d
         elif kind == "direction_compared":
             compared.append(d)
@@ -532,7 +555,8 @@ def report(store, run_id):
     for index, plan in sorted(planned.items()):
         item = built.get(index)
         rows.append({"index": index, "name": plan["name"], "worker": item["worker"] if item else None,
-                     "passed": item["passed"] if item else None, "reason": (item or {}).get("reason"),
+                     "passed": item["passed"] if item else None, "unscored": bool(item and item.get("status") == "unscored"),
+                     "reason": (item or {}).get("reason"),
                      "seconds": (item or {}).get("seconds"), "commit": (item or {}).get("commit"),
                      "score": scores.get(index), "winner": bool(chosen and chosen["winner"] == index)})
     status = {"direction_chosen": "chosen", "exploration_failed": "failed", "exploration_skipped": "skipped"}.get(end["kind"] if end else None, "in_progress")
@@ -546,11 +570,13 @@ def format_lines(data):
     """Plain-text lines for the pursuit report."""
     names = {"chosen": "winner chosen by " + str(data["chosen_by"]), "failed": "no direction passed its checks",
              "skipped": "skipped: " + str(data["reason"] or ""), "in_progress": "in progress"}
-    lines = ["", f"Design exploration - {names[data['status']]} ({data['judge_calls']} judge calls)"]
+    unscored = sum(row["unscored"] for row in data["directions"])
+    lines = ["", f"Design exploration - {names[data['status']]} ({data['judge_calls']} judge calls"
+                 + (f", {unscored} unscored: their checks ran out of time" if unscored else "") + ")"]
     for row in data["directions"]:
         first = str(row["reason"] or "").splitlines()
-        state = ("not built yet" if row["passed"] is None else "passed" if row["passed"] else
-                 "failed" + (": " + first[0][:120] if first else ""))
+        state = ("unscored: its checks ran out of time" if row["unscored"] else "not built yet" if row["passed"] is None else
+                 "passed" if row["passed"] else "failed" + (": " + first[0][:120] if first else ""))
         lines.append(f"  {row['index']}. {row['name']} [{(row['worker'] or {}).get('kind', '?')}] {state}"
                      + (f", score {row['score']:g}" if row["score"] is not None else "") + (" - WINNER" if row["winner"] else ""))
     if data["position_bias_pairs"]:

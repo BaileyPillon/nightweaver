@@ -563,6 +563,21 @@ def gate_timed_out(receipt):
     return error == BASELINE_TIMEOUT or (receipt.get("exit") is None and error == GATE_TIMEOUT)
 
 
+def timed_out_for_good(receipt):
+    """Whether a receipt that Run.run_timed_gate returned is of a gate the controller ended at its limit for good: after its retries (the
+    receipt says so in timeout_retried), or at the first stop when the plan allows none. Such a gate was not judged, so it is neither a pass
+    nor a failure of the code it ran on."""
+    return gate_timed_out(receipt) or bool((receipt.get("timeout_retried") or {}).get("timed_out"))
+
+
+def timeout_issue(check, receipt):
+    """What a run says when `check` timed out for good (timed_out_for_good): which gate and limits, that nothing was judged, what to do.
+    The milestone path words its block the same way (invalid_gate); a judge's ledger and a candidate's checks use this one."""
+    said = receipt["artifact_error"] if (receipt.get("timeout_retried") or {}).get("timed_out") else (
+        f"Gate {check['name']!r} exceeded its wall-clock timeout of {check['timeout']} s, and the plan allows no retry. The worker's change was not judged.")
+    return said + " " + timeout_advice(check["timeout"])
+
+
 def timeout_advice(planned):
     """What an operator can do about a gate that timed out for good. A run keeps the plan it was created with (no command edits it), so more
     time means the edited plan added as a new run; a resume runs the gate again with the limits the plan has."""

@@ -8,8 +8,8 @@ import shutil
 from tempfile import mkdtemp
 
 from . import context
-from .checks import contract_hash, observed_pass, run_gate
-from .engine import common_dir, git, tail, verify_registered_repository
+from .checks import contract_hash, observed_pass
+from .engine import common_dir, git, tail, timed_out_for_good, timeout_issue, verify_registered_repository
 from .insights import budget_status, failure_excerpt
 from .process import PausedRun
 from .repair import describe
@@ -94,9 +94,16 @@ def slot(parent, number):
     return folder
 
 
+class Unscored(ValueError):
+    """A ledger check the controller ended at its time limit for good. It says nothing about the build, so the judgment waits: raised to the
+    run loop, which blocks the run in the phase that was running (judging, or rescuing) with this text, for --retry or a longer plan."""
+
+
 def ledger(run, state, path, folder, tree, milestones=None):
     """Re-run every distinct check that applies to the finished build on it: those of the final milestone, which holds the plan's checks, its
-    final checks and the checks retained from earlier milestones, but not a check local to an earlier milestone (or those of `milestones`)."""
+    final checks and the checks retained from earlier milestones, but not a check local to an earlier milestone (or those of `milestones`).
+    A check that times out is run again with more time, as in a verification. One that times out for good raises Unscored: it is not a failed
+    check, so no row is made for it and the build is not judged on a guess."""
     seen, checks = set(), []
     for milestone in milestones or run.spec["milestones"][-1:]:
         for check in milestone["gates"]:
@@ -110,10 +117,10 @@ def ledger(run, state, path, folder, tree, milestones=None):
             raise PausedRun()
         out = slot(folder, number)
         baseline = run.spec.get("proof_base", base) if "proof" in check else base
-        receipt = run_gate(check, path, out, tree, paused=run.paused,
-                           **({"baseline": baseline} if check.get("kind") == "catalog" or "proof" in check else {}),
-                           max_log_bytes=run.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
-                           heartbeat=lambda info: run.set("process_heartbeat", {**info, "role": "gate"}))
+        # A check that runs out of time is run again with twice the time (engine.Run.run_timed_gate), as in a verification.
+        receipt, out = run.run_timed_gate(check, path, out, tree, {"wave": state.get("wave", 1), "ledger_index": number},
+                                          lambda: slot(folder, number), baseline)
+        unscored = timeout_issue(check, receipt) if timed_out_for_good(receipt) else None  # before the receipt is amended below
         receipt.update(wave=state.get("wave", 1), ledger_index=number)
         log = out / "gate.log"
         if log.is_file() or observed_pass(receipt) is not None:
@@ -128,6 +135,8 @@ def ledger(run, state, path, folder, tree, milestones=None):
         if "proof" in receipt:
             receipt["proof"]["passed"] = observed_pass(receipt) is True
         run.set("judge_gate_finished", receipt)
+        if unscored:
+            raise Unscored(unscored)
         passed = observed_pass(receipt)
         row = {"name": check["name"], "passed": passed is True, "log": str(log)}
         if passed is not True:
