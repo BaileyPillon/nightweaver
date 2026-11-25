@@ -229,6 +229,18 @@ class EffortValidation(Hermetic):
         with self.assertRaisesRegex(ValueError, "already names effort xhigh"):
             self.route(model="gemini-4-neon-xhigh", effort="high")
 
+    def test_a_slug_is_read_in_any_case_as_the_levels_table_is(self):
+        for model in ("Gemini-4-Neon-XHigh", "GEMINI-4-NEON-XHIGH", "gemini-4-neon-XHIGH"):
+            with self.subTest(model):
+                with self.assertRaisesRegex(ValueError, "already names effort xhigh; drop the suffix from the model or set effort to xhigh, not low"):
+                    self.route(model=model, effort="low")
+                self.assertEqual(self.route(model=model, effort="xhigh"), {"kind": "antigravity", "model": model, "effort": "xhigh"})
+                self.assertEqual(self.route(model=model)["model"], model, "the model goes to agy as it was written")
+        with self.assertRaisesRegex(ValueError, "names xhigh, but GEMINI-4-CARBON accepts low, medium, high"):
+            self.route(model="GEMINI-4-CARBON-XHIGH")
+        with self.assertRaisesRegex(ValueError, "Unsupported effort for antigravity: max"):
+            self.route(model="GEMINI-4-NEON", effort="max")
+
     def test_the_gemini_cli_still_has_no_effort_and_says_where_to_get_one(self):
         for level in ("low", "high", "xhigh"):
             with self.assertRaisesRegex(ValueError, "Unsupported effort for gemini: .*antigravity kind"):

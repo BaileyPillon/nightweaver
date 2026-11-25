@@ -131,14 +131,16 @@ def _metrics(store, run_id):
                    "confirmations_skipped": kinds.count("confirmation_skipped"), "discarded_milestones": discarded}
     exploration = None
     if {"direction_planned", "exploration_skipped"} & set(kinds):
+        from .explore import BUILT
         chosen = next((e["details"] for e in reversed(events) if e["kind"] == "direction_chosen"), None)
-        exploration = {"directions": kinds.count("direction_planned"), "built": kinds.count("direction_built"),
-                       "failed": kinds.count("direction_failed"), "comparisons": kinds.count("direction_compared"),
+        ended = list({e["details"]["index"]: e["kind"] for e in events if e["kind"] in BUILT}.values())  # a direction built again after a block counts once, as it last ended
+        exploration = {"directions": kinds.count("direction_planned"), "built": ended.count("direction_built"),
+                       "failed": ended.count("direction_failed"), "comparisons": kinds.count("direction_compared"),
                        "winner": chosen["winner"] if chosen else None, "chosen_by": chosen["chosen_by"] if chosen else None,
                        "position_bias_pairs": len(chosen["position_bias_pairs"]) if chosen else 0,
                        "outcome": "chosen" if chosen else "failed" if "exploration_failed" in kinds else
                                   "skipped" if "exploration_skipped" in kinds else "in progress",
-                       **({"unscored": kinds.count("direction_unscored")} if "direction_unscored" in kinds else {})}  # the key only when it is nonzero
+                       **({"unscored": ended.count("direction_unscored")} if "direction_unscored" in ended else {})}  # the key only when it is nonzero
     from .rescue import summary as rescue_summary
     rescue = rescue_summary(events) if {"rescue_started", "rescue_skipped"} & set(kinds) else None
     return {

@@ -15,7 +15,8 @@ import test_release_019_explore as explore_tests
 import test_windows as fixtures
 
 from nightweaver.cli import main
-from nightweaver.engine import FALLBACK_IDENTITY, Run, commit_tree, git, identity_error, identity_message, quoted, require_identity
+from nightweaver.engine import (FALLBACK_IDENTITY, Run, commit_tree, git, identity_error, identity_fallback, identity_message, missing_identity,
+                                quoted, require_identity)
 from nightweaver.pursuit import legacy_final, settle_gates, wave_gates
 from nightweaver.spec import validate
 
@@ -468,6 +469,23 @@ class IdentityTests(unittest.TestCase):
             mixed = commit_tree(self.repo, tree, self.head, "Mixed")
             self.assertEqual(author_of(self.repo, mixed), f"Ada <ada@example.invalid>|{name} <{email}>")
         self.assertEqual((name, email), ("Nightweaver", "nightweaver@localhost"))
+
+    def test_a_half_configured_identity_keeps_what_is_configured_and_fills_only_the_rest(self):
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        name, email = FALLBACK_IDENTITY
+        for key, value, expected, filled in (("user.name", "Alice", f"Alice <{email}>", "email"),
+                                             ("user.email", "bob@example.invalid", f"{name} <bob@example.invalid>", "name")):
+            with self.subTest(key), no_identity(self.repo, self.root):
+                git(self.repo, "config", key, value)
+                self.assertEqual(sorted(missing_identity(self.repo)), ["author", "committer"], "git cannot fill either role with half of it")
+                commit = commit_tree(self.repo, tree, self.head, "Half")
+                self.assertEqual(author_of(self.repo, commit), f"{expected}|{expected}")
+                self.assertEqual(identity_fallback(self.repo, commit), {"name": name, "email": email, "roles": ["author", "committer"],
+                                                                        "filled": {"author": [filled], "committer": [filled]}})
+        with no_identity(self.repo, self.root, GIT_AUTHOR_NAME="Ada"):  # one role half given by the environment, the other not at all
+            mixed = commit_tree(self.repo, tree, self.head, "Mixed")
+            self.assertEqual(author_of(self.repo, mixed), f"Ada <{email}>|{name} <{email}>")
+            self.assertEqual(identity_fallback(self.repo, mixed), {"name": name, "email": email, "roles": ["author", "committer"], "filled": {"author": ["email"]}})
 
     def test_a_run_in_a_repository_without_an_identity_is_accepted_and_says_so(self):
         run = self.configured(fixtures.fixture("good"), reviewer={"kind": "command", "argv": fixtures.fixture("review")})

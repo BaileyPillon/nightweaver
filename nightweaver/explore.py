@@ -29,6 +29,7 @@ from .verdicts import extract_object, normalize
 RANK_LIMIT, JUDGE_IMAGES = 12, 6
 EVENTS = ["direction_planned", "direction_built", "direction_failed", "direction_unscored", "direction_compared", "direction_chosen",
           "exploration_skipped", "exploration_failed"]
+BUILT = ("direction_built", "direction_failed", "direction_unscored")  # what a direction's build can end as; a run that builds it again records another
 # What a contest of builds calls its state key, events and worktrees; the rescue contest brings its own set.
 EXPLORE = {"key": "exploration", "started": "direction_started", "worked": "direction_worker_finished",
            "passed": "direction_built", "failed": "direction_failed", "unscored": "direction_unscored", "compared": "direction_compared",
@@ -543,7 +544,7 @@ def report(store, run_id):
         d, kind = event["details"], event["kind"]
         if kind == "direction_planned":
             planned[d["index"]] = d
-        elif kind in ("direction_built", "direction_failed", "direction_unscored"):
+        elif kind in BUILT:
             built[d["index"]] = d
         elif kind == "direction_compared":
             compared.append(d)

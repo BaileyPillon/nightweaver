@@ -109,13 +109,26 @@ class GateTimeoutRetry(unittest.TestCase):
         (finished,) = self.events(run, "gate_finished")
         self.assertIsNone(observed_pass(finished), "a gate that never finished scores nothing")
 
-    def test_no_retries_keeps_the_0_19_behavior(self):
+    def test_no_retries_blocks_at_the_first_timeout_as_0_19_did_and_says_which_gate_and_what_to_do(self):
         run = self.configured(fixtures.fixture("good"), gates=[self.gate(ALWAYS_SLOW)], attempts=3, retry={"gate_timeout_retries": 0})
         self.assertEqual(Run(self.store, run).run(), "blocked")
         self.assertEqual(self.events(run, "gate_timeout_retried"), [])
-        self.assertEqual(self.store.get(run)["state"]["last_error"], GATE_TIMEOUT)
+        state = self.store.get(run)["state"]
+        for text in ("'slow gate'", f"timeout of {LIMIT} s", "allows no retry", "not judged", '"timeout"', "as a new run", "--retry"):
+            self.assertIn(text, state["last_error"])
+        self.assertEqual((state["phase"], state["blocked_from"], state["attempts_used"]), ("blocked", "checking", 1))
+        self.assertEqual((blocked_issue(self, run), self.events(run, "attempt_rejected")), (state["last_error"], []))
         (finished,) = self.events(run, "gate_finished")
         self.assertNotIn("timeout_retried", finished)
+        self.assertEqual((finished["exit"], finished["artifact_error"]), (None, GATE_TIMEOUT), "the receipt is as 0.19 wrote it")
+
+    def test_a_proof_baseline_that_times_out_with_no_retry_says_so_in_the_block(self):
+        run = self.configured(fixtures.fixture("good"), gates=[self.proof_gate("always")], attempts=1, retry={"gate_timeout_retries": 0})
+        self.assertEqual(Run(self.store, run).run(), "blocked")
+        issue = self.store.get(run)["state"]["last_error"]
+        for text in ("'watchlist'", "(its run on the proof baseline)", f"timeout of {LIMIT} s", "allows no retry", "as a new run", "--retry"):
+            self.assertIn(text, issue)
+        self.assertEqual(self.events(run, "gate_timeout_retried"), [])
 
     def test_a_retry_in_a_stability_batch_keeps_every_sample_matching_the_plan(self):
         run = self.configured(fixtures.fixture("good"), gates=[self.gate(SLOW_ONCE, stability_runs=2)], attempts=1)

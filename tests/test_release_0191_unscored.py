@@ -17,7 +17,7 @@ from test_release_0191_runtime import timeout_receipt
 from nightweaver import engine, explore, rescue
 from nightweaver.checks import observed_pass
 from nightweaver.engine import Run
-from nightweaver.reports import metrics
+from nightweaver.reports import metrics, run_report
 
 REAL = engine.run_gate
 LIMIT = 10  # seconds the plan gives its check; the retry doubles it. No test waits: the runs that "time out" are faked.
@@ -150,6 +150,44 @@ class UnscoredDirections(unittest.TestCase):
         self.assertEqual((chosen["winner"], chosen["passed"], chosen["directions"]), (2, 3, 3))
         self.assertEqual(len(self.workers()), 7, "three builds, three rebuilds and the second milestone")
 
+    def exploration_line(self, run):
+        """The exploration row of the run report's measurements, as the report writes it."""
+        html = Path(run_report(self.store, run, self.root / "report.html")["report"]).read_text(encoding="utf-8")
+        return next(row for row in html.split("<tr>") if "Exploration" in row.split("</th>")[0])
+
+    def test_the_counts_follow_each_directions_latest_build_not_every_event_the_log_holds(self):
+        run = self.explored(gates=GATES)
+        with patch("nightweaver.engine.run_gate", ends_at_limit("explore-", [])):
+            self.assertEqual(Run(self.store, run).run(), "blocked")
+        self.assertEqual(metrics(self.store, run)["exploration"]["unscored"], 3)
+        self.assertIn("3 unscored (their checks ran out of time)", self.exploration_line(run))
+        # The machine was busy: every direction passes its checks the second time.
+        self.assertEqual(Run(self.store, run).run(retry=True), "done")
+        data = metrics(self.store, run)["exploration"]
+        self.assertEqual((data["directions"], data["built"], data["failed"], data["outcome"]), (3, 3, 0, "chosen"))
+        self.assertNotIn("unscored", data, "the old direction_unscored events describe builds that were thrown away")
+        self.assertEqual(len(self.events(run, "direction_unscored")), 3, "the log keeps what happened")
+        (chosen,) = self.events(run, "direction_chosen")
+        self.assertEqual(chosen["unscored"], 0)
+        line = self.exploration_line(run)
+        self.assertIn("3 of 3 directions passed their checks", line)
+        self.assertNotIn("unscored", line)
+        self.assertNotIn("unscored", "\n".join(explore.format_lines(explore.report(self.store, run))))
+
+    def test_two_blocked_rounds_count_each_direction_once_and_a_mixed_retry_counts_what_is_left(self):
+        run = self.explored(gates=GATES)
+        for retry in (False, True):
+            with patch("nightweaver.engine.run_gate", ends_at_limit("explore-", [])):
+                self.assertEqual(Run(self.store, run).run(retry=retry), "blocked")
+        self.assertEqual(len(self.events(run, "direction_unscored")), 6)
+        self.assertEqual(metrics(self.store, run)["exploration"]["unscored"], 3, "three directions, not six")
+        with patch("nightweaver.engine.run_gate", ends_at_limit("explore-02", [])):
+            self.assertEqual(Run(self.store, run).run(retry=True), "done")
+        data = metrics(self.store, run)["exploration"]
+        self.assertEqual((data["directions"], data["built"], data["failed"], data["unscored"]), (3, 2, 0, 1))
+        line = self.exploration_line(run)
+        self.assertIn("2 of 3 directions passed their checks, 1 unscored", line)
+
     def test_an_unscored_direction_is_left_out_of_the_tournament_and_counted_apart(self):
         run = self.explored(gates=GATES)
         with patch("nightweaver.engine.run_gate", ends_at_limit("explore-02", [])):
@@ -220,6 +258,9 @@ class UnscoredStrategies(unittest.TestCase):
         self.assertEqual(len(self.events(run, "rescue_candidate_unscored")), 2)
         (chosen,) = self.events(run, "rescue_chosen")
         self.assertEqual((chosen["winner"], chosen["passed"], chosen["strategies"]), (1, 2, 2))
+        self.assertNotIn("unscored_strategies", metrics(self.store, run)["rescue"], "the strategies that were built again are not unscored")
+        (data,) = rescue.report(self.store, run)
+        self.assertEqual([r["unscored"] for r in data["strategies"]], [False, False])
 
     def test_an_unscored_strategy_is_left_out_of_the_comparison_and_counted_apart(self):
         names = rescue_tests.NAMES

@@ -238,22 +238,46 @@ def require_identity(repo):
         raise ValueError(message)
 
 
+def fallback_env(path):
+    """The GIT_<ROLE>_NAME and _EMAIL variables that fill what git cannot resolve in `path`, and nothing it can: for each role git cannot fill,
+    git is asked again with one half of FALLBACK_IDENTITY supplied (the email first), so a configured name or email stays and only its missing
+    partner is filled; a role that has neither gets both."""
+    name, email = FALLBACK_IDENTITY
+    env = {}
+    for role in missing_identity(path):
+        prefix = f"GIT_{role.upper()}_"
+        for half in ({prefix + "EMAIL": email}, {prefix + "NAME": name}):
+            try:
+                git(path, "var", prefix + "IDENT", env=half)
+            except ValueError:
+                continue
+            env.update(half)
+            break
+        else:
+            env.update({prefix + "NAME": name, prefix + "EMAIL": email})
+    return env
+
+
 def commit_tree(path, tree, parent, message):
     """The commit of `tree` on `parent`. A repository that resolves no identity still gets the commit, under FALLBACK_IDENTITY for the
-    role git cannot fill, so a run started before the identity checks existed (or one whose config changed) is not lost at promotion.
-    Only the missing side is replaced: a configured identity is never overridden."""
-    env = {f"GIT_{role.upper()}_{key}": value for role in missing_identity(path) for key, value in zip(("NAME", "EMAIL"), FALLBACK_IDENTITY)}
-    return git(path, "commit-tree", tree, "-p", parent, "-m", message, env=env or None)
+    part of a role git cannot fill (fallback_env), so a run started before the identity checks existed (or one whose config changed) is not
+    lost at promotion. A configured name or email is never overridden."""
+    return git(path, "commit-tree", tree, "-p", parent, "-m", message, env=fallback_env(path) or None)
 
 
 def identity_fallback(repo, commit):
-    """{"name", "email", "roles"} when `commit` carries FALLBACK_IDENTITY as its author or committer, else None."""
+    """{"name", "email", "roles"} when `commit` carries FALLBACK_IDENTITY's name or email as its author or committer, else None. `roles` are
+    the ones that did; "filled" appears when a role got only one half and names it: {"author": ["email"]} is a configured name kept."""
     try:
         author, committer = (line.split("\t") for line in git(repo, "show", "-s", "--format=%an\t%ae%n%cn\t%ce", commit).splitlines()[:2])
     except ValueError:
         return None
-    roles = [role for role, who in (("author", author), ("committer", committer)) if tuple(who) == FALLBACK_IDENTITY]
-    return {"name": FALLBACK_IDENTITY[0], "email": FALLBACK_IDENTITY[1], "roles": roles} if roles else None
+    halves = {role: [half for half, have, fallback in zip(("name", "email"), who, FALLBACK_IDENTITY) if have == fallback]
+              for role, who in (("author", author), ("committer", committer))}
+    halves = {role: found for role, found in halves.items() if found}
+    partial = {role: found for role, found in halves.items() if len(found) < 2}
+    return ({"name": FALLBACK_IDENTITY[0], "email": FALLBACK_IDENTITY[1], "roles": list(halves), **({"filled": partial} if partial else {})}
+            if halves else None)
 
 
 def common_dir(path):
@@ -572,9 +596,13 @@ def timed_out_for_good(receipt):
 
 def timeout_issue(check, receipt):
     """What a run says when `check` timed out for good (timed_out_for_good): which gate and limits, that nothing was judged, what to do.
-    The milestone path words its block the same way (invalid_gate); a judge's ledger and a candidate's checks use this one."""
-    said = receipt["artifact_error"] if (receipt.get("timeout_retried") or {}).get("timed_out") else (
-        f"Gate {check['name']!r} exceeded its wall-clock timeout of {check['timeout']} s, and the plan allows no retry. The worker's change was not judged.")
+    The milestone path (invalid_gate), a judge's ledger and a candidate's checks all use it, so every block for a timeout reads alike."""
+    if (receipt.get("timeout_retried") or {}).get("timed_out"):
+        said = receipt["artifact_error"]
+    else:
+        on_baseline = " (its run on the proof baseline)" if receipt.get("artifact_error") == BASELINE_TIMEOUT else ""
+        said = (f"Gate {check['name']!r}{on_baseline} exceeded its wall-clock timeout of {check['timeout']} s, and the plan allows no retry. "
+                f"The worker's change was not judged.")
     return said + " " + timeout_advice(check["timeout"])
 
 
@@ -1052,9 +1080,7 @@ class Run:
         if receipt.get("source_error"):
             self.reject(receipt["source_error"], "snapshot", repairable=False)
         elif receipt.get("input_error") or receipt.get("execution_error"):
-            issue = receipt["artifact_error"]
-            if (timed := receipt.get("timeout_retried")) and timed.get("timed_out"):
-                issue += " " + timeout_advice(timed["limits"][0])
+            issue = timeout_issue(check, receipt) if timed_out_for_good(receipt) else receipt["artifact_error"]
             self.set("blocked", {"during": "checking", "issue": issue}, phase="blocked", blocked_from="checking", last_error=issue)
         else:
             self.reject(f"{check['name']} exited {receipt['exit']} and could not collect its required evidence: "

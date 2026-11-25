@@ -112,7 +112,7 @@ def text(obj, key):
 # Hydrogen reach xhigh, Carbon and Argon stop at high, the 3.x Flash models take low to high and 3.1 Pro only low and high, so no listed
 # model takes max. With no --model agy uses gemini-3.1-pro. A model not listed (a Claude one that a signed-in account may offer) is left
 # to agy, which names the levels it takes.
-EFFORT_SLUG = re.compile(r"-(low|medium|high|xhigh|max)$")
+EFFORT_SLUG = re.compile(r"-(low|medium|high|xhigh|max)$", re.I)  # agy reads a model in any case, as AGY_LEVELS does
 ALL_LEVELS = ("low", "medium", "high", "xhigh", "max")
 AGY_LEVELS = ((re.compile(r"gemini-4-(?:neon|hydrogen)\b"), ("low", "medium", "high", "xhigh")),
               (re.compile(r"gemini-4-(?:carbon|argon)\b"), ("low", "medium", "high")),
@@ -164,12 +164,12 @@ def provider(value, choices, label, relative_to=None):
                                     f" for agy's default model {AGY_DEFAULT_MODEL}, which accepts {', '.join(levels['antigravity'])}; "
                                     "name a model, such as gemini-4-neon, to use another level")}
             raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}" + hint.get(value["kind"], ""))
-        if slug and slug.group(1) != value["effort"]:
-            raise ValueError(f"The antigravity model {value['model']} already names effort {slug.group(1)}; "
-                             f"drop the suffix from the model or set effort to {slug.group(1)}, not {value['effort']}")
+        if slug and slug.group(1).lower() != value["effort"]:
+            raise ValueError(f"The antigravity model {value['model']} already names effort {slug.group(1).lower()}; "
+                             f"drop the suffix from the model or set effort to {slug.group(1).lower()}, not {value['effort']}")
         out["effort"] = value["effort"]
-    if slug and slug.group(1) not in antigravity_levels(value["model"]):  # a slug names a level its model does not have
-        raise ValueError(f"Unsupported effort for antigravity: the model {value['model']} names {slug.group(1)}, but "
+    if slug and slug.group(1).lower() not in antigravity_levels(value["model"]):  # a slug names a level its model does not have
+        raise ValueError(f"Unsupported effort for antigravity: the model {value['model']} names {slug.group(1).lower()}, but "
                          f"{EFFORT_SLUG.sub('', value['model'])} accepts {', '.join(antigravity_levels(value['model']))}")
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
