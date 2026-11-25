@@ -10,7 +10,7 @@ import tempfile
 # Each vendor's credential variables. A child process gets its own vendor's and no other's.
 CREDENTIALS = {"claude": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
                "deepseek": ("DEEPSEEK_API_KEY",), "codex": ("OPENAI_API_KEY", "CODEX_API_KEY"),
-               "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+               "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "antigravity": ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
 SECRET_VARIABLES = frozenset(name.upper() + suffix for names in CREDENTIALS.values() for name in names for suffix in ("", "_FILE"))
 # Any other variable whose name says it holds a credential (*_TOKEN, *_API_KEY, *_SECRET, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, a
 # Bedrock bearer token, Claude Code's own session socket) is scrubbed too, with or without a *_FILE pointer.
@@ -20,7 +20,7 @@ NOT_SECRET = frozenset({"HF_HUB_DISABLE_IMPLICIT_TOKEN"})  # switches whose name
 # What each vendor's own CLI may keep besides its fixed names: credential-shaped variables with these prefixes. A Claude route on
 # Bedrock or Vertex also keeps that cloud's credentials, found by the switch that turns it on.
 FAMILIES = {"claude": ("ANTHROPIC_", "CLAUDE_CODE_OAUTH_", "AWS_BEARER_TOKEN_BEDROCK"), "codex": ("OPENAI_", "CODEX_", "AZURE_OPENAI_"),
-            "gemini": ("GEMINI_", "GOOGLE_"), "deepseek": ("DEEPSEEK_",)}
+            "gemini": ("GEMINI_", "GOOGLE_"), "antigravity": ("GEMINI_", "GOOGLE_"), "deepseek": ("DEEPSEEK_",)}
 CLOUDS = {"CLAUDE_CODE_USE_BEDROCK": "AWS_", "CLAUDE_CODE_USE_VERTEX": "GOOGLE_APPLICATION_"}
 
 

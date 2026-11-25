@@ -10,6 +10,7 @@ from statistics import median
 
 from .safety import atomic_write, redact
 from .checks import observed_pass
+from .store import CLOCK_EVENTS, run_clock, with_ledger
 
 
 def failure_excerpt(path, size=3600):
@@ -38,19 +39,16 @@ def failure_excerpt(path, size=3600):
 
 
 def budget_status(spec, state, now=None):
+    """What a run has used against its budgets. max_seconds is spent in active time: the time since the run started less the stretches it sat
+    blocked or paused (the ledger in `state`; see store.run_clock). `time` shows wall and active time side by side."""
     limits = spec.get("budgets", {})
-    elapsed = None
+    wall = active = 0.0
     if state.get("started_at"):
-        elapsed = max(
-            0,
-            (
-                (now or datetime.now(timezone.utc)) - datetime.fromisoformat(state["started_at"])
-            ).total_seconds(),
-        )
+        wall, active = run_clock(state, now or datetime.now(timezone.utc))
     used = {
         "max_calls": state.get("provider_calls", 0),
         "max_observed_tokens": state.get("observed_tokens", 0),
-        "max_seconds": round(elapsed or 0, 3),
+        "max_seconds": round(active, 3),
     }
     return {
         "used": used,
@@ -58,6 +56,7 @@ def budget_status(spec, state, now=None):
             key: max(0, round(limits[key] - value, 3)) for key, value in used.items() if key in limits
         },
         "limits": {key: limits[key] for key in used if key in limits},
+        "time": {"wall_seconds": round(wall, 3), "active_seconds": round(active, 3), "idle_seconds": round(wall - active, 3)},
         "unknown_usage_calls": state.get("usage_unknown_calls", 0),
         "call_in_progress": bool(state.get("pending_call")),
     }
@@ -76,9 +75,12 @@ def budget_report(store, run_id):
             stop = datetime.fromisoformat(row["state"]["started_at"]) + timedelta(
                 seconds=measured["elapsed_seconds"]
             )
-    result = budget_status(row["spec"], row["state"], stop)
+    # A run made by 0.19 keeps no ledger: its blocked and paused time is read from its events, without saving anything.
+    state = with_ledger(row["state"], store.events(run_id, limit=None, kinds=CLOCK_EVENTS)) if row["state"].get("started_at") else row["state"]
+    result = budget_status(row["spec"], state, stop)
     if row["state"]["phase"] in ("done", "blocked") and stop is None:
         result["used"]["max_seconds"] = None
+        result["time"] = None
         if "max_seconds" in result["remaining"]:
             result["remaining"]["max_seconds"] = None
     return {"run_id": run_id, **result}

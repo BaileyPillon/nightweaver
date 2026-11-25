@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 
 
-IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "command"}
+IMPLEMENTERS = {"codex", "claude", "deepseek", "gemini", "antigravity", "command"}
 REVIEWERS = IMPLEMENTERS
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -108,6 +108,24 @@ def text(obj, key):
     return obj[key].strip()
 
 
+# Reasoning levels agy accepts per model (`agy models` and agy's own 'has no "xhigh" effort' errors, agy 1.5.15, 2026-11): Gemini 4 Neon and
+# Hydrogen reach xhigh, Carbon and Argon stop at high, the 3.x Flash models take low to high and 3.1 Pro only low and high, so no listed
+# model takes max. With no --model agy uses gemini-3.1-pro. A model not listed (a Claude one that a signed-in account may offer) is left
+# to agy, which names the levels it takes.
+EFFORT_SLUG = re.compile(r"-(low|medium|high|xhigh|max)$", re.I)  # agy reads a model in any case, as AGY_LEVELS does
+ALL_LEVELS = ("low", "medium", "high", "xhigh", "max")
+AGY_LEVELS = ((re.compile(r"gemini-4-(?:neon|hydrogen)\b"), ("low", "medium", "high", "xhigh")),
+              (re.compile(r"gemini-4-(?:carbon|argon)\b"), ("low", "medium", "high")),
+              (re.compile(r"gemini-3\.\d+-flash\b"), ("low", "medium", "high")),
+              (re.compile(r"gemini-3\.1-pro\b"), ("low", "high")))
+AGY_DEFAULT_MODEL = "gemini-3.1-pro"
+
+
+def antigravity_levels(model):
+    name = EFFORT_SLUG.sub("", re.sub(r"^models/", "", model.strip().lower())) if isinstance(model, str) and model.strip() else AGY_DEFAULT_MODEL
+    return next((levels for pattern, levels in AGY_LEVELS if pattern.match(name)), ALL_LEVELS)
+
+
 def provider(value, choices, label, relative_to=None):
     fields(value, "kind argv executable model effort api_key api_key_file oauth_token_file profile_dir unavailable_exit_code inherit_credentials", label)
     if not isinstance(value, dict) or value.get("kind") not in choices:
@@ -134,13 +152,25 @@ def provider(value, choices, label, relative_to=None):
         out["executable"] = text(value, "executable")
     if value.get("model"):
         out["model"] = text(value, "model")
+    slug = EFFORT_SLUG.search(out.get("model", "")) if value["kind"] == "antigravity" else None
     if "effort" in value:
         levels = {"claude": ("low", "medium", "high", "xhigh", "max"),
                   "codex": ("low", "medium", "high", "xhigh", "max", "ultra"),
-                  "deepseek": ("low", "high", "max")}
+                  "deepseek": ("low", "high", "max"),
+                  "antigravity": antigravity_levels(value.get("model"))}
         if value["effort"] not in levels.get(value["kind"], ()):
-            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}")
+            hint = {"gemini": ". The Gemini CLI has no effort setting; use the antigravity kind for Gemini 4 reasoning levels",
+                    "antigravity": (f" for model {value['model']}, which accepts {', '.join(levels['antigravity'])}" if value.get("model") else
+                                    f" for agy's default model {AGY_DEFAULT_MODEL}, which accepts {', '.join(levels['antigravity'])}; "
+                                    "name a model, such as gemini-4-neon, to use another level")}
+            raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}" + hint.get(value["kind"], ""))
+        if slug and slug.group(1).lower() != value["effort"]:
+            raise ValueError(f"The antigravity model {value['model']} already names effort {slug.group(1).lower()}; "
+                             f"drop the suffix from the model or set effort to {slug.group(1).lower()}, not {value['effort']}")
         out["effort"] = value["effort"]
+    if slug and slug.group(1).lower() not in antigravity_levels(value["model"]):  # a slug names a level its model does not have
+        raise ValueError(f"Unsupported effort for antigravity: the model {value['model']} names {slug.group(1).lower()}, but "
+                         f"{EFFORT_SLUG.sub('', value['model'])} accepts {', '.join(antigravity_levels(value['model']))}")
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
     if value.get("api_key_file"):
@@ -155,6 +185,8 @@ def provider(value, choices, label, relative_to=None):
         profile = ((relative_to or Path.cwd()) / Path(text(value, "profile_dir")).expanduser()).resolve()
         if value["kind"] == "command":
             raise ValueError("profile_dir is supported by model providers")
+        if value["kind"] == "antigravity":
+            raise ValueError("The antigravity adapter keeps its sign-in in the CLI's own store and has no profile_dir")
         out["profile_dir"] = str(profile)
     return out
 
@@ -340,6 +372,8 @@ def validate(raw, relative_to=None, store=None):
     milestones = array(raw.get("milestones", []), "milestones", 50)
     steps = []
     retained = []
+    kept = []  # checks retained "subsequent" from a milestone that is not the last: every later milestone passes them, a pursuit's new waves too
+    last_own = []
     for index, item in enumerate(milestones):
         fields(item, "title task gates paths worker worker_fallbacks retain_gates", "milestone")
         own = [gate_spec(g) for g in array(item.get("gates", []), "milestone gates")]
@@ -376,6 +410,9 @@ def validate(raw, relative_to=None, store=None):
             steps[-1]["retained_from"] = inherited
         if retention != "local":
             retained.extend((g, retention, steps[-1]["title"]) for g in own)
+            if retention == "subsequent" and index < len(milestones) - 1:
+                kept.extend(g["name"] for g in own)
+        last_own = [g["name"] for g in own]
     if not steps:
         raise ValueError("At least one milestone is required")
     out = {"schema_version": 1, "repository": str(repository), "title": text(raw, "title"), "objective": text(raw, "objective"),
@@ -398,10 +435,11 @@ def validate(raw, relative_to=None, store=None):
     if "git_timeout" in raw:
         out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
     retry = raw.get("retry", {})
-    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds", "retry")
+    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds gate_timeout_retries", "retry")
     defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3,
-                "max_parks": 8, "max_park_seconds": 21600}
-    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800)}
+                "max_parks": 8, "max_park_seconds": 21600, "gate_timeout_retries": 1}
+    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800),
+              "gate_timeout_retries": (0, 3)}  # a gate that times out is run again this many times, each with twice the time; 0 blocks at once, as 0.19 did
     out["retry"] = {key: integer(retry.get(key, value), key, *limits.get(key, (0, 20))) for key, value in defaults.items()}
     if "repair" in raw:
         from .repair import policy
@@ -428,6 +466,12 @@ def validate(raw, relative_to=None, store=None):
         out["reviewer"] = provider(raw["reviewer"], REVIEWERS, "reviewer", relative_to)
     if "pursue" in raw:
         out["pursue"] = pursuit(raw["pursue"], relative_to, out["acceptance"])
+        # Written by 0.19.1 on (a pursuit plan without it was made by 0.19: see pursuit.legacy_final). The checks every milestone of a new wave
+        # passes are the plan's `gates` and those retained "subsequent"; the rest of the last milestone's checks (final_gates, checks retained
+        # "final", checks only the last milestone owns) bind only the last milestone of a wave. A one-milestone plan has nothing to compare:
+        # its own checks stay per-milestone.
+        each = {g["name"] for g in gates} | set(kept) | (set(last_own) if len(steps) == 1 else set())
+        out["final_checks"] = [g["name"] for g in steps[-1]["gates"] if g["name"] not in each]
         if "explore" in out["pursue"]:
             out["pursue"]["explore"].setdefault("workers", [dict(steps[0]["worker"])])
     if "advisory_ollama" in raw:

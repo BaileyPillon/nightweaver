@@ -8,8 +8,8 @@ import shutil
 from tempfile import mkdtemp
 
 from . import context
-from .checks import contract_hash, observed_pass, run_gate
-from .engine import common_dir, git, tail, verify_registered_repository
+from .checks import contract_hash, observed_pass
+from .engine import common_dir, git, tail, timed_out_for_good, timeout_issue, verify_registered_repository
 from .insights import budget_status, failure_excerpt
 from .process import PausedRun
 from .repair import describe
@@ -94,9 +94,16 @@ def slot(parent, number):
     return folder
 
 
+class Unscored(ValueError):
+    """A ledger check the controller ended at its time limit for good. It says nothing about the build, so the judgment waits: raised to the
+    run loop, which blocks the run in the phase that was running (judging, or rescuing) with this text, for --retry or a longer plan."""
+
+
 def ledger(run, state, path, folder, tree, milestones=None):
     """Re-run every distinct check that applies to the finished build on it: those of the final milestone, which holds the plan's checks, its
-    final checks and the checks retained from earlier milestones, but not a check local to an earlier milestone (or those of `milestones`)."""
+    final checks and the checks retained from earlier milestones, but not a check local to an earlier milestone (or those of `milestones`).
+    A check that times out is run again with more time, as in a verification. One that times out for good raises Unscored: it is not a failed
+    check, so no row is made for it and the build is not judged on a guess."""
     seen, checks = set(), []
     for milestone in milestones or run.spec["milestones"][-1:]:
         for check in milestone["gates"]:
@@ -110,10 +117,10 @@ def ledger(run, state, path, folder, tree, milestones=None):
             raise PausedRun()
         out = slot(folder, number)
         baseline = run.spec.get("proof_base", base) if "proof" in check else base
-        receipt = run_gate(check, path, out, tree, paused=run.paused,
-                           **({"baseline": baseline} if check.get("kind") == "catalog" or "proof" in check else {}),
-                           max_log_bytes=run.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
-                           heartbeat=lambda info: run.set("process_heartbeat", {**info, "role": "gate"}))
+        # A check that runs out of time is run again with twice the time (engine.Run.run_timed_gate), as in a verification.
+        receipt, out = run.run_timed_gate(check, path, out, tree, {"wave": state.get("wave", 1), "ledger_index": number},
+                                          lambda: slot(folder, number), baseline)
+        unscored = timeout_issue(check, receipt) if timed_out_for_good(receipt) else None  # before the receipt is amended below
         receipt.update(wave=state.get("wave", 1), ledger_index=number)
         log = out / "gate.log"
         if log.is_file() or observed_pass(receipt) is not None:
@@ -128,6 +135,8 @@ def ledger(run, state, path, folder, tree, milestones=None):
         if "proof" in receipt:
             receipt["proof"]["passed"] = observed_pass(receipt) is True
         run.set("judge_gate_finished", receipt)
+        if unscored:
+            raise Unscored(unscored)
         passed = observed_pass(receipt)
         row = {"name": check["name"], "passed": passed is True, "log": str(log)}
         if passed is not True:
@@ -683,9 +692,76 @@ def inherited_paths(milestones):
     return list(dict.fromkeys(path for step in milestones for path in step["paths"]))
 
 
+def legacy_final(plan):
+    """The names of the checks only the last milestone of `plan` (the milestones its author wrote, no wave) passes, for a pursuit made by 0.19,
+    which recorded none (`final_checks`). The per-milestone checks are the plan's own and those retained to a milestone that is not the last;
+    everything else on the last milestone (its final_gates, the checks retained "final", the checks only it owns) is final. A one-milestone
+    plan gives nothing to compare with, so all its checks stay per-milestone, as 0.19 had it.
+
+    Retention is read from each milestone's retained_from. A check retained from a milestone before the penultimate one reaches a milestone
+    that is not the last, so it is per-milestone. One owned by the penultimate milestone reaches only the last one, where "final" and
+    "subsequent" leave the same record; it is taken as final, so a wave's early milestones are never held to a check the plan only promised
+    for the end (a stuck run is worse than a check enforced on the wave's last milestone alone)."""
+    early, last = plan[:-1], plan[-1]
+    if not early:
+        return []
+    retained = {name for step in plan for name in step.get("retained_from", {})}
+    reaching = {name for step in early for name in step.get("retained_from", {})}
+    each = [g for g in last["gates"] if g["name"] in reaching or (g["name"] not in retained and all(g in step["gates"] for step in early))]
+    return [g["name"] for g in last["gates"] if g not in each]
+
+
+def wave_gates(spec):
+    """(each, final): the checks every milestone of a new wave passes, and those only the wave's last milestone passes in addition (the plan's
+    final_gates, the checks retained to its final milestone and the checks only its last milestone owns: spec.final_checks). Together they are
+    the gates of the current last milestone. A spec without final_checks was made by 0.19 and has had no wave planned (settle_gates records
+    the split when a run starts), so it is derived from its milestones as the plan."""
+    milestones = spec["milestones"]
+    names = spec["final_checks"] if "final_checks" in spec else legacy_final(milestones)
+    last = milestones[-1]
+    return [g for g in last["gates"] if g["name"] not in names], [g for g in last["gates"] if g["name"] in names]
+
+
+def settle_gates(run):
+    """Bring a pursuit made by 0.19 to the 0.19.1 rules when it starts again. 0.19 recorded no final_checks and gave every milestone of a wave
+    the last milestone's checks, final-only ones included, so a wave's early milestone could never pass (a freeze-only step cannot meet 'every
+    study has result.json') and `retry` failed the same way. This records the split and takes the final-only checks off the milestones of
+    planned waves that are not yet built, except each wave's last, which keeps every check. Built milestones are history and stay as they ran."""
+    row = run.store.get(run.id)
+    spec, state = row["spec"], row["state"]
+    run.spec = spec
+    if not spec.get("pursue") or "final_checks" in spec:
+        return
+    milestones = spec["milestones"]
+    waves = [e["details"] for e in run.store.events(run.id, limit=None, kinds=["wave_planned"])]
+    names = legacy_final(milestones[:waves[0]["first_step"] - 1] if waves else milestones)
+    changed = {}
+    for wave in waves:
+        first = wave["first_step"] - 1
+        if [m["title"] for m in milestones[first:first + len(wave["titles"])]] != wave["titles"]:
+            continue  # the record and the plan disagree: leave that wave alone
+        for index in range(max(first, state["step"]), first + len(wave["titles"]) - 1):
+            kept = [g for g in milestones[index]["gates"] if g["name"] not in names]
+            if kept and len(kept) < len(milestones[index]["gates"]):
+                changed[index] = kept
+
+    def record(spec):
+        spec["final_checks"] = names
+        for index, gates in changed.items():
+            spec["milestones"][index]["gates"] = gates
+
+    run.store.revise_spec(run.id, record, "gates_split", {"final_checks": names, "steps": [index + 1 for index in sorted(changed)]},
+                          **({"verification_batch": None} if state["step"] in changed else {}))  # samples of the old check list no longer match
+    run.spec = run.store.get(run.id)["spec"]
+
+
+def listed(gates):
+    return "\n".join("- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in gates)
+
+
 def plan_prompt(run, state, room):
     pursue, wave = run.spec["pursue"], state.get("wave", 1)
-    last = run.spec["milestones"][-1]
+    each, final = wave_gates(run.spec)
     allowed = inherited_paths(run.spec["milestones"])
     protected = run.spec.get("protected_paths", [])
     events = run.store.events(run.id, limit=None, kinds=["goal_judged"])
@@ -707,8 +783,9 @@ def plan_prompt(run, state, room):
         f"scored {judged.get('score', '?')}/100, best {state.get('best_score', '?')}/100\nUnmet criteria\n{unmet}",
         (state.get("pursuit_note") + "\n\n" if state.get("pursuit_note") else "") + f"Gaps to close, most important first\n{gaps}",
         f"Checks that failed on the current build\n{failures}",
-        "Checks every new milestone must pass; the controller runs these exact checks\n" + "\n".join(
-            "- " + g["name"] + ": " + json.dumps(g, ensure_ascii=False) for g in last["gates"]),
+        "Checks every new milestone must pass; the controller runs these exact checks\n" + listed(each or final)
+        + ("\n\nChecks the last milestone you plan must also pass. They hold for the finished build, so do not require them of an earlier one\n"
+           + listed(final) if each and final else ""),
         "Every new milestone is confined to these paths; the controller rejects a change outside them, so plan only work that fits\n"
         f"Allowed paths: {', '.join(allowed) or 'any file in the repository'}\n"
         f"Protected paths (no milestone may change them): {', '.join(protected) or 'none declared'}",
@@ -748,6 +825,8 @@ def plan_wave(run, state):
     room = min(run.spec["pursue"]["wave_size"], MAX_MILESTONES - len(run.spec["milestones"]))
     if room < 1:
         return milestone_limit(run, state, wave)
+    if not wave_gates(run.spec)[0]:
+        room = 1  # every check is a final one: a milestone before the last would pass nothing, so the wave is one milestone, as in the first plan
     path = worktree(run, state)
     folder = judge_dir(run, wave)
     log = folder / f"plan-{state.get('provider_calls', 0) + 1:04d}.jsonl"
@@ -763,8 +842,9 @@ def plan_wave(run, state):
         return
     last = run.spec["milestones"][-1]
     paths = inherited_paths(run.spec["milestones"])
-    steps = [{**item, "gates": last["gates"], "paths": paths, "worker": last["worker"],
-              "worker_fallbacks": last["worker_fallbacks"]} for item in planned]
+    each = wave_gates(run.spec)[0]  # the wave's last milestone passes the final checks as well, so it keeps every check of the plan's last
+    steps = [{**item, "gates": last["gates"] if number == len(planned) else each, "paths": paths, "worker": last["worker"],
+              "worker_fallbacks": last["worker_fallbacks"]} for number, item in enumerate(planned, 1)]
     drop_worktree(run, state)
     run.store.extend_plan(run.id, steps, {"wave": wave + 1, "titles": [s["title"] for s in steps], "planner": describe(config),
                                           **({"conflicts": conflicts} if conflicts else {})},

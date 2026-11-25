@@ -11,8 +11,9 @@ from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 from uuid import uuid4
 
-from .engine import source_info
-from .providers import ProviderUnavailable, advisory, check_provider, claude_auth, describe_provider, invoke
+from .engine import identity_error, source_info
+from .providers import (ProviderUnavailable, advisory, antigravity_report, check_provider, claude_auth, describe_provider, gemini_auth,
+                        invoke)
 
 
 def check_route(store, config, cwd, live):
@@ -22,6 +23,10 @@ def check_route(store, config, cwd, live):
             result["auth"] = claude_auth(config)[1]  # the source only; the token itself is never reported
         except ProviderUnavailable:
             result["auth"] = "oauth_token_file"
+    if config["kind"] == "antigravity":
+        result.update(antigravity_report(config, cwd))  # version, how it signs in and whether it is; the sign-in itself is never read
+    if config["kind"] == "gemini":
+        result["auth"] = gemini_auth(config)
     try:
         result["executable"] = check_provider(config, cwd)
     except ProviderUnavailable as error:
@@ -30,7 +35,10 @@ def check_route(store, config, cwd, live):
     if config["kind"] == "command":
         return {**result, "status": "configured", "action": "Executable found. Custom commands are checked during the run."}
     if not live:
-        return {**result, "status": "configured", "action": "Use --live to verify model access."}
+        hint = (" No Gemini credential was found: set GEMINI_API_KEY or sign in with the CLI." if result.get("auth") == "none_found" else
+                " GEMINI_API_KEY is set, but agy ignores it without \"modelProvider\": \"gemini\" in its settings.json, so this route runs "
+                "on agy's own sign-in." if result.get("api_key_ignored") else "")
+        return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
     try:
@@ -155,6 +163,12 @@ def browser_readiness():
     return {**result, "status": "unavailable", "action": f"Install a browser: {hint}, or install Microsoft Edge or Google Chrome"}
 
 
+def identity_readiness(repository):
+    """Whether git can author the commits Nightweaver makes in the repository: promotion stops with 'Author identity unknown' otherwise."""
+    problem = identity_error(repository)
+    return {"status": "blocked", "action": problem} if problem else {"status": "ready"}
+
+
 def diagnose(store, spec=None, planner=None, live=False):
     report = {"data_directory": str(store.root),
               "executables": {key: shutil.which(key) for key in ("git", "claude", "codex", "gemini", "ollama")},
@@ -164,6 +178,7 @@ def diagnose(store, spec=None, planner=None, live=False):
     roles = []
     if spec:
         report["source"] = source_info(store, spec)
+        report["identity"] = identity_readiness(report["source"]["repository"])
         if "project" in spec:
             report["source"]["project"] = spec["project"]
         roles = [(f"worker {index}: {step['title']}", step["worker"])

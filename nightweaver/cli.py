@@ -11,7 +11,7 @@ import threading
 import time
 from uuid import uuid4
 
-from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, source_info
+from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, require_identity, source_info
 from .process import BusyRun, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
 from .readiness import diagnose
@@ -104,6 +104,22 @@ def background(store, run_id, retry, restarts=None):
     return child.pid
 
 
+def read_objective(path):
+    """The text of an objective file: UTF-8, nonempty, at most 1 MB. It exists because Windows caps a command line at 32,767 characters."""
+    path = Path(path).expanduser()
+    try:
+        if path.stat().st_size > 1000000:
+            raise ValueError(f"The objective file exceeds 1MB: {path}")
+        objective = path.read_text(encoding="utf-8-sig").strip()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"The objective file must be UTF-8 text: {path}") from error
+    except OSError as error:
+        raise ValueError(f"Cannot read the objective file {path}: {error}") from error
+    if not objective:
+        raise ValueError(f"The objective file is empty: {path}")
+    return objective
+
+
 def plan_goal(store, args, template=None):
     if template is None:
         path = Path(args.template).resolve(strict=True)
@@ -112,6 +128,8 @@ def plan_goal(store, args, template=None):
         raw, folder = template, Path(template["repository"])
     anchor_provider_paths(raw, folder)
     repository, project = resolve_repository(raw, folder, store)
+    if args.start or args.enqueue:
+        require_identity(repository)  # before the planner call: promotion would otherwise stop at the first accepted milestone
     raw["repository"] = str(repository)
     if project:
         raw["project"] = project["name"]
@@ -255,7 +273,7 @@ def route_config(kind, profile, model, effort, label, choices=IMPLEMENTERS):
     return provider(config, choices, label)
 
 
-EXPLORERS = ("codex", "claude", "deepseek", "gemini")
+EXPLORERS = ("codex", "claude", "deepseek", "gemini", "antigravity")
 
 
 def explore_kinds(args):
@@ -286,6 +304,8 @@ def pursuit_block(args):
 
 
 def register(store, spec, args):
+    if args.start or args.enqueue:
+        require_identity(Path(spec["repository"]))
     run_id = create_run(store, spec, enqueue=args.enqueue, after=args.after)
     result = {"run_id": run_id}
     if args.start:
@@ -347,11 +367,13 @@ def main(argv=None):
     add.add_argument("plan")
     goal = commands.add_parser("goal", help="Turn one goal into an ordered plan using an authenticated CLI")
     goal.add_argument("template")
-    goal.add_argument("objective")
     one = commands.add_parser("oneshot", help="Build and verify a goal from a repository's committed tests")
     one.add_argument("repository", type=Path)
-    one.add_argument("objective")
-    one.add_argument("--worker", choices=("codex", "claude", "gemini", "deepseek"), default="codex")
+    for parser in (goal, one):
+        parser.add_argument("objective", nargs="?", help="The goal in one argument (or give --objective-file)")
+        parser.add_argument("--objective-file", type=Path, metavar="PATH",
+                            help="Read the objective from this UTF-8 file instead of the command line, which Windows limits to 32,767 characters")
+    one.add_argument("--worker", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), default="codex")
     one.add_argument("--model", help="Model for the primary worker and planner")
     one.add_argument("--effort", help="Reasoning effort for the primary worker and planner")
     one.add_argument("--python", type=Path, help="Python executable with the target repository's test dependencies")
@@ -359,20 +381,20 @@ def main(argv=None):
                      help="The goal is a web page, so a new repository gets a browser smoke check (default: judged from the objective)")
     one.add_argument("--profile-dir", help="Signed-in CLI profile for the primary worker and planner")
     one.add_argument("--expected-base", help="Require this exact previewed Git commit before launching")
-    one.add_argument("--rescue", choices=("codex", "claude", "gemini", "deepseek"), help="Alternate worker after a rejected attempt")
+    one.add_argument("--rescue", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Alternate worker after a rejected attempt")
     one.add_argument("--rescue-profile", help="Signed-in CLI profile for the alternate")
     one.add_argument("--direct", action="store_true", help="Use the objective as one milestone and skip the planner call")
-    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "deepseek"), help="Review every milestone with this provider")
+    one.add_argument("--reviewer", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Review every milestone with this provider")
     one.add_argument("--reviewer-model")
     one.add_argument("--reviewer-effort")
     one.add_argument("--reviewer-profile", help="Signed-in CLI profile for the milestone reviewer")
     one.add_argument("--pursue", action="store_true", help="Keep judging and planning further waves until the goal is met or progress stops")
-    one.add_argument("--judge", choices=("codex", "claude", "gemini", "deepseek"),
+    one.add_argument("--judge", choices=("codex", "claude", "gemini", "antigravity", "deepseek"),
                      help="Independent goal judge (default: a different model family from the worker)")
     one.add_argument("--judge-model")
     one.add_argument("--judge-effort")
     one.add_argument("--judge-profile", help="Signed-in CLI profile for the judge")
-    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "deepseek"), help="Wave planner (default: the judge)")
+    one.add_argument("--planner-kind", choices=("codex", "claude", "gemini", "antigravity", "deepseek"), help="Wave planner (default: the judge)")
     one.add_argument("--planner-model")
     one.add_argument("--planner-effort")
     one.add_argument("--planner-profile")
@@ -383,7 +405,7 @@ def main(argv=None):
     one.add_argument("--explore", type=int, metavar="N",
                      help="Before milestone 1, build N divergent design directions, compare them and keep the winner (2 to 4; requires --pursue)")
     one.add_argument("--explore-workers", metavar="KIND[,KIND...]",
-                     help="Workers that build the directions in turn: codex, claude, deepseek or gemini (default: the primary worker)")
+                     help="Workers that build the directions in turn: codex, claude, deepseek, gemini or antigravity (default: the primary worker)")
     one.add_argument("--rescue-strategies", type=int, metavar="N",
                      help="When progress stalls, try N divergent strategies from the best build (2 to 4, default 3; 0 turns the rescue off; requires --pursue)")
     launch_one = one.add_mutually_exclusive_group()
@@ -434,7 +456,7 @@ def main(argv=None):
     doctor.add_argument("--plan", help="Check the exact provider routes in a plan")
     doctor.add_argument("--live", action="store_true", help="Make a small model request per distinct provider route")
     for parser in (goal, doctor):
-        parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini"), default="claude" if parser is goal else None)
+        parser.add_argument("--planner", choices=("claude", "codex", "deepseek", "gemini", "antigravity"), default="claude" if parser is goal else None)
         parser.add_argument("--profile-dir")
         parser.add_argument("--model", help="Model used by the planner")
         parser.add_argument("--effort", help="Reasoning effort used by the planner")
@@ -612,7 +634,7 @@ def main(argv=None):
     fork = commands.add_parser("fork", help="Start a new run from an accepted checkpoint")
     fork.add_argument("id")
     fork.add_argument("--milestone", type=int, required=True)
-    fork.add_argument("--worker", choices=("codex", "claude", "deepseek", "gemini"))
+    fork.add_argument("--worker", choices=("codex", "claude", "deepseek", "gemini", "antigravity"))
     issue = commands.add_parser("issue", help="Import one GitHub issue into a local plan")
     issue.add_argument("template")
     issue.add_argument("--repo", required=True)
@@ -689,6 +711,11 @@ def main(argv=None):
         p.add_argument("--project")
         p.add_argument("--phase", choices=("queued","ready","working","checking","reviewing","promoting","exploring","judging","rescuing","planning","done","blocked"))
     args = app.parse_args(argv)
+    if args.command in ("goal", "oneshot"):
+        if args.objective is not None and args.objective_file is not None:
+            app.error("--objective-file cannot be combined with an objective argument")
+        if args.objective is None and args.objective_file is None:
+            app.error("give the objective as an argument or with --objective-file")
     if args.command == "goal" and args.prompt_only and (args.start or args.enqueue):
         app.error("--prompt-only previews a goal and cannot launch it")
     if args.command in ("add", "goal") and args.after and not args.enqueue:
@@ -730,6 +757,8 @@ def main(argv=None):
         print("Nightweaver's native process runner requires Windows.", file=sys.stderr)
         return 1
     try:
+        if getattr(args, "objective_file", None) is not None:
+            args.objective = read_objective(args.objective_file)
         if args.command in ("db-backup", "db-check"):
             from .diagnostics import database_backup, database_check
             database = Path(args.home or default_home()) / "runs.sqlite3"
@@ -773,6 +802,8 @@ def main(argv=None):
             from .discovery import discover, verify_tools, web_goal
             if args.rescue_profile and not args.rescue:
                 raise ValueError("--rescue-profile requires --rescue")
+            if not args.preview:
+                require_identity(args.repository.expanduser().resolve())  # refuse before any model call, not at the first promotion
             args.planner = args.worker
             worker = planner_route(args)
             alternate = {"kind": args.rescue} if args.rescue else None
@@ -803,7 +834,9 @@ def main(argv=None):
             output(result)
             return launch_exit(result)
         if name == "wish":
-            from .wish import run_wish
+            from .wish import resolve, run_wish
+            if args.start:
+                require_identity(resolve(store, args.target)[0])  # before the brief writer's model call
             return run_wish(store, args)
         if name in ("preflight", "replay-browser", "replay-checks"):
             from .diagnostics import preflight, replay_checks
@@ -816,6 +849,9 @@ def main(argv=None):
             report = diagnose(store, read_plan(args.plan, store) if args.plan else None,
                               planner_route(args) if args.planner else None, args.live)
             output(report)
+            if report.get("identity", {}).get("status") == "blocked":
+                print(f"Nightweaver: {report['identity']['action']}", file=sys.stderr)
+                return 3
             return 3 if any(route["status"] in {"blocked", "unverified"} for route in report.get("providers", [])) else 0
         elif name == "project":
             if args.project_action == "list":
