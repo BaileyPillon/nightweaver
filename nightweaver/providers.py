@@ -365,34 +365,58 @@ def agy_run(executable, env, *args, timeout=30):
     return done.returncode, done.stdout + done.stderr
 
 
+def antigravity_settings():
+    """agy's own settings.json as a dict ({} when it is absent or unreadable). Only its modelProvider is ever looked at."""
+    try:
+        found = json.loads((Path.home() / ".gemini" / "antigravity-cli" / "settings.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def antigravity_key(env):
+    return any(str(env.get(name) or "").strip() for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+
+
 def antigravity_source(env):
-    """How an agy route signs in, judged from its environment: an API key, Application Default Credentials or the CLI's own login."""
-    given = {name.upper(): str(value).strip() for name, value in env.items()}
-    if given.get("GEMINI_API_KEY") or given.get("GOOGLE_API_KEY"):
+    """How an agy route signs in. A key in the environment does nothing by itself: agy uses it only when its settings.json says
+    "modelProvider": "gemini" (observed with agy 1.5.15: with the variable alone it prints a sign-in link and waits a minute for a code).
+    Otherwise it is Application Default Credentials (AGY_ADC_AUTH) or the CLI's own browser login."""
+    if antigravity_settings().get("modelProvider") == "gemini":
         return "api_key"
+    given = {name.upper(): str(value).strip() for name, value in env.items()}
     return "adc" if given.get("AGY_ADC_AUTH", "").lower() in ("1", "true", "yes", "on") else "cli_login"
 
 
 def antigravity_login(executable):
     """Stop a call that would sign in on its own. Signed out, agy prints an OAuth link and waits a minute for a code that a
-    headless run can never give, so `agy models` (exit 1, "Please sign in") is asked first. An API key or ADC route is not checked:
-    which of those agy actually uses depends on its settings.json, so it is left to the call and its error text."""
+    headless run can never give, so `agy models` (exit 1, "Please sign in") is asked first, also when only GEMINI_API_KEY is set,
+    because the key counts only with "modelProvider": "gemini" in settings.json. A route that selects the Gemini API there is
+    checked for its key instead, and an ADC route is left to the call, which fails fast with "authentication required"."""
     env = scrub_env(os.environ, own_credentials("antigravity", os.environ))
-    if antigravity_source(env) != "cli_login" or monotonic() - AGY_SIGNED_IN.get(executable, -1e9) < 300:
+    source = antigravity_source(env)
+    if source == "api_key" and not antigravity_key(env):
+        raise ProviderUnavailable("agy's settings.json selects the Gemini API (\"modelProvider\": \"gemini\"), but neither GEMINI_API_KEY "
+                                  "nor GOOGLE_API_KEY is set in this process. Set one in the environment Nightweaver runs in, or remove "
+                                  "modelProvider to use agy's own login. Then resume this run with --retry.", "authentication")
+    if source != "cli_login" or monotonic() - AGY_SIGNED_IN.get(executable, -1e9) < 300:
         return
     code, output = agy_run(executable, env, "models")
     if code == 0:
         AGY_SIGNED_IN[executable] = monotonic()
     elif code is not None and SIGNED_OUT.search(output):
-        raise ProviderUnavailable("The Antigravity CLI is not signed in. Run agy once and sign in with the Google account that has the "
-                                  "model (Gemini 4 Neon needs Google AI Pro or Ultra), or use an API key: set GEMINI_API_KEY and "
-                                  "\"modelProvider\": \"gemini\" in ~/.gemini/antigravity-cli/settings.json. Then resume this run "
+        ignored = (" GEMINI_API_KEY is set, but agy ignores it unless settings.json has \"modelProvider\": \"gemini\"; without that it "
+                   "waits for a browser sign-in." if antigravity_key(env) else "")
+        raise ProviderUnavailable("The Antigravity CLI is not signed in." + ignored + " Run agy once and sign in with the Google account "
+                                  "that has the model (Gemini 4 Neon needs Google AI Pro or Ultra), or use an API key: set GEMINI_API_KEY "
+                                  "and \"modelProvider\": \"gemini\" in ~/.gemini/antigravity-cli/settings.json. Then resume this run "
                                   "with --retry.", "authentication")
 
 
 def antigravity_report(config, cwd):
     """What doctor shows for an agy route besides its executable: version, how it signs in, whether it is signed in (None when agy
-    could not say) and, when signed in and the route names a model, whether `agy models` lists it. Never a secret."""
+    could not say), whether a key in the environment is being ignored and, when signed in and the route names a model, whether
+    `agy models` lists it. Never a secret."""
     executable = find_executable(config, cwd)
     if not executable:
         return {}
@@ -401,6 +425,8 @@ def antigravity_report(config, cwd):
     code, listing = agy_run(executable, env, "models")
     report = {"auth": antigravity_source(env), "version": (version.strip().splitlines() or [None])[0],
               "signed_in": True if code == 0 else False if code is not None and SIGNED_OUT.search(listing) else None}
+    if report["auth"] != "api_key" and antigravity_key(env):
+        report["api_key_ignored"] = True  # GEMINI_API_KEY is set, but settings.json does not select the Gemini API
     if report["signed_in"] and config.get("model"):
         report["model_listed"] = config["model"].strip().lower() in listing.lower()
     return report
@@ -520,9 +546,12 @@ def adapter(config, mode, session=None, images=()):
         # The task goes in on stdin as one stream-json user message. --print takes its prompt as a flag value and then ignores stdin
         # (and --input-format stream-json rejects a flag prompt), so a task of any length can only travel this way.
         # Writes are confined to the worktree by Nightweaver; accept-edits lets the worker edit files, and commands that need a
-        # review are soft-denied in a headless run, while every other mode is read-only plan mode.
-        argv = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
-                "--mode", "accept-edits" if mode == "worker" else "plan"]
+        # review are soft-denied in a headless run, while every other mode is read-only plan mode. agy applies --mode plan through
+        # slash command expansion: with --disable-slash-commands it prints "warning: --mode plan has no effect while slash command
+        # expansion is disabled" and runs in its default request-review mode (observed with agy 1.5.15). So only the worker, whose
+        # accept-edits mode is unaffected, keeps the flag that stops a task starting with "/" from being run as a command.
+        argv = [exe, "--input-format", "stream-json", "--output-format", "stream-json",
+                *(["--disable-slash-commands"] if mode == "worker" else []), "--mode", "accept-edits" if mode == "worker" else "plan"]
         if config.get("effort"):
             argv += ["--effort", config["effort"]]
         if model:
@@ -576,14 +605,25 @@ def adapter(config, mode, session=None, images=()):
     return argv, env
 
 
+AGY_FAILED_REASON = re.compile(r"error|time.?out|interrupt|cancel|abort|fail", re.I)
+
+
+def agy_failed(body):
+    """Whether an Antigravity result ends a failed call: a status other than SUCCESS, or a finished_reason that names an error, a
+    timeout or an interruption. The real error result has status ERROR and finished_reason "error"; a reason such as "stop" is not one."""
+    status, reason = str(body.get("status") or "").upper(), body.get("finished_reason")
+    return bool((status and status != "SUCCESS") or (reason and AGY_FAILED_REASON.search(str(reason))))
+
+
 def agy_stream(path, mode=None):
     """What an Antigravity `--output-format stream-json` log says: conversation id, final answer, usage, model and how the call ended.
 
-    PENDING LIVE VERIFICATION. Written from agy's docs, changelog and help text; no signed-in run has been seen yet, so every field
-    is read defensively and a missing one is simply absent. Events are {"event": "init" | "step_update" | "result", "<event>": {...}},
-    with the same fields accepted beside "event". The answer is the result's structured_output (a schema mode) or response, else
-    the text deltas of the last agent_response step. A result whose status is not SUCCESS, or that names a finished_reason such as
-    print_timeout, is a failed call. Returns {session, answer, usage, model, failed, status}."""
+    PENDING LIVE VERIFICATION of the success path. The init, step_update and error result shapes were captured from agy 1.5.15 (a call
+    that failed on a bad API key, tests/test_release_0191_gemini.py REAL_ERROR); no signed-in run has been seen, so the answer text
+    (response, structured_output, agent_response text_delta) is written from agy's docs and every field is read defensively: a missing
+    one is simply absent. Events are {"event": "init" | "step_update" | "result", "<event>": {...}}, with the same fields accepted
+    beside "event". The answer is the result's structured_output (a schema mode) or response, else the text deltas of the last
+    agent_response step. A result that agy_failed() calls failed is a failed call. Returns {session, answer, usage, model, failed, status}."""
     found = {"session": None, "answer": "", "usage": None, "model": None, "failed": False, "status": None}
     step, streamed = None, ""
     for event in json_events(path):
@@ -605,7 +645,7 @@ def agy_stream(path, mode=None):
             reply = (json.dumps(structured) if mode in SCHEMAS and isinstance(structured, dict) else
                      structured if mode in SCHEMAS and isinstance(structured, str) and structured.strip() else body.get("response"))
             found.update(status=status or None, usage=body.get("usage") if isinstance(body.get("usage"), dict) else found["usage"],
-                         failed=bool((status and status != "SUCCESS") or body.get("finished_reason")),
+                         failed=agy_failed(body),
                          answer=reply if isinstance(reply, str) and reply.strip() else streamed)
     found["answer"] = found["answer"] or streamed
     return found
@@ -862,7 +902,7 @@ def failure_parts(event):
     """The words in one stream event that a provider uses to report how a call ended or failed, or nothing for ordinary events."""
     if event.get("event") == "result" and "type" not in event:  # Antigravity: a result that is not SUCCESS (see agy_stream) carries the error
         body = event["result"] if isinstance(event.get("result"), dict) else event
-        if str(body.get("status") or "SUCCESS").upper() == "SUCCESS" and not body.get("finished_reason"):
+        if not agy_failed(body):
             return []
         error = body.get("error")
         return [*texts(error), *([json.dumps(error)] if isinstance(error, dict) else []), *texts(body.get("finished_reason"))]
@@ -904,17 +944,34 @@ def provider_errors(log, limit=12000):
 
 
 GOOGLE_KINDS = ("gemini", "antigravity")
+
+
+def http_code(*codes):
+    """How Google's failures state an HTTP status: the Gemini API's JSON "code": 429, agy's AGY_ERROR "error_code": 429 and the
+    "Error 429, Message: ..." text agy prints."""
+    return r"(?:\"(?:error_)?code\"\s*:\s*|\bError\s+)(?:" + "|".join(map(str, codes)) + r")\b"
+
+
 GOOGLE_AUTH = re.compile(r"please set an auth method|specify one of the following environment variables|authentication required|"
-                         r"not signed in|please sign in|sign in once with|api key (?:not valid|expired|invalid)|API_KEY_INVALID|"
-                         r"invalid api key|UNAUTHENTICATED|modelProvider is set to", re.I)
+                         r"authentication (?:failed|timed out)|not signed in|please sign in|sign in once with|api key (?:not valid|expired|invalid)|"
+                         r"API_KEY_INVALID|invalid api key|UNAUTHENTICATED|modelProvider is set to", re.I)
 GOOGLE_TRUST = re.compile(r"not running in a trusted directory|untrusted (?:workspace|folder|directory)|FatalUntrustedWorkspaceError", re.I)
-GOOGLE_LIMIT = re.compile(r"exhausted your (?:daily )?(?:quota|capacity)|RESOURCE_EXHAUSTED|quota will reset after|\"code\"\s*:\s*429|"
-                          r"exceeded your (?:current )?quota|daily quota|spend cap|prepaid credits|rate limit exceeded", re.I)
-GOOGLE_BUSY = re.compile(r"model is overloaded|high demand|\"status\"\s*:\s*\"UNAVAILABLE\"|\"code\"\s*:\s*50[234]", re.I)
-GOOGLE_MODEL = re.compile(r"requested entity was not found|\"code\"\s*:\s*404|is not found for API version|failed to resolve model|"
-                          r"unknown model|model not found|\"status\"\s*:\s*\"NOT_FOUND\"", re.I)
+# Gemini CLI's own capacity test is /exhausted your capacity|capacity exceeded|MODEL_CAPACITY_EXHAUSTED/ and it ends a 429 with
+# "Please wait and try again later. To increase your limits, request a quota increase through AI Studio".
+GOOGLE_LIMIT = re.compile(r"exhausted your (?:daily )?(?:quota|capacity)|RESOURCE_EXHAUSTED|MODEL_CAPACITY_(?:EXHAUSTED|EXCEEDED)|capacity exceeded|"
+                          r"no capacity available for model|quota will reset after|request a quota increase|exceeded your (?:current )?quota|"
+                          r"daily quota|spend cap|prepaid credits|rate limit exceeded|" + http_code(429), re.I)
+GOOGLE_BUSY = re.compile(r"model is overloaded|high demand|\"status\"\s*:\s*\"UNAVAILABLE\"|status:\s*UNAVAILABLE|" + http_code(502, 503, 504), re.I)
+# A key or account the service refuses: Gemini 4 Neon is paid-tier only, so a key without it gets a 403.
+GOOGLE_DENIED = re.compile(r"(?-i:PERMISSION_DENIED)|" + http_code(403), re.I)
+GOOGLE_MODEL = re.compile(r"requested entity was not found|is not found for API version|model not found|no model configuration is available|"
+                          r"\"status\"\s*:\s*\"NOT_FOUND\"|status:\s*NOT_FOUND|" + http_code(404), re.I)
+# agy checks --model and --effort before it calls anything and exits 1 with, for example, 'error: invalid model selection (--model "x"
+# --effort ""): model x is not recognized as a known model or custom model in settings' or '... gemini-3.1-pro has no "xhigh" effort
+# (available: low, high)' or '--model gemini-4-neon-xhigh conflicts with --effort=high'. No retry can fix them.
+AGY_SELECTION = re.compile(r"invalid model selection[^\n]*", re.I)
 LIMIT_WORDS = r"usage limit|hit your limit|rate.?limit|quota exceeded|too many requests|\b429\b"
-GOOGLE_LIMIT_WORDS = LIMIT_WORDS + r"|exhausted your [a-z ]{0,20}(?:quota|capacity)|RESOURCE_EXHAUSTED|quota will reset after"
+GOOGLE_LIMIT_WORDS = LIMIT_WORDS + "|" + GOOGLE_LIMIT.pattern
 
 
 def usage_limit(kind, detail):
@@ -943,8 +1000,17 @@ def google_problem(config, code, detail):
     if kind == "gemini" and code == 52:
         return ProviderUnavailable("Gemini CLI reported a configuration error (exit 52). Check its settings.json, then resume this run "
                                    "with --retry.", "configuration")
+    if picked := AGY_SELECTION.search(detail):
+        quote = redact(" ".join(picked.group(0).split()))[:300]
+        return ProviderUnavailable(f"{name} rejected the route's model or effort ({quote}). Fix the route's model or effort (agy models lists "
+                                   "what this sign-in offers), then resume this run with --retry.",
+                                   "model_access" if re.search(r"not recognized as a known model", quote, re.I) else "configuration")
     if GOOGLE_LIMIT.search(detail):
         return usage_limit(kind, detail)
+    if GOOGLE_DENIED.search(detail):
+        return ProviderUnavailable(f"{name} was refused access (403 PERMISSION_DENIED). This key or account cannot use the selected model (Gemini 4 "
+                                   "Neon needs a paid-tier API key or a Google AI Pro or Ultra plan) or the API is not enabled for its project. "
+                                   "Fix the access, then resume this run with --retry.", "model_access")
     if GOOGLE_MODEL.search(detail):
         return ProviderUnavailable(f"{name} could not use the selected model. Check the model id and that this account or key can use it.", "model_access")
     if GOOGLE_BUSY.search(detail):

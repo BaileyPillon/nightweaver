@@ -108,16 +108,22 @@ def text(obj, key):
     return obj[key].strip()
 
 
-# Antigravity reasoning levels per Gemini 4 family (AI Studio thinking levels, 2026-11): Neon and Hydrogen reach xhigh, Carbon and Argon stop
-# at high, and no Gemini 4 model takes max. Any other model, such as a Claude one served by agy, may take the whole range.
+# Reasoning levels agy accepts per model (`agy models` and agy's own 'has no "xhigh" effort' errors, agy 1.5.15, 2026-11): Gemini 4 Neon and
+# Hydrogen reach xhigh, Carbon and Argon stop at high, the 3.x Flash models take low to high and 3.1 Pro only low and high, so no listed
+# model takes max. With no --model agy uses gemini-3.1-pro. A model not listed (a Claude one that a signed-in account may offer) is left
+# to agy, which names the levels it takes.
 EFFORT_SLUG = re.compile(r"-(low|medium|high|xhigh|max)$")
-GEMINI_4_CAPS = {"neon": ("low", "medium", "high", "xhigh"), "hydrogen": ("low", "medium", "high", "xhigh"),
-                 "carbon": ("low", "medium", "high"), "argon": ("low", "medium", "high")}
+ALL_LEVELS = ("low", "medium", "high", "xhigh", "max")
+AGY_LEVELS = ((re.compile(r"gemini-4-(?:neon|hydrogen)\b"), ("low", "medium", "high", "xhigh")),
+              (re.compile(r"gemini-4-(?:carbon|argon)\b"), ("low", "medium", "high")),
+              (re.compile(r"gemini-3\.\d+-flash\b"), ("low", "medium", "high")),
+              (re.compile(r"gemini-3\.1-pro\b"), ("low", "high")))
+AGY_DEFAULT_MODEL = "gemini-3.1-pro"
 
 
 def antigravity_levels(model):
-    found = re.match(r"(?:models/)?gemini-4-([a-z]+)", model.strip().lower()) if isinstance(model, str) else None
-    return GEMINI_4_CAPS.get(found.group(1), ("low", "medium", "high", "xhigh", "max")) if found else ("low", "medium", "high", "xhigh", "max")
+    name = EFFORT_SLUG.sub("", re.sub(r"^models/", "", model.strip().lower())) if isinstance(model, str) and model.strip() else AGY_DEFAULT_MODEL
+    return next((levels for pattern, levels in AGY_LEVELS if pattern.match(name)), ALL_LEVELS)
 
 
 def provider(value, choices, label, relative_to=None):
@@ -146,6 +152,7 @@ def provider(value, choices, label, relative_to=None):
         out["executable"] = text(value, "executable")
     if value.get("model"):
         out["model"] = text(value, "model")
+    slug = EFFORT_SLUG.search(out.get("model", "")) if value["kind"] == "antigravity" else None
     if "effort" in value:
         levels = {"claude": ("low", "medium", "high", "xhigh", "max"),
                   "codex": ("low", "medium", "high", "xhigh", "max", "ultra"),
@@ -153,13 +160,17 @@ def provider(value, choices, label, relative_to=None):
                   "antigravity": antigravity_levels(value.get("model"))}
         if value["effort"] not in levels.get(value["kind"], ()):
             hint = {"gemini": ". The Gemini CLI has no effort setting; use the antigravity kind for Gemini 4 reasoning levels",
-                    "antigravity": f" for model {value['model']}, which accepts {', '.join(levels['antigravity'])}" if value.get("model") else ""}
+                    "antigravity": (f" for model {value['model']}, which accepts {', '.join(levels['antigravity'])}" if value.get("model") else
+                                    f" for agy's default model {AGY_DEFAULT_MODEL}, which accepts {', '.join(levels['antigravity'])}; "
+                                    "name a model, such as gemini-4-neon, to use another level")}
             raise ValueError(f"Unsupported effort for {value['kind']}: {value['effort']}" + hint.get(value["kind"], ""))
-        slug = EFFORT_SLUG.search(value.get("model") or "") if value["kind"] == "antigravity" else None
         if slug and slug.group(1) != value["effort"]:
             raise ValueError(f"The antigravity model {value['model']} already names effort {slug.group(1)}; "
                              f"drop the suffix from the model or set effort to {slug.group(1)}, not {value['effort']}")
         out["effort"] = value["effort"]
+    if slug and slug.group(1) not in antigravity_levels(value["model"]):  # a slug names a level its model does not have
+        raise ValueError(f"Unsupported effort for antigravity: the model {value['model']} names {slug.group(1)}, but "
+                         f"{EFFORT_SLUG.sub('', value['model'])} accepts {', '.join(antigravity_levels(value['model']))}")
     if "api_key" in value:
         raise ValueError("Use api_key_file or DEEPSEEK_API_KEY for credentials")
     if value.get("api_key_file"):

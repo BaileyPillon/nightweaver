@@ -35,7 +35,9 @@ def check_route(store, config, cwd, live):
     if config["kind"] == "command":
         return {**result, "status": "configured", "action": "Executable found. Custom commands are checked during the run."}
     if not live:
-        hint = (" No Gemini credential was found: set GEMINI_API_KEY or sign in with the CLI." if result.get("auth") == "none_found" else "")
+        hint = (" No Gemini credential was found: set GEMINI_API_KEY or sign in with the CLI." if result.get("auth") == "none_found" else
+                " GEMINI_API_KEY is set, but agy ignores it without \"modelProvider\": \"gemini\" in its settings.json, so this route runs "
+                "on agy's own sign-in." if result.get("api_key_ignored") else "")
         return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"

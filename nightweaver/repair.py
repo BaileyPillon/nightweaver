@@ -4,7 +4,7 @@ import hashlib
 
 from .spec import fields, integer
 
-FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google"}
+FAMILIES = {"codex": "openai", "claude": "anthropic", "deepseek": "deepseek", "gemini": "google", "antigravity": "google"}
 
 
 def policy(raw):

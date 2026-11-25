@@ -16,12 +16,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from nightweaver import cli, engine, providers, readiness, safety, spec
+from nightweaver import benchmark, cli, engine, providers, readiness, repair, rescue, safety, spec
 from nightweaver.cli import main
 
 HOME_VARIABLES = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME")
 ALL_MODES = ("worker", *providers.READ_ONLY, "planner", "probe")
 NEON_LEVELS = ("low", "medium", "high", "xhigh")
+NPM_PACKAGE = Path("node_modules") / "@google" / "gemini-cli"
+# The model slugs `agy models` printed on agy 1.5.15 (2026-11-23).
+LISTED = ("gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium", "gemini-4-neon-low", "gemini-4-carbon-high",
+          "gemini-4-carbon-medium", "gemini-4-carbon-low", "gemini-4-hydrogen-high", "gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-medium",
+          "gemini-4-hydrogen-low", "gemini-4-argon-high", "gemini-4-argon-medium", "gemini-4-argon-low", "gemini-3.8-flash-high",
+          "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+          "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low")
 
 
 def write(path, *lines):
@@ -34,11 +41,16 @@ class Hermetic(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="nwgem")))
         keep = {k: v for k, v in os.environ.items() if not safety.is_secret(k) and k.upper() not in HOME_VARIABLES
                 and not k.upper().startswith(("GEMINI_", "GOOGLE_", "AGY_", "NIGHTWEAVER_"))}
-        self.enterContext(patch.dict(os.environ, {**keep, "NIGHTWEAVER_HOME": str(self.root / "home"), "LOCALAPPDATA": str(self.root / "local")},
-                                     clear=True))
+        # The user's own home holds agy's settings.json, so it is the temp folder too: no test reads the real one.
+        self.enterContext(patch.dict(os.environ, {**keep, "NIGHTWEAVER_HOME": str(self.root / "home"), "LOCALAPPDATA": str(self.root / "local"),
+                                                  "USERPROFILE": str(self.root / "user"), "HOME": str(self.root / "user")}, clear=True))
         self.enterContext(patch("nightweaver.providers.user_environment", return_value=None))
         providers.AGY_SIGNED_IN.clear()
         self.addCleanup(providers.AGY_SIGNED_IN.clear)
+
+    def agy_settings(self, **fields):
+        """agy's settings.json in the (temporary) user home, as the Antigravity CLI reads it."""
+        write(self.root / "user" / ".gemini" / "antigravity-cli" / "settings.json", fields)
 
     def fake_agy(self, name, *, code=0, output=""):
         """A stand-in agy.cmd that answers --version with 1.5.15, `models` with the given output and exit code (on stderr when it fails),
@@ -100,10 +112,20 @@ class AntigravityArgv(Hermetic):
             self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits" if mode == "worker" else "plan", mode)
             self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
             self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
-            self.assertIn("--disable-slash-commands", argv)
             for flag in ("--print", "-p", "--prompt", "--dangerously-skip-permissions", "--sandbox", "--effort", "--model", "--conversation"):
                 self.assertNotIn(flag, argv, f"{flag} in {mode}: --print takes its prompt as a flag value and ignores stdin, and "
                                  "--input-format stream-json rejects a flag prompt")
+
+    def test_plan_mode_is_never_combined_with_the_flag_that_switches_it_off(self):
+        """agy 1.5.15 applies --mode plan through slash command expansion: with --disable-slash-commands it prints 'warning: --mode plan has no
+        effect while slash command expansion is disabled' and runs in its default request-review mode (reproduced against the real agy.exe)."""
+        for mode in ALL_MODES:
+            for config in ({"kind": "antigravity"}, {"kind": "antigravity", "model": "gemini-4-neon", "effort": "xhigh"}):
+                argv, _ = providers.adapter(config, mode, "conv-1")
+                if argv[argv.index("--mode") + 1] == "plan":
+                    self.assertNotIn("--disable-slash-commands", argv, mode)
+        self.assertIn("--disable-slash-commands", providers.adapter({"kind": "antigravity"}, "worker")[0],
+                      "accept-edits is unaffected, and the worker keeps the flag that stops a task starting with / from running as a command")
 
     def test_effort_model_and_resume_follow_the_route(self):
         config = {"kind": "antigravity", "model": "gemini-4-neon", "effort": "xhigh", "executable": "agy"}
@@ -145,11 +167,48 @@ class EffortValidation(Hermetic):
     def route(self, **fields):
         return spec.provider({"kind": "antigravity", **fields}, spec.IMPLEMENTERS, "worker", self.root)
 
-    def test_every_level_is_accepted_for_a_model_with_no_stated_cap(self):
+    def test_every_level_is_accepted_for_a_model_agy_lists_no_levels_for(self):
         for level in ("low", "medium", "high", "xhigh", "max"):
-            self.assertEqual(self.route(effort=level)["effort"], level)
             self.assertEqual(self.route(effort=level, model="claude-opus-5-5")["effort"], level)
         self.assertNotIn("effort", self.route(model="gemini-4-neon"))
+        self.assertNotIn("effort", self.route())
+
+    def test_the_gemini_3_models_take_only_the_levels_agy_lists_for_them(self):
+        """From `agy models` and agy's own errors: 3.1 Pro has low and high, the 3.x Flash models low, medium and high, and agy uses
+        gemini-3.1-pro when no model is named."""
+        for model, levels in (("gemini-3.1-pro", ("low", "high")), ("models/gemini-3.1-pro", ("low", "high")), ("gemini-3.8-flash", ("low", "medium", "high")),
+                              ("gemini-3.7-flash", ("low", "medium", "high")), ("gemini-3.6-flash", ("low", "medium", "high")), (None, ("low", "high"))):
+            for level in ("low", "medium", "high", "xhigh", "max"):
+                fields = {"effort": level, **({"model": model} if model else {})}
+                if level in levels:
+                    self.assertEqual(self.route(**fields)["effort"], level, (model, level))
+                else:
+                    with self.assertRaisesRegex(ValueError, rf"Unsupported effort for antigravity: {level} for .*accepts {', '.join(levels)}"):
+                        self.route(**fields)
+
+    def test_a_route_with_no_model_says_which_model_agy_will_use_and_how_to_get_another_level(self):
+        with self.assertRaisesRegex(ValueError, "xhigh for agy's default model gemini-3.1-pro, which accepts low, high; name a model"):
+            self.route(effort="xhigh")
+        self.assertEqual(self.route(effort="high")["effort"], "high")
+        self.assertEqual(self.route(effort="xhigh", model="gemini-4-neon")["effort"], "xhigh")
+
+    def test_a_slug_cannot_name_a_level_its_model_does_not_have(self):
+        for model, level, accepts in (("gemini-3.1-pro-medium", "medium", "low, high"), ("gemini-4-carbon-xhigh", "xhigh", "low, medium, high"),
+                                      ("gemini-3.8-flash-max", "max", "low, medium, high"), ("gemini-4-neon-max", "max", "low, medium, high, xhigh")):
+            with self.assertRaisesRegex(ValueError, rf"the model {model} names {level}, but .* accepts {accepts}$"):
+                self.route(model=model)
+        self.assertEqual(self.route(model="gemini-3.1-pro-low")["model"], "gemini-3.1-pro-low")
+
+    def test_the_levels_agy_itself_lists_are_the_levels_the_plan_accepts(self):
+        """Every slug in `agy models` (captured from agy 1.5.15) is a valid route, and no level it omits is accepted for its model."""
+        for slug in LISTED:
+            self.assertEqual(self.route(model=slug)["model"], slug)
+            base, level = slug.rsplit("-", 1)
+            self.assertEqual(self.route(model=base, effort=level)["effort"], level, slug)
+            omitted = [x for x in ("low", "medium", "high", "xhigh", "max") if f"{base}-{x}" not in LISTED]
+            for x in omitted:
+                with self.assertRaises(ValueError, msg=f"{base} at {x}"):
+                    self.route(model=base, effort=x)
 
     def test_neon_takes_low_to_xhigh_and_rejects_max_with_the_levels_it_does_accept(self):
         for model in ("gemini-4-neon", "models/gemini-4-neon", "gemini-4-hydrogen"):
@@ -298,12 +357,61 @@ class NpmEntrypoint(Hermetic):
         with self.assertRaisesRegex(providers.ProviderUnavailable, "native executable"):
             self.call({"kind": "claude", "executable": str(npm / "claude.cmd")})
 
-    def test_the_real_install_on_this_machine_resolves_when_present(self):
+    @staticmethod
+    def declared(launcher):
+        """The file an installed package's own manifest names as its gemini binary, read here without any help from providers."""
+        package = Path(launcher).parent / "node_modules" / "@google" / "gemini-cli"
+        binary = json.loads((package / "package.json").read_text(encoding="utf-8-sig"))["bin"]
+        return package / (binary if isinstance(binary, str) else binary["gemini"])
+
+    def check_resolution(self, resolver, launcher):
+        entry = resolver(launcher)
+        self.assertIsNotNone(entry, "an installed package always has an entrypoint")
+        self.assertEqual(entry, self.declared(launcher))
+        self.assertTrue(entry.is_file())
+
+    def test_the_real_install_on_this_machine_resolves_to_the_file_its_manifest_names(self):
         launcher = shutil.which("gemini")
-        if not launcher or Path(launcher).suffix.casefold() != ".cmd":
-            self.skipTest("no npm Gemini launcher installed")
-        entry = providers.gemini_entrypoint(launcher)
-        self.assertTrue(entry is None or entry.is_file())
+        if not launcher or Path(launcher).suffix.casefold() != ".cmd" or not self.declared(launcher).is_file():
+            self.skipTest("no npm Gemini launcher with its package installed")
+        self.check_resolution(providers.gemini_entrypoint, launcher)
+
+    def test_that_check_fails_for_the_resolver_that_ignored_the_manifest(self):
+        """The original defect: dist/index.js hard-coded, bin ignored. On a 0.70.0 layout (bundle/gemini.js, no dist) the check above must fail
+        for it and pass for the real resolver, or it proves nothing."""
+        npm, package = self.tree()
+        launcher = npm / "gemini.cmd"
+
+        def dist_only(path):
+            entry = Path(path).parent / NPM_PACKAGE / "dist" / "index.js"
+            return entry if entry.is_file() else None
+
+        self.check_resolution(providers.gemini_entrypoint, launcher)
+        with self.assertRaises(AssertionError):
+            self.check_resolution(dist_only, launcher)
+        with patch.object(providers, "GEMINI_ENTRIES", ("dist/index.js",)):
+            self.check_resolution(providers.gemini_entrypoint, launcher)  # the manifest alone still finds it
+
+
+def agy_error(code, status, message):
+    """An AGY_ERROR line in the shape agy 1.5.15 printed for a bad API key: short_error, status, error_code, code_kind, retryable, error_id."""
+    return "AGY_ERROR: " + json.dumps({"short_error": f"agent executor error: generating and executing: Error {code}, Message: {message}, Status: {status}",
+                                       "status": status, "error_code": code, "code_kind": "http", "retryable": False, "error_id": "e1-1"},
+                                      separators=(",", ":"))
+
+
+# Captured from agy 1.5.15 with a dummy GEMINI_API_KEY (modelProvider gemini): the stderr line of a bad key (exit 3) ...
+REAL_400_LINE = ('error: agent executor error: generating and executing: Error 400, Message: API key not valid. Please pass a valid API key., Status: '
+                 'INVALID_ARGUMENT, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo domain:googleapis.com metadata:map[service:'
+                 'generativelanguage.googleapis.com] reason:API_KEY_INVALID] map[@type:type.googleapis.com/google.rpc.LocalizedMessage locale:en-US '
+                 'message:API key not valid. Please pass a valid API key.]]')
+REAL_400 = ('AGY_ERROR: {"short_error":"' + REAL_400_LINE[len("error: "):] + '","status":"INVALID_ARGUMENT","error_code":400,"code_kind":"http",'
+            '"retryable":false,"error_id":"556cb741-4aa8-4e2f-a767-8274464a9b24-1"}')
+# ... and what it printed for a model it does not list (exit 1; the list of models follows on stderr line by line).
+SELECT_UNKNOWN = ('error: invalid model selection (--model "nonsense-model" --effort ""): model nonsense-model is not recognized as a known model or '
+                  'custom model in settings\nAvailable models:\n  Gemini 4 Neon (High)\n  Gemini 4 Neon (XHigh)\n  Gemini 3.1 Pro (Low)')
+GEMINI_FOOTER = ("\nPlease wait and try again later. To increase your limits, request a quota increase through AI Studio, "
+                 "or switch to another /auth method")
 
 
 class Classification(Hermetic):
@@ -331,19 +439,60 @@ class Classification(Hermetic):
         ("gemini", 1, '{"error":{"code":400,"message":"x","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}', "authentication"),
         ("gemini", 1, "The model is overloaded. Please try again later.", "transient"),
         ("gemini", 1, '{"error":{"code":503,"status":"UNAVAILABLE"}}', "transient"),
+        # The capacity forms the Gemini CLI's own bundle matches (/exhausted your capacity|capacity exceeded|MODEL_CAPACITY_EXHAUSTED/i), its 429
+        # footer, a no-status capacity text, and the 403 a key without access to a paid-only model like Neon gets.
+        ("gemini", 1, "[API Error: capacity exceeded for model gemini-3-pro-preview]", "usage_limit"),
+        ("gemini", 1, "MODEL_CAPACITY_EXHAUSTED", "usage_limit"),
+        ("gemini", 1, "[API Error: No capacity available for model gemini-3-pro-preview on the server]", "usage_limit"),
+        ("gemini", 1, GEMINI_FOOTER, "usage_limit"),
+        ("gemini", 1, "[API Error: Resource exhausted (Status: RESOURCE_EXHAUSTED)]" + GEMINI_FOOTER, "usage_limit"),
+        ("gemini", 1, "[API Error: Permission denied on resource project (Status: PERMISSION_DENIED)]", "model_access"),
+        ("gemini", 1, '{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}', "model_access"),
+        ("gemini", 1, '{"error":{"code":403,"message":"x"}}', "model_access"),
+        ("gemini", 1, "tool failed: permission_denied", None),
         ("gemini", 1, "tests did not pass", None),
         ("gemini", 42, "Error resuming session: no such session", None),
-        ("antigravity", 1, "Error: authentication required. Run 'agy' to log in, then retry.", "authentication"),
+        # agy's own texts. REAL_400, REAL_400_LINE, SELECT_UNKNOWN and the sign-in lines are exactly what agy 1.5.15 printed; the other AGY_ERROR rows
+        # use the shape of the captured 400 (short_error, status, error_code, code_kind, retryable, error_id) with the status and code of the
+        # failure they stand for swapped in.
+        ("antigravity", 1, "Error: authentication required. Run 'agy.exe' to log in.", "authentication"),
+        ("antigravity", 1, "error: authentication failed or timed out", "authentication"),
         ("antigravity", 1, "Error: Please sign in to view available models. Launch the CLI without arguments to sign in.", "authentication"),
-        ("antigravity", 1, 'Error: modelProvider is set to "gemini" in settings.json, but the GEMINI_API_KEY environment variable is not set.',
+        ("antigravity", 1, 'modelProvider is set to "gemini" in settings.json, but the GEMINI_API_KEY environment variable is not set. '
+                           'Set GEMINI_API_KEY to your Gemini API key, or remove "modelProvider" from settings.json to use the default backend.',
          "authentication"),
-        ("antigravity", 3, 'AGY_ERROR: {"short_error":"You have exhausted your capacity on this model. Your quota will reset after 1h2m3s."}',
-         "usage_limit"),
-        ("antigravity", 3, 'AGY_ERROR: {"canonical_status":"RESOURCE_EXHAUSTED","code":429,"retryable":false}', "usage_limit"),
-        ("antigravity", 1, 'Error: failed to resolve model "gemini-9": model not found', "model_access"),
-        ("antigravity", 1, 'Error: unknown model "nonsense"', "model_access"),
-        ("antigravity", 3, 'AGY_ERROR: {"canonical_status":"UNAVAILABLE","code":503,"retryable":true}', "transient"),
-        ("antigravity", 2, "Error: --input-format stream-json reads prompts from stdin, so a prompt given on the command line would be ignored", None),
+        ("antigravity", 3, REAL_400, "authentication"),
+        ("antigravity", 3, REAL_400_LINE, "authentication"),
+        ("antigravity", 1, SELECT_UNKNOWN, "model_access"),
+        ("antigravity", 1, SELECT_UNKNOWN.splitlines()[0], "model_access"),
+        ("antigravity", 1, 'error: invalid model selection (--model "gemini-3.1-pro" --effort "xhigh"): gemini-3.1-pro has no "xhigh" effort '
+                           '(available: low, high)', "configuration"),
+        ("antigravity", 1, 'error: invalid model selection (--model "gemini-3.1-pro" --effort "medium"): gemini-3.1-pro has no "medium" effort '
+                           '(available: low, high)', "configuration"),
+        ("antigravity", 1, 'error: invalid model selection (--model "gemini-4-carbon" --effort "xhigh"): gemini-4-carbon has no "xhigh" effort '
+                           '(available: low, medium, high)', "configuration"),
+        ("antigravity", 1, 'error: invalid model selection (--model "gemini-4-neon" --effort "max"): gemini-4-neon has no "max" effort '
+                           '(available: low, medium, high, xhigh)', "configuration"),
+        ("antigravity", 1, 'error: invalid model selection (--model "" --effort "xhigh"): gemini-3.1-pro has no "xhigh" effort (available: low, high)',
+         "configuration"),
+        ("antigravity", 1, 'error: invalid model selection (--model "gemini-4-neon-xhigh" --effort "high"): --model gemini-4-neon-xhigh '
+                           'conflicts with --effort=high', "configuration"),
+        ("antigravity", 3, agy_error(429, "RESOURCE_EXHAUSTED", "Resource has been exhausted (e.g. check quota)."), "usage_limit"),
+        ("antigravity", 3, '{"short_error":"quota","error_code":429,"code_kind":"http","retryable":true}', "usage_limit"),
+        ("antigravity", 3, "error: agent executor error: generating and executing: Error 429, Message: Resource has been exhausted (e.g. check quota)., "
+                           "Status: RESOURCE_EXHAUSTED", "usage_limit"),
+        ("antigravity", 3, "error: agent executor error: generating and executing: Error 429, Message: slow down", "usage_limit"),
+        ("antigravity", 3, 'AGY_ERROR: {"short_error":"You have exhausted your capacity on this model. Your quota will reset after 1h2m3s."}', "usage_limit"),
+        ("antigravity", 3, "error: agent executor error: generating and executing: Error 403, Message: Permission denied on resource project "
+                           "projects/1, Status: PERMISSION_DENIED", "model_access"),
+        ("antigravity", 3, agy_error(403, "PERMISSION_DENIED", "The caller does not have permission"), "model_access"),
+        ("antigravity", 3, '{"short_error":"denied","error_code":403,"code_kind":"http","retryable":false}', "model_access"),
+        ("antigravity", 3, agy_error(404, "NOT_FOUND", "models/gemini-9 is not found for API version v1beta"), "model_access"),
+        ("antigravity", 1, "no model configuration is available for this account", "model_access"),
+        ("antigravity", 3, agy_error(503, "UNAVAILABLE", "The model is overloaded. Please try again later."), "transient"),
+        ("antigravity", 3, '{"short_error":"busy","error_code":503,"code_kind":"http","retryable":true}', "transient"),
+        ("antigravity", 1, "warning: --mode plan has no effect while slash command expansion is disabled.", None),
+        ("antigravity", 1, "tests did not pass", None),
         ("antigravity", 41, "an ordinary failure", None),
     )
 
@@ -395,6 +544,37 @@ class Classification(Hermetic):
         self.assertEqual(self.blocked("antigravity", 1, "Error: authentication required. Run 'agy' to log in, then retry.").kind, "authentication")
         self.assertEqual(self.blocked("antigravity", 3, 'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED"}').kind, "usage_limit")
 
+    def test_gemini_cli_texts_that_used_to_pass_as_ordinary_failures_are_recognised_through_a_call(self):
+        for text, kind in (("[API Error: capacity exceeded for model gemini-3-pro-preview]", "usage_limit"), ("MODEL_CAPACITY_EXHAUSTED", "usage_limit"),
+                           (GEMINI_FOOTER.strip(), "usage_limit"), ("[API Error: No capacity available for model gemini-3-pro-preview on the server]",
+                                                                    "usage_limit"),
+                           ("[API Error: Permission denied on resource (Status: PERMISSION_DENIED)]", "model_access")):
+            problem = self.blocked("gemini", 1, {"type": "init", "session_id": "s"}, {"type": "error", "severity": "error", "message": text})
+            self.assertEqual(problem.kind, kind, text)
+            problem = self.blocked("gemini", 1, text)  # the same words on stderr
+            self.assertEqual(problem.kind, kind, text)
+
+    def test_the_real_agy_failures_replayed_through_a_call_block_with_the_right_kind(self):
+        """What agy 1.5.15 wrote for a rejected key and for a refused model or effort, run through invoke(): no attempt is used."""
+        bad_key = self.blocked("antigravity", 3, *REAL_ERROR, REAL_400_LINE, REAL_400)
+        self.assertEqual(bad_key.kind, "authentication")
+        self.assertNotIn("sk-", str(bad_key))
+        unknown = self.blocked("antigravity", 1, {"event": "result", "result": {**REAL_REFUSAL["result"], "error": SELECT_UNKNOWN.split(": ", 1)[1]}},
+                               *SELECT_UNKNOWN.splitlines())
+        self.assertEqual(unknown.kind, "model_access")
+        self.assertIn("nonsense-model", str(unknown))
+        effort = self.blocked("antigravity", 1, REAL_REFUSAL, "error: " + REAL_REFUSAL["result"]["error"])
+        self.assertEqual(effort.kind, "configuration")
+        self.assertIn('no "xhigh" effort (available: low, high)', str(effort))
+        self.assertEqual(self.blocked("antigravity", 0, REAL_REFUSAL).kind, "configuration", "even when agy exits 0 on a failed result")
+        denied = self.blocked("antigravity", 3, {"event": "result", "result": {"status": "ERROR", "response": "", "finished_reason": "error", "usage": ZERO_USAGE,
+                                                                               "error": "agent executor error: generating and executing: Error 403, "
+                                                                                        "Message: no access, Status: PERMISSION_DENIED"}})
+        self.assertEqual(denied.kind, "model_access")
+        self.assertIn("Neon needs a paid-tier API key", str(denied))
+        limit = self.blocked("antigravity", 3, agy_error(429, "RESOURCE_EXHAUSTED", "quota"))
+        self.assertEqual((limit.kind, limit.reset_at), ("usage_limit", None))
+
     def test_a_clean_exit_with_a_failed_agy_result_is_still_a_failure(self):
         problem = self.blocked("antigravity", 0, {"event": "init", "conversation_id": "c"},
                                {"event": "result", "result": {"conversation_id": "c", "status": "ERROR",
@@ -437,8 +617,53 @@ def result(**fields):
                                           "usage": USAGE, **fields}}
 
 
+CONVERSATION = "874f329d-2a94-4f4d-b047-5d4659ba3d06"
+ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 0}
+# Captured from agy 1.5.15 (a call with a dummy API key that the service rejected, exit 3; the init tool list is cut to two names). This is the
+# only complete stream seen so far: no signed-in run has produced a success.
+REAL_ERROR = (
+    {"event": "init", "conversation_id": CONVERSATION, "init": {"model": "gemini-4-neon-xhigh", "cwd": "C:\\work", "tools": ["read_file", "run_command"],
+                                                                "permission_mode": "request-review"}},
+    {"event": "step_update", "step_update": {"conversation_id": CONVERSATION, "step_index": 0, "state": "DONE", "step_type": "user_input"}},
+    {"event": "step_update", "step_update": {"conversation_id": CONVERSATION, "step_index": 1, "state": "DONE", "step_type": "error_message"}},
+    {"event": "result", "result": {"conversation_id": CONVERSATION, "status": "ERROR", "response": "", "error": REAL_400_LINE[len("error: "):],
+                                   "duration_seconds": 0, "num_turns": 1, "usage": ZERO_USAGE, "finished_reason": "error"}},
+)
+# ... and the result agy printed when it refused the route's --model or --effort before starting (exit 1, no conversation id yet).
+REAL_REFUSAL = {"event": "result", "result": {"conversation_id": "", "status": "ERROR", "response": "",
+                                              "error": 'invalid model selection (--model "gemini-3.1-pro" --effort "xhigh"): gemini-3.1-pro has no "xhigh" '
+                                                       "effort (available: low, high)", "duration_seconds": 0, "num_turns": 0, "usage": ZERO_USAGE,
+                                              "finished_reason": "error"}}
+
+
 class AntigravityStream(Hermetic):
-    """The stream-json parser is PENDING LIVE VERIFICATION: these fixtures come from agy's docs, not from a signed-in run."""
+    """The success half of the stream-json parser is PENDING LIVE VERIFICATION: its fixtures come from agy's docs. The error half is checked
+    against REAL_ERROR and REAL_REFUSAL, which agy 1.5.15 printed."""
+
+    def test_the_captured_error_stream_is_a_failed_call_with_its_conversation_and_model(self):
+        log = self.log(*REAL_ERROR)
+        found = providers.agy_stream(log)
+        self.assertEqual((found["session"], found["model"], found["status"], found["failed"], found["answer"]),
+                         (CONVERSATION, "gemini-4-neon-xhigh", "ERROR", True, ""))
+        self.assertEqual(providers.metadata(log, "antigravity"), (CONVERSATION, ""))
+        self.assertEqual(providers.served_models({"kind": "antigravity"}, log), {"models": ["gemini-4-neon-xhigh"], "source": "init"})
+        self.assertIn("API key not valid", providers.provider_errors(log))
+        self.assertEqual(providers.usage(log, "antigravity")["observed_tokens"], 0, "agy reported zero, which is a number and not missing")
+
+    def test_a_refusal_before_the_conversation_starts_has_no_session_and_names_the_problem(self):
+        log = self.log(REAL_REFUSAL)
+        self.assertEqual(providers.metadata(log, "antigravity"), (None, ""))
+        self.assertIs(providers.agy_stream(log)["failed"], True)
+        self.assertIn('has no "xhigh" effort', providers.provider_errors(log))
+
+    def test_only_a_failure_naming_reason_fails_a_result_that_says_success(self):
+        for reason, failed in (("error", True), ("print_timeout", True), ("timeout", True), ("interrupted", True), ("cancelled", True), ("aborted", True),
+                               ("stop", False), ("end_turn", False), ("completed", False), ("max_tokens", False), ("", False), (None, False)):
+            self.assertIs(providers.agy_failed({"status": "SUCCESS", "finished_reason": reason}), failed, reason)
+        self.assertIs(providers.agy_failed({"status": "ERROR", "finished_reason": "stop"}), True)
+        self.assertIs(providers.agy_failed({"finished_reason": "stop"}), False)
+        self.assertEqual(providers.provider_errors(self.log(INIT, result(finished_reason="stop", response="fine"))), "")
+        self.assertEqual(providers.agy_stream(self.log(INIT, result(finished_reason="stop", response="fine")))["answer"], "fine")
 
     def log(self, *events):
         write(self.root / "call.jsonl", *events)
@@ -645,14 +870,76 @@ class SignIn(Hermetic):
         self.assertEqual((report["status"], report["reason"]), ("blocked", "missing_executable"))
         self.assertNotIn("signed_in", report)
 
-    def test_an_api_key_route_names_its_source_and_is_not_blocked_by_a_missing_login(self):
+    def test_a_key_alone_does_nothing_in_agy_so_doctor_blocks_instead_of_giving_false_comfort(self):
+        """agy 1.5.15 with only GEMINI_API_KEY and no "modelProvider": "gemini" in settings.json prints a sign-in link and waits a minute
+        for a code, then fails with 'authentication timed out' (reproduced against the real agy.exe). Doctor reported it as configured."""
         os.environ["GEMINI_API_KEY"] = "sk-never-printed-0123456789"
         report = readiness.check_route(None, self.route(self.signed_out), self.root, False)
-        self.assertEqual((report["status"], report["auth"], report["signed_in"]), ("configured", "api_key", False))
+        self.assertEqual((report["status"], report["reason"], report["auth"], report["signed_in"]), ("blocked", "authentication", "cli_login", False))
+        self.assertIs(report["api_key_ignored"], True)
+        self.assertIn('ignores it unless settings.json has "modelProvider": "gemini"', report["action"])
         self.assertNotIn("never-printed", json.dumps(report))
+        self.agy_settings(model="x", other={"modelProvider": "gemini"})  # a modelProvider that is not at the top level counts for nothing
+        self.assertEqual(readiness.check_route(None, self.route(self.signed_out), self.root, False)["status"], "blocked")
+        self.agy_settings(modelProvider="vertex")
+        self.assertEqual(readiness.check_route(None, self.route(self.signed_out), self.root, False)["auth"], "cli_login")
+
+    def test_a_key_with_the_gemini_provider_selected_names_api_key_and_is_not_asked_about_a_login(self):
+        os.environ["GEMINI_API_KEY"] = "sk-never-printed-0123456789"
+        self.agy_settings(modelProvider="gemini")
+        report = readiness.check_route(None, self.route(self.signed_in), self.root, False)
+        self.assertEqual((report["status"], report["auth"], report["signed_in"]), ("configured", "api_key", True))
+        self.assertNotIn("api_key_ignored", report)
+        self.assertNotIn("never-printed", json.dumps(report))
+        with patch("nightweaver.providers.agy_run", side_effect=AssertionError("the key is what signs in, so agy is not asked")):
+            providers.antigravity_login("agy")
         del os.environ["GEMINI_API_KEY"]
+        os.environ["GOOGLE_API_KEY"] = "k"  # agy reads this one too and prefers it
+        with patch("nightweaver.providers.agy_run", side_effect=AssertionError("not asked")):
+            providers.antigravity_login("agy")
+
+    def test_the_gemini_provider_without_any_key_blocks_at_once_and_names_the_missing_variable(self):
+        self.agy_settings(modelProvider="gemini")
+        with patch("nightweaver.providers.agy_run", side_effect=AssertionError("no key, so nothing to ask agy")):
+            with self.assertRaisesRegex(providers.ProviderUnavailable, "neither GEMINI_API_KEY nor GOOGLE_API_KEY is set") as caught:
+                providers.antigravity_login("agy")
+        self.assertEqual(caught.exception.kind, "authentication")
+        report = readiness.check_route(None, self.route(self.signed_in), self.root, False)
+        self.assertEqual((report["status"], report["reason"], report["auth"]), ("blocked", "authentication", "api_key"))
+
+    def test_a_key_that_agy_ignores_is_harmless_when_agy_is_signed_in_by_other_means(self):
+        os.environ["GEMINI_API_KEY"] = "sk-never-printed-0123456789"
+        report = readiness.check_route(None, self.route(self.signed_in, model="gemini-4-neon"), self.root, False)
+        self.assertEqual((report["status"], report["auth"], report["signed_in"], report["api_key_ignored"]), ("configured", "cli_login", True, True))
+        self.assertIn("agy ignores it", report["action"])
+        self.assertNotIn("never-printed", json.dumps(report))
+
+    def test_adc_is_left_to_the_call_which_fails_fast(self):
         os.environ["AGY_ADC_AUTH"] = "true"
-        self.assertEqual(readiness.check_route(None, self.route(self.signed_out), self.root, False)["auth"], "adc")
+        report = readiness.check_route(None, self.route(self.signed_out), self.root, False)
+        self.assertEqual((report["status"], report["auth"]), ("configured", "adc"))
+        self.assertNotIn("api_key_ignored", report)
+        with patch("nightweaver.providers.agy_run", side_effect=AssertionError("not asked")):
+            providers.antigravity_login("agy")
+
+    def test_the_settings_file_is_read_defensively(self):
+        path = self.root / "user" / ".gemini" / "antigravity-cli" / "settings.json"
+        self.assertEqual(providers.antigravity_settings(), {})
+        path.parent.mkdir(parents=True)
+        for body in ("not json", "[]", '"gemini"'):
+            path.write_text(body, encoding="utf-8")
+            self.assertEqual(providers.antigravity_settings(), {}, body)
+        path.write_text("\ufeff" + json.dumps({"modelProvider": "gemini"}), encoding="utf-8")
+        self.assertEqual(providers.antigravity_settings(), {"modelProvider": "gemini"})
+
+    def test_a_key_alone_stops_the_call_before_agy_can_wait_a_minute_for_a_login(self):
+        os.environ["GEMINI_API_KEY"] = "sk-never-printed-0123456789"
+        with patch("nightweaver.providers.execute", side_effect=AssertionError("agy must not be started: it would wait for an OAuth code")):
+            with self.assertRaises(providers.ProviderUnavailable) as caught:
+                providers.invoke(self.route(self.signed_out), "worker", self.root, self.root / "call.jsonl", "task", 10, lambda: False)
+        self.assertEqual(caught.exception.kind, "authentication")
+        self.assertIn("modelProvider", str(caught.exception))
+        self.assertNotIn("never-printed", str(caught.exception))
 
     def test_a_signed_out_agy_stops_the_call_before_it_can_wait_for_a_login(self):
         with patch("nightweaver.providers.execute", side_effect=AssertionError("agy must not be started signed out")):
@@ -672,10 +959,12 @@ class SignIn(Hermetic):
                     providers.antigravity_login("agy")
         self.assertEqual(ran.call_count, 2, "signing in must take effect on the next call")
 
-    def test_a_route_with_a_key_is_not_asked_whether_it_is_signed_in(self):
+    def test_a_route_with_a_key_but_no_gemini_provider_is_asked_whether_it_is_signed_in(self):
         os.environ["GOOGLE_API_KEY"] = "k"
-        with patch("nightweaver.providers.agy_run", side_effect=AssertionError("not asked")):
-            providers.antigravity_login("agy")
+        with patch("nightweaver.providers.agy_run", return_value=(1, "Please sign in")) as ran:
+            with self.assertRaises(providers.ProviderUnavailable):
+                providers.antigravity_login("agy")
+        self.assertEqual(ran.call_count, 1)
 
     def test_the_plain_doctor_report_keeps_its_shape_and_the_route_report_finds_the_unlisted_agy(self):
         report = readiness.diagnose(SimpleNamespace(root=self.root / "data"))
@@ -702,6 +991,55 @@ class SignIn(Hermetic):
             code = main(["--home", str(self.root / "home"), "doctor", "--planner", "antigravity", "--model", "gemini-4-neon"])
         provider = json.loads(out.getvalue())["providers"][0]
         self.assertEqual((code, provider["status"], provider["signed_in"], provider["model_listed"]), (0, "configured", True, True))
+
+
+class VendorFamily(Hermetic):
+    """Both Google kinds are one vendor family, so the features that compare vendors treat an antigravity route like a gemini one."""
+
+    def warned(self, config, worker):
+        events = []
+        stand_in = SimpleNamespace(id="r", set=lambda name, payload, **more: events.append((name, payload)),
+                                   store=SimpleNamespace(get=lambda _id: {"state": {}}))
+        engine.Run.independence(stand_in, {}, "judge", config, worker)
+        return events
+
+    def test_the_family_of_an_antigravity_route_is_google(self):
+        self.assertEqual(repair.family({"kind": "antigravity"}), "google")
+        self.assertEqual(repair.family({"kind": "antigravity"}), repair.family({"kind": "gemini"}))
+        self.assertNotEqual(repair.family({"kind": "antigravity"}), repair.family({"kind": "claude"}))
+
+    def test_a_google_judge_of_a_google_worker_is_flagged_whichever_kind_each_is(self):
+        for worker, judge in (("gemini", "antigravity"), ("antigravity", "gemini"), ("antigravity", "antigravity"), ("gemini", "gemini")):
+            events = self.warned({"kind": judge, "model": "m"}, {"kind": worker})
+            self.assertEqual([name for name, _ in events], ["independence_degraded"], (worker, judge))
+            self.assertEqual((events[0][1]["worker"]["family"], events[0][1]["reviewer_or_judge"]["family"]), ("google", "google"))
+        for worker, judge in (("antigravity", "claude"), ("claude", "antigravity"), ("antigravity", "codex"), ("deepseek", "antigravity")):
+            self.assertEqual(self.warned({"kind": judge}, {"kind": worker}), [], (worker, judge))
+
+    def test_the_diagnoser_falls_back_to_the_judge_when_planner_and_worker_are_both_google(self):
+        def run(planner, worker):
+            return SimpleNamespace(spec={"pursue": {"planner": {"kind": planner}}, "milestones": [{"worker": {"kind": worker}}]},
+                                   route=lambda state, step, role: {"kind": role})
+        for planner, worker in (("antigravity", "gemini"), ("gemini", "antigravity"), ("antigravity", "antigravity")):
+            self.assertEqual(rescue.diagnoser(run(planner, worker), {})[0], "judge", (planner, worker))
+        for planner, worker in (("antigravity", "claude"), ("claude", "antigravity"), ("antigravity", "codex")):
+            self.assertEqual(rescue.diagnoser(run(planner, worker), {})[0], "planner", (planner, worker))
+
+    def test_a_standalone_benchmark_contender_may_be_antigravity_as_it_may_be_gemini(self):
+        outcomes = {}
+        for kind in ("gemini", "antigravity"):
+            suite = self.root / f"{kind}.json"
+            write(suite, {"name": "s", "tasks": [{"name": "t", "plan": "missing-plan.json"}],
+                          "contenders": [{"name": "c", "mode": "standalone", "worker": {"kind": kind}}]})
+            with self.assertRaises((OSError, ValueError)) as caught:
+                benchmark.create_suite(None, suite)
+            outcomes[kind] = type(caught.exception)
+            self.assertNotIn("Standalone contenders", str(caught.exception), kind)
+        self.assertEqual(outcomes["gemini"], outcomes["antigravity"], "both fail only on the missing plan file")
+        with self.assertRaisesRegex(ValueError, "Standalone contenders"):
+            write(self.root / "c.json", {"name": "s", "tasks": [{"name": "t", "plan": "p.json"}],
+                                         "contenders": [{"name": "c", "mode": "standalone", "worker": {"kind": "command", "argv": ["x"]}}]})
+            benchmark.create_suite(None, self.root / "c.json")
 
 
 class GeminiDoctor(Hermetic):
