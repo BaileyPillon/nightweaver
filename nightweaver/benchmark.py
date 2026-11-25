@@ -57,7 +57,7 @@ def create_suite(store, source, *, preview=False):
             raise ValueError("Contender mode must be nightweaver, standalone or external")
         if contender.get("mode") == "external" and (contender["worker"]["kind"] != "command" or contender.get("reviewer") or contender.get("worker_fallbacks")):
             raise ValueError("External contenders require one command route and manage their own orchestration")
-        if mode == "standalone" and (contender["worker"]["kind"] not in {"codex", "claude", "gemini", "deepseek"}
+        if mode == "standalone" and (contender["worker"]["kind"] not in {"codex", "claude", "gemini", "antigravity", "deepseek"}
                                     or contender.get("reviewer") or contender.get("worker_fallbacks")):
             raise ValueError("Standalone contenders require one native model CLI without reviewer or fallback")
         if "reviewer" in contender:
