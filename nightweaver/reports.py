@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .safety import atomic_write, redact
 from .insights import provider_totals
-from .store import current_stop
+from .store import current_stop, idle_from_events
 from .checks import observed_pass
 
 
@@ -77,6 +77,11 @@ def _metrics(store, run_id):
     seconds = None
     if start and (stop or row["state"]["phase"] not in ("blocked", "done")):
         seconds = max(0, ((datetime.fromisoformat(stop) if stop else datetime.now(timezone.utc)) - datetime.fromisoformat(start)).total_seconds())
+    idle = None  # elapsed_seconds is wall time; the time the run sat blocked or paused is not what its budget measures
+    if seconds is not None:
+        finished, since = idle_from_events(events, start)
+        end = datetime.fromisoformat(stop) if stop else datetime.now(timezone.utc)
+        idle = min(seconds, finished + (max(0.0, (end - since).total_seconds()) if since else 0.0))
     queued = next((e["time"] for e in events if e["kind"] == "queued"), None)
     first_acceptance = next((e["time"] for e in events if e["kind"] == "milestone_accepted"), None)
 
@@ -147,6 +152,8 @@ def _metrics(store, run_id):
         "accepted": row["state"]["phase"] == "done", "baseline": row["state"]["base"],
         "accepted_milestones": len(current), "total_milestones": len(row["spec"]["milestones"]) - discarded,
         "elapsed_seconds": round(seconds, 3) if seconds is not None else None,
+        "active_seconds": round(seconds - idle, 3) if seconds is not None else None,
+        "idle_seconds": round(idle, 3) if idle is not None else None,
         "queue_seconds": interval(queued, start), "seconds_to_first_acceptance": interval(start, first_acceptance),
         "provider_calls": kinds.count("provider_call_started"), "worker_attempts": kinds.count("worker_started"),
         "failed_attempts": kinds.count("attempt_rejected"), "gate_failures": sum(

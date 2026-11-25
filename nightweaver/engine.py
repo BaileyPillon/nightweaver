@@ -20,7 +20,7 @@ from .checks import contract_hash, evidence_folder, observed_pass, run_gate, ver
 from .insights import budget_status, failure_excerpt
 from . import context, notify
 from .safety import atomic_write, redact, write_json
-from .store import timestamp
+from .store import run_clock, timestamp
 
 
 class BudgetExceeded(ValueError):
@@ -31,6 +31,9 @@ GIT_TIMEOUT = 90
 WORKTREE_ADD_TIMEOUT = 900
 SETTLE_POLL, SETTLE_QUIET = 1.0, 5  # seconds between looks at an unfinished checkout; looks with no index lock before git is given up on
 IDLE_DEFAULT = 900
+GATE_TIMEOUT_CAP = 14400  # a gate's retried timeout never exceeds 4 hours
+GATE_TIMEOUT = "Gate exceeded its wall-clock timeout"  # what process.execute reports when it ends a gate at its limit; test_release_0191_runtime holds the two together
+BASELINE_TIMEOUT = "Baseline did not establish the requested proof: " + GATE_TIMEOUT  # a proof gate's baseline run ended at the limit (proof.apply_proof)
 PARK_MARGIN, PARK_UNPARSED, PARK_UNPARSED_MAX = 90, 1800, 7200
 
 
@@ -498,7 +501,8 @@ def park_plan(spec, state, error, now, kind):
     when = (reset if parsed else until).astimezone()
     clock = when.strftime("%H:%M" if when.date() == now.astimezone().date() else "%b %d %H:%M")
     limits = spec.get("budgets", {})
-    deadline = (datetime.fromisoformat(state["started_at"]) + timedelta(seconds=limits["max_seconds"])
+    # The wait counts against the budget (parked time is active time), so the deadline is the time the budget has left from now.
+    deadline = (now + timedelta(seconds=limits["max_seconds"] - run_clock(state, now)[1])
                 if limits.get("max_seconds") and state.get("started_at") else None)
     allowed, longest = policy.get("max_parks", 8), policy.get("max_park_seconds", 21600)
     if number > allowed:
@@ -550,6 +554,25 @@ def model_drift(pending, served, seen):
     return events, seen
 
 
+def gate_timed_out(receipt):
+    """Whether the controller ended a gate at its wall-clock limit before it could deliver a verdict: the gate itself, or (a proof gate) its
+    run on the baseline commit, which proof.apply_proof reports as the reason the baseline did not establish the proof."""
+    if not receipt.get("execution_error"):
+        return False
+    error = receipt.get("artifact_error")
+    return error == BASELINE_TIMEOUT or (receipt.get("exit") is None and error == GATE_TIMEOUT)
+
+
+def timeout_advice(planned):
+    """What an operator can do about a gate that timed out for good. A run keeps the plan it was created with (no command edits it), so more
+    time means the edited plan added as a new run; a resume runs the gate again with the limits the plan has."""
+    first = ('Raise "timeout" on this gate in the plan (it allows up to 7200 seconds) and add that plan as a new run: a run keeps the plan it was '
+             'created with, so editing the plan file does not change this one.' if planned < 7200 else
+             'This gate already has the longest "timeout" the plan allows (7200 seconds): make it faster or split it in the plan and add that plan '
+             'as a new run (a run keeps the plan it was created with).')
+    return first + " If the machine was only busy, resume this run with --retry to run the gate again."
+
+
 class Run:
     def __init__(self, store, run_id):
         self.store = store
@@ -559,6 +582,7 @@ class Run:
         self.root = store.directory(run_id)
         self.repository = Path(self.spec["repository"])
         self.ref = row["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
+        self.gate_limits = {}  # (tree, gate) -> the timeouts a gate has been run with on that tree, the plan's first: see run_timed_gate
 
     def set(self, kind, details=None, **state):
         result = self.store.transition(self.id, kind, details, **state)
@@ -570,11 +594,16 @@ class Run:
         return self.store.get(self.id)["pause"]
 
     def check_budget(self, *, call=False):
+        """Raise BudgetExceeded when a budget is spent. budgets.max_seconds is active time: the time since the run started less the stretches
+        it sat blocked (waiting for a person) or paused, which the state's ledger holds (see store.run_clock). Time parked on a usage limit
+        still counts: the run is waiting on its own clock, by design, and park_plan refuses a wait that would outlast the budget."""
         state = self.store.get(self.id)["state"]
         limits = self.spec.get("budgets", {})
         if "max_seconds" in limits and state.get("started_at"):
-            if (datetime.now(timezone.utc) - datetime.fromisoformat(state["started_at"])).total_seconds() >= limits["max_seconds"]:
-                raise BudgetExceeded("Run elapsed-time budget exhausted")
+            wall, active = run_clock(state, datetime.fromisoformat(timestamp()))
+            if active >= limits["max_seconds"]:
+                raise BudgetExceeded("Run elapsed-time budget exhausted" + (
+                    f" ({active / 3600:.1f} h active; {(wall - active) / 3600:.1f} h blocked or paused is not counted)" if wall - active >= 60 else ""))
         if call and "max_calls" in limits and state.get("provider_calls", 0) >= limits["max_calls"]:
             raise BudgetExceeded("Run provider-call budget exhausted")
         if call and "max_observed_tokens" in limits and state.get("observed_tokens", 0) >= limits["max_observed_tokens"]:
@@ -881,6 +910,8 @@ class Run:
                         raise ValueError("Saved gate samples do not match the active verification")
                     if observed_pass(receipt) is not None:
                         verify_saved_sample(receipt, evidence)
+                    known = self.gate_limits.setdefault((snapshot, digest), [check["timeout"]])
+                    known[:] = max(known, receipt.get("timeout_retried", {}).get("limits", known), key=len)  # a resumed verification starts at the limit its saved samples needed
             location.update(verification_batch=batch, stability_runs=count)
 
         # A mixed first round earns one whole confirmation round on the same candidate.
@@ -936,16 +967,54 @@ class Run:
                  blocked_from="checking", last_error=reason)
         return None
 
+    def run_timed_gate(self, check, path, folder, snapshot, location, fresh, base):
+        """run_gate on `check` in `folder`; each time the controller ends it at its wall-clock limit (gate_timed_out) it is run again in `fresh()`,
+        a new evidence folder, with twice the time (never above GATE_TIMEOUT_CAP), up to the plan's retry.gate_timeout_retries (0 stops at the
+        first timeout, as 0.19 did). A gate that ran out of time has not failed: a repository that grew since the limit was set is the usual
+        cause, so a timeout is never a rejection of the worker's change. A limit that had to be raised stays raised for the rest of that
+        verification (the same gate on the same tree: its other stability samples, a confirmation round, an exploration's other samples), so the
+        old limit is paid once, not once per sample, and the retries are those of the verification. -> (receipt, the folder it was made in).
+        A receipt run above the plan's limit carries the plan's contract hash (saved samples are matched by it) and `timeout_retried`; one that
+        timed out for good says which gate, what limits and that the change was not judged."""
+        retries = self.spec.get("retry", {}).get("gate_timeout_retries", 1)
+        limits = self.gate_limits.setdefault((snapshot, contract_hash(check)), [check["timeout"]])
+        if len(self.gate_limits) > 64:
+            del self.gate_limits[next(iter(self.gate_limits))]
+        retried_here = False
+        while True:
+            receipt = run_gate({**check, "timeout": limits[-1]}, path, folder, snapshot, paused=self.paused,
+                               **({"baseline": base} if check.get("kind") == "catalog" or "proof" in check else {}),
+                               max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
+                               heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
+            longer = min(limits[-1] * 2, GATE_TIMEOUT_CAP)
+            if not gate_timed_out(receipt) or len(limits) > retries or longer <= limits[-1]:
+                break
+            next_folder = fresh()
+            self.set("gate_timeout_retried", {**location, "name": check["name"], "old_timeout": limits[-1], "new_timeout": longer,
+                     "retry": len(limits), "log": receipt["log"], "next_log": str(next_folder / "gate.log")}, log=str(next_folder / "gate.log"))
+            limits.append(longer)
+            folder, retried_here = next_folder, True
+        if len(limits) > 1:
+            receipt["contract_sha256"] = contract_hash(check)  # the plan's gate, not the one run with more time
+            receipt["timeout_retried"] = {"limits": list(limits), **({} if retried_here else {"carried": True})}
+            if gate_timed_out(receipt):
+                again = (f"again at {limits[-1]} s with the limit doubled" if len(limits) == 2 else
+                         f"on {len(limits) - 1} retries with the limit doubled each time, the last at {limits[-1]} s")
+                on_baseline = " (its run on the proof baseline)" if receipt["artifact_error"] == BASELINE_TIMEOUT else ""
+                receipt["artifact_error"] = (f"Gate {check['name']!r}{on_baseline} exceeded its wall-clock timeout of {limits[0]} s, and {again}. "
+                                             f"The worker's change was not judged.")
+                receipt["timeout_retried"]["timed_out"] = True
+        return receipt, folder
+
     def observe_gate(self, check, path, state, step, snapshot, location, evidence=None):
-        folder = evidence_folder(evidence or self.evidence_dir(state), location["gate_index"])
+        parent = evidence or self.evidence_dir(state)
+        folder = evidence_folder(parent, location["gate_index"])
         log = folder / "gate.log"
         self.set("gate_started", {**location, "name": check["name"], "tree": snapshot,
                  "contract_sha256": contract_hash(check), "log": str(log)}, log=str(log))
         baseline = self.spec.get("proof_base", state["base"]) if "proof" in check else state["base"]
-        receipt = run_gate(check, path, folder, snapshot, paused=self.paused,
-                           **({"baseline": baseline} if check.get("kind") == "catalog" or "proof" in check else {}),
-                           max_log_bytes=self.spec.get("budgets", {}).get("max_log_bytes", 16 * 1024 * 1024),
-                           heartbeat=lambda info: self.set("process_heartbeat", {**info, "role": "gate"}))
+        receipt, folder = self.run_timed_gate(check, path, folder, snapshot, location, lambda: evidence_folder(parent, location["gate_index"]), baseline)
+        log = folder / "gate.log"
         receipt.update(location)
         if log.is_file() or observed_pass(receipt) is not None:
             try:
@@ -968,8 +1037,10 @@ class Run:
         if receipt.get("source_error"):
             self.reject(receipt["source_error"], "snapshot", repairable=False)
         elif receipt.get("input_error") or receipt.get("execution_error"):
-            self.set("blocked", {"during": "checking", "issue": receipt["artifact_error"]},
-                     phase="blocked", blocked_from="checking", last_error=receipt["artifact_error"])
+            issue = receipt["artifact_error"]
+            if (timed := receipt.get("timeout_retried")) and timed.get("timed_out"):
+                issue += " " + timeout_advice(timed["limits"][0])
+            self.set("blocked", {"during": "checking", "issue": issue}, phase="blocked", blocked_from="checking", last_error=issue)
         else:
             self.reject(f"{check['name']} exited {receipt['exit']} and could not collect its required evidence: "
                         f"{receipt.get('artifact_error')}\n{failure_excerpt(receipt['log'])}", "artifact")
@@ -1112,7 +1183,7 @@ class Run:
         try:
             config = dict(self.spec["advisory_ollama"])
             if self.spec.get("budgets", {}).get("max_seconds"):
-                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(current["started_at"])).total_seconds()
+                elapsed = run_clock(current, datetime.fromisoformat(timestamp()))[1]
                 config["timeout"] = max(.1, min(config.get("timeout", 90), self.spec["budgets"]["max_seconds"] - elapsed))
             summary = ", ".join(f"{check['name']} exit {check['exit']}" for check in json.loads(checks))
             inference = {}
@@ -1245,6 +1316,7 @@ class Run:
                 self.set("blocked", {"issue": str(error), "during": state["phase"]},
                          phase="blocked", blocked_from=state.get("blocked_from") or state["phase"], last_error=str(error))
                 return "blocked"
+            self.store.derive_clock(self.id)  # a run made by 0.19 keeps no active-time ledger: read it from its events before anything changes it
             if self.spec.get("pursue") and "final_checks" not in self.spec:
                 from . import pursuit
                 pursuit.settle_gates(self)  # a pursuit made by 0.19: its planned waves ask a wave's early milestones for the final-only checks

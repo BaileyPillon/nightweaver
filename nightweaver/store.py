@@ -45,6 +45,62 @@ def current_stop(events):
     return stop
 
 
+# The run clock. A run's time budget (budgets.max_seconds) is spent while the run works or waits on its own clock, not while it waits
+# for a person: the stretches it sits blocked and the stretches it is paused are not counted. The state keeps a ledger for it, written in
+# the same transaction as every change of phase or pause: `paused_seconds` is the time of the stretches that ended and `idle_since` is
+# when the one still open began, so reading the active time is O(1) and a crash loses nothing. Parking on a usage limit is NOT idle: the
+# run is waiting on its own clock by design (park_plan refuses a wait that outlasts the budget), so parked time counts.
+# A run made by 0.19 has no ledger; its stretches are read back once from these events (idle_from_events).
+BLOCKING = ("blocked", "budget_exhausted", "provider_unavailable", "dispatcher_run_failed", "verification_inconsistent",
+            "repeated_failure_stopped", "pursuit_stopped", "local_advice_required")
+CLOCK_EVENTS = (*BLOCKING, "blocked_run_retried", "pursuit_extended", "pause_requested", "runner_stopped", "resume_requested")
+
+
+def idle_from_events(events, started):
+    """The blocked and paused time in a run's events, oldest first, after `started`: (seconds of the stretches that ended, when the
+    one still open began or None). A run is blocked from the event that blocked it until the retry (or the extension that resumed it) and
+    paused from pause_requested until resume_requested; time that is both counts once."""
+    started = datetime.fromisoformat(started)
+    total, since, blocked, paused = 0.0, None, False, None
+    for event in events:
+        kind, details = event["kind"], event["details"]
+        if kind in BLOCKING:
+            blocked = True
+        elif kind == "blocked_run_retried" or (kind == "pursuit_extended" and (details.get("resumed") or details.get("phase") not in (None, "blocked"))):
+            blocked = False
+        elif kind == "pause_requested" or (kind == "runner_stopped" and paused is not False):  # a runner that stopped after the resume saw a stale pause
+            paused = True
+        elif kind == "resume_requested":
+            paused = False
+        else:
+            continue
+        at = max(started, datetime.fromisoformat(event["time"]))
+        if (blocked or paused) and since is None:
+            since = at
+        elif not (blocked or paused) and since is not None:
+            total += (at - since).total_seconds()
+            since = None
+    return total, since
+
+
+def run_clock(state, now):
+    """(wall, active) seconds since the run started. Active leaves out the blocked and paused stretches of the state's ledger, the open
+    one up to `now`; a state without a ledger (a plain dict, a run not yet resumed by 0.19.1) has none to leave out."""
+    wall = max(0.0, (now - datetime.fromisoformat(state["started_at"])).total_seconds())
+    idle = state.get("paused_seconds", 0)
+    if state.get("idle_since"):
+        idle += max(0.0, (now - datetime.fromisoformat(state["idle_since"])).total_seconds())
+    return wall, max(0.0, wall - idle)
+
+
+def with_ledger(state, events):
+    """The state of a run made before the ledger, with the ledger read from its events; any other state as it is. Read-only."""
+    if not state.get("started_at") or "paused_seconds" in state:
+        return state
+    seconds, since = idle_from_events(events, state["started_at"])
+    return {**state, "paused_seconds": seconds, "idle_since": since.isoformat(timespec="milliseconds") if since else None}
+
+
 class Store:
     def __init__(self, root=None):
         self.root = Path(root or default_home()).resolve()
@@ -217,7 +273,9 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            before = dict(row["state"])
             row["state"].update(changes)
+            self._ledger(db, run_id, row, before, row["pause"])
             db.execute("UPDATE runs SET state=?,updated=? WHERE id=?",
                        (json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, kind, details or {})
@@ -234,7 +292,9 @@ class Store:
             if first - 1 + len(milestones) > 50:
                 raise ValueError("A run supports at most 50 milestones")
             row["spec"]["milestones"] = [*row["spec"]["milestones"], *milestones]
+            before = dict(row["state"])
             row["state"].update(changes)
+            self._ledger(db, run_id, row, before, row["pause"])
             db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
                        (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, "wave_planned", {**details, "first_step": first})
@@ -246,7 +306,9 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
             revise(row["spec"])
+            before = dict(row["state"])
             row["state"].update(changes)
+            self._ledger(db, run_id, row, before, row["pause"])
             db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
                        (json.dumps(row["spec"]), json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, kind, details)
@@ -263,6 +325,7 @@ class Store:
             if not row["spec"].get("pursue"):
                 raise ValueError("This run does not pursue a goal")
             state = row["state"]
+            before = dict(state)
             if state["phase"] == "done":
                 raise ValueError("The goal was already met")
             blocked = state["phase"] == "blocked"
@@ -288,6 +351,7 @@ class Store:
                             "were discarded. Plan from the best build." if last.get("commit") and last["commit"] != state.get("accepted") else "")
                     state.update(phase="planning", judge_stage=None, plan_attempts=0, planner_route=0, pursuit_note=note, pursuit_failures=[],
                                  pursuit_gaps=gaps or [{"title": "The judge does not consider the goal met", "detail": "See the last judgment."}])
+            self._ledger(db, run_id, row, before, row["pause"])
             db.execute("UPDATE runs SET spec=?,state=?,updated=? WHERE id=?",
                        (json.dumps(row["spec"]), json.dumps(state), timestamp(), run_id))
             self._event(db, run_id, "pursuit_extended", {"waves": waves, "max_waves": row["spec"]["pursue"]["max_waves"],
@@ -300,7 +364,8 @@ class Store:
             row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
             if row["state"]["phase"] == "done" or row["pause"] == bool(value):
                 return False
-            db.execute("UPDATE runs SET pause=?,updated=? WHERE id=?", (int(value), timestamp(), run_id))
+            self._ledger(db, run_id, row, dict(row["state"]), row["pause"], bool(value))
+            db.execute("UPDATE runs SET pause=?,state=?,updated=? WHERE id=?", (int(value), json.dumps(row["state"]), timestamp(), run_id))
             self._event(db, run_id, "pause_requested" if value else "resume_requested", {})
             return True
 
@@ -403,6 +468,50 @@ class Store:
                 except (ValueError, KeyError, OSError, subprocess.SubprocessError):
                     continue
         return found
+
+    def _ledger(self, db, run_id, row, before, was_paused, paused=None):
+        """Settle the run clock's ledger in the state about to be saved (`row["state"]`, `before` being what it was): a run that is blocked
+        or paused after this change is idle from now, a run that is neither closes the stretch that was open. Called by every writer of
+        state or pause, inside its transaction, so the ledger and the phase it follows cannot disagree. A state made by 0.19 has no ledger: the
+        first writer to touch it reads it from the events and says so with an `active_time_derived` event, whoever that writer is. Returns
+        whether it did."""
+        after = row["state"]
+        if not after.get("started_at"):
+            return False  # the clock has not started
+        derived = "paused_seconds" not in after and bool(before.get("started_at"))
+        if "paused_seconds" not in after:
+            seconds, since = 0.0, None
+            if before.get("started_at"):  # made by 0.19, which kept no ledger: read its blocked and paused time back from its events
+                marks = ",".join("?" for _ in CLOCK_EVENTS)
+                seconds, since = idle_from_events(
+                    [{"kind": r["kind"], "time": r["time"], "details": json.loads(r["details"])} for r in db.execute(
+                        f"SELECT kind, time, details FROM events WHERE run_id=? AND kind IN ({marks}) ORDER BY seq", (run_id, *CLOCK_EVENTS))],
+                    before["started_at"])
+                was_idle = bool(was_paused) or before.get("phase") == "blocked"
+                # The state says whether a stretch is open: trust it over events that left one open or did not recognize the block.
+                since = (since or datetime.fromisoformat(row["updated"])) if was_idle else None
+            after.update(paused_seconds=round(seconds, 3), idle_since=since.isoformat(timespec="milliseconds") if since else None)
+            read = {"paused_seconds": after["paused_seconds"], "idle_since": after["idle_since"], "source": "events"}  # what the events said, before this change
+        idle = bool(was_paused if paused is None else paused) or after.get("phase") == "blocked"
+        if idle and not after.get("idle_since"):
+            after["idle_since"] = timestamp()
+        elif not idle and after.get("idle_since"):
+            gap = (datetime.fromisoformat(timestamp()) - datetime.fromisoformat(after["idle_since"])).total_seconds()
+            after.update(paused_seconds=round(after["paused_seconds"] + max(0.0, gap), 3), idle_since=None)
+        if derived:
+            self._event(db, run_id, "active_time_derived", read)
+        return derived
+
+    def derive_clock(self, run_id):
+        """Give a run made before the ledger its ledger, once, on resume (any other change to it would, too: see _ledger). Returns whether it did."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self.decode(db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            if not row["state"].get("started_at") or "paused_seconds" in row["state"]:
+                return False
+            self._ledger(db, run_id, row, dict(row["state"]), row["pause"])
+            db.execute("UPDATE runs SET state=?,updated=? WHERE id=?", (json.dumps(row["state"]), timestamp(), run_id))
+            return True
 
     @staticmethod
     def _event(db, run_id, kind, details):

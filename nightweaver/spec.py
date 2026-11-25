@@ -403,10 +403,11 @@ def validate(raw, relative_to=None, store=None):
     if "git_timeout" in raw:
         out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
     retry = raw.get("retry", {})
-    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds", "retry")
+    fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds gate_timeout_retries", "retry")
     defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3,
-                "max_parks": 8, "max_park_seconds": 21600}
-    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800)}
+                "max_parks": 8, "max_park_seconds": 21600, "gate_timeout_retries": 1}
+    limits = {"initial_seconds": (1, 3600), "max_seconds": (1, 3600), "max_parks": (0, 50), "max_park_seconds": (60, 604800),
+              "gate_timeout_retries": (0, 3)}  # a gate that times out is run again this many times, each with twice the time; 0 blocks at once, as 0.19 did
     out["retry"] = {key: integer(retry.get(key, value), key, *limits.get(key, (0, 20))) for key, value in defaults.items()}
     if "repair" in raw:
         from .repair import policy
