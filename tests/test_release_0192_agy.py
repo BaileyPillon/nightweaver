@@ -341,7 +341,7 @@ class ReadOnlyArgv(Hermetic):
 
 
 def rules_output(text):
-    return lambda executable, env, *args, timeout=30: (0, text) if "/permissions" in args else (0, "gemini-4-neon-xhigh")
+    return lambda executable, env, *args, timeout=30, cwd=None: (0, text) if "/permissions" in args else (0, "gemini-4-neon-xhigh")
 
 
 class Called(Hermetic):
@@ -530,7 +530,7 @@ class ReadOnlyHolds(Called):
     def test_the_worker_is_never_asked_about_the_rules(self):
         asked = []
 
-        def agy(executable, env, *args, timeout=30):
+        def agy(executable, env, *args, timeout=30, cwd=None):
             asked.append(args)
             return 0, "gemini-4-neon-xhigh"
 
@@ -540,7 +540,7 @@ class ReadOnlyHolds(Called):
     def test_the_rules_are_asked_for_with_the_file_the_call_uses_and_remembered_for_five_minutes(self):
         asked = []
 
-        def agy(executable, env, *args, timeout=30):
+        def agy(executable, env, *args, timeout=30, cwd=None):
             asked.append(args)
             return (0, LOADED) if "/permissions" in args else (0, "models")
 
@@ -557,7 +557,7 @@ class ReadOnlyHolds(Called):
     def test_a_missing_answer_from_agy_about_its_rules_does_not_stop_the_call(self):
         for output in ((None, ""), (1, "boom"), (0, "gemini-4-neon"), (0, '{"event":"command_result","command":{"name":"permissions","data":{}}}\n')):
             with self.subTest(output=output):
-                (code, _, _), _ = self.call(raw(2), mode="reviewer", agy=lambda executable, env, *args, timeout=30: output)
+                (code, _, _), _ = self.call(raw(2), mode="reviewer", agy=lambda executable, env, *args, timeout=30, cwd=None: output)
                 self.assertEqual(code, 0)
         self.assertEqual(providers.AGY_READ_ONLY, {}, "nothing was learned, so nothing is remembered")
 
@@ -565,7 +565,7 @@ class ReadOnlyHolds(Called):
         """/permissions would then run as a chat prompt, which is a model turn."""
         self.agy_settings(disableSlashCommands=True)
         asked = []
-        self.call(raw(2), mode="reviewer", agy=lambda executable, env, *args, timeout=30: (asked.append(args), (0, "x"))[1])
+        self.call(raw(2), mode="reviewer", agy=lambda executable, env, *args, timeout=30, cwd=None: (asked.append(args), (0, "x"))[1])
         self.assertFalse([a for a in asked if "/permissions" in a])
 
     def test_the_captured_permissions_output_is_read_as_the_rules_it_lists(self):

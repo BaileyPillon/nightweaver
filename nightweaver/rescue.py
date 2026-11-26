@@ -187,7 +187,7 @@ def diagnose(run, state, ex):
     run.set("rescue_diagnosis_started", {"adapter": config["kind"], "role": role, "wave": ex["wave"], "attempt": ex["attempts"] + 1},
             log=str(log), retry_at=None)
     code, _, answer = run.call_provider(config, role, path, log, diagnosis_prompt(run, state, ex, images), evidence=where, images=images,
-                                        mode="diagnosis")
+                                        mode="diagnosis", unreadable_ok=True)
     try:
         if code:
             raise ValueError(f"The {role} exited {code}: {(answer or tail(log))[:300]}")

@@ -15,7 +15,7 @@ import tempfile
 import time
 
 from .process import BusyRun, ExtendedLimits, PausedRun, WindowsJob, run_lock
-from .providers import ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
+from .providers import UNREADABLE, ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
 from . import context, notify
@@ -674,7 +674,11 @@ class Run:
                  usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None), **sessions,
                  **({"parks": 0} if succeeded and state.get("parks") else {}), **({"model_mismatches": seen} if mismatches else {}))
 
-    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None):
+    def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None, unreadable_ok=False):
+        """One provider call, counted and logged. `unreadable_ok` is for a caller that already answers an unreadable reply itself (it asks
+        again once, then records an unscored tie or skips its stage): a read-only call that finished with no answer, or only one it must
+        not take (providers.UNREADABLE), comes back as an empty answer for that caller instead of raising, so one silent judge, planner
+        or diagnoser cannot block a run that has a way past it. Any other caller gets the ProviderUnavailable and its retries."""
         self.check_budget(call=True)
         state = self.store.get(self.id)["state"]
         milestone = role in ("worker", "reviewer")
@@ -697,8 +701,14 @@ class Run:
             health["idle_timeout"] = IDLE_DEFAULT
         returned = False
         try:
-            result = invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
-                            session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
+            try:
+                result = invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
+                                session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
+            except ProviderUnavailable as error:
+                if not (unreadable_ok and error.kind in UNREADABLE):
+                    raise
+                self.set("answer_unreadable", {**describe_provider(config), "role": role, "reason": error.kind, "issue": str(error), "log": str(log)})
+                result = (0, session, "")
             returned = True
             return result
         finally:
@@ -1481,7 +1491,7 @@ class Run:
                         return "blocked"
                     failures = current.get("transient_failures", 0)
                     policy = self.spec.get("retry", {})
-                    if error.kind in ("transient", "no_answer", "read_only_refused") and failures < policy.get("transient_attempts", 2):
+                    if error.kind in ("transient", *UNREADABLE) and failures < policy.get("transient_attempts", 2):
                         delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** failures)
                         self.set("provider_retry_scheduled", {"issue": str(error), "seconds": delay, **provider},
                                  phase=next_phase, transient_failures=failures + 1, **refund,

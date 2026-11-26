@@ -90,6 +90,12 @@ class ProviderUnavailable(ValueError):
         self.reset_at = reset_at
 
 
+# The kinds invoke() raises for a read-only call that finished but gave nothing it can use: no answer at all, or one given after a refused
+# action. The engine retries them like a transient failure and then blocks; a caller that scores an unreadable answer itself can take them
+# as one instead (Run.call_provider(unreadable_ok=True)).
+UNREADABLE = ("no_answer", "read_only_refused")
+
+
 MONTHS = {name: number for number, name in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 CUE = r"(?:reset\w*|retry\w*|try again|available|until)\W{0,4}(?:(?:at|on|after|by|time)\b\W{0,3})*"
@@ -384,10 +390,11 @@ SIGNED_OUT = re.compile(r"sign in|signed in|log in|login required|authentication
 AGY_SIGNED_IN = {}  # agy path -> when `agy models` last succeeded
 
 
-def agy_run(executable, env, *args, timeout=30):
-    """(exit code, output) of one short agy command, or (None, "") when it could not run in time."""
+def agy_run(executable, env, *args, timeout=30, cwd=None):
+    """(exit code, output) of one short agy command run in `cwd` (this process's own folder when None), or (None, "") when it could not
+    run in time. agy reads its project-scope settings and permissions from the folder it runs in."""
     try:
-        done = subprocess.run([executable, *args], capture_output=True, stdin=subprocess.DEVNULL, env=env, timeout=timeout, text=True,
+        done = subprocess.run([executable, *args], capture_output=True, stdin=subprocess.DEVNULL, env=env, timeout=timeout, text=True, cwd=cwd,
                               encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return None, ""
@@ -460,30 +467,39 @@ def agy_rules(output):
     return None
 
 
-AGY_READ_ONLY = {}  # agy path -> when its read-only rules were last seen loaded
+AGY_READ_ONLY = {}  # (agy path, folder) -> when its read-only rules were last seen loaded there
 
 
-def antigravity_rules(executable, env):
+def read_only_key(executable, cwd):
+    return executable, None if cwd is None else os.path.normcase(os.path.abspath(cwd))
+
+
+def antigravity_rules(executable, env, cwd=None):
     """"enforced" when agy reports every read-only deny rule as loaded from the --settings file Nightweaver passes, "missing" when it
     reports the rules without them, None when it could not say (it did not run in time, or printed no command_result). It asks
-    `agy -p /permissions --settings FILE`, which agy answers without a model turn (checked on agy 1.5.17). A misspelt rule class would
-    still load, so this proves the file reached agy and was applied, not that every class name means something."""
-    code, output = agy_run(executable, env, "-p", "/permissions", "--output-format", "stream-json", "--settings", str(settings_file()))
+    `agy -p /permissions --settings FILE` in `cwd`, the folder the call it protects runs in, because agy also loads the project scope of
+    that folder (agy answers without a model turn, checked on agy 1.5.17). A misspelt rule class would still load, so this proves the
+    file reached agy and was applied, not that every class name means something."""
+    code, output = agy_run(executable, env, "-p", "/permissions", "--output-format", "stream-json", "--settings", str(settings_file()), cwd=cwd)
     loaded = agy_rules(output) if code == 0 else None
     state = None if loaded is None else "enforced" if set(AGY_DENY) <= loaded else "missing"
     if state == "enforced":
-        AGY_READ_ONLY[executable] = monotonic()
+        now = monotonic()
+        for stale in [known for known, seen in AGY_READ_ONLY.items() if now - seen >= 300]:
+            del AGY_READ_ONLY[stale]  # a run asks again in each milestone's worktree, so old folders must not pile up
+        AGY_READ_ONLY[read_only_key(executable, cwd)] = now
     return state
 
 
-def antigravity_guard(executable):
+def antigravity_guard(executable, cwd):
     """Stop a read-only call that agy would run without the deny rules. The barrier of every read-only role is that file, so a call is
-    not made when agy reports the rules did not load (a changed settings format, a policy that overrides them). A cleared check is
-    remembered for five minutes. Where agy cannot say, the call goes on: its own stream is checked afterwards (agy_violation). The
-    check is skipped when agy's settings.json turns slash commands off, because /permissions would then be a model turn."""
-    if monotonic() - AGY_READ_ONLY.get(executable, -1e9) < 300 or antigravity_settings().get("disableSlashCommands"):
+    not made when agy reports the rules did not load (a changed settings format, a policy or the folder's own project settings that
+    override them). agy is asked in the folder the call runs in, and a cleared check is remembered for five minutes for that folder. Where
+    agy cannot say, the call goes on: its own stream is checked afterwards (agy_violation). The check is skipped when agy's settings.json
+    turns slash commands off, because /permissions would then be a model turn."""
+    if monotonic() - AGY_READ_ONLY.get(read_only_key(executable, cwd), -1e9) < 300 or antigravity_settings().get("disableSlashCommands"):
         return
-    if antigravity_rules(executable, scrub_env(os.environ, own_credentials("antigravity", os.environ))) == "missing":
+    if antigravity_rules(executable, scrub_env(os.environ, own_credentials("antigravity", os.environ)), cwd) == "missing":
         raise ProviderUnavailable("agy did not load the read-only permission rules that Nightweaver passes with --settings "
                                   f"({', '.join(AGY_DENY)}), so a reviewer, judge or planner would run with permission to edit files "
                                   "and the call was not made. Run agy -p /permissions --settings <file> to see what it loaded, update "
@@ -503,7 +519,7 @@ def antigravity_report(config, cwd):
     code, listing = agy_run(executable, env, "models")
     report = {"auth": antigravity_source(env), "version": (version.strip().splitlines() or [None])[0],
               "signed_in": True if code == 0 else False if code is not None and SIGNED_OUT.search(listing) else None,
-              "read_only_rules": None if antigravity_settings().get("disableSlashCommands") else antigravity_rules(executable, env)}
+              "read_only_rules": None if antigravity_settings().get("disableSlashCommands") else antigravity_rules(executable, env, cwd)}
     if report["auth"] != "api_key" and antigravity_key(env):
         report["api_key_ignored"] = True  # GEMINI_API_KEY is set, but settings.json does not select the Gemini API
     if report["signed_in"] and config.get("model"):
@@ -1249,7 +1265,7 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
     argv, env = adapter(config, mode, session, images)
     argv = [executable, *argv[1:]]
     if config["kind"] == "antigravity" and "--settings" in argv:
-        antigravity_guard(executable)  # a read-only role is not started when agy did not load its deny rules
+        antigravity_guard(executable, cwd)  # a read-only role is not started when agy did not load its deny rules in its own folder
     if Path(executable).suffix.casefold() in (".cmd", ".bat"):
         # npm's Windows launcher is a shell script. Resolve the package's own JavaScript entrypoint without executing a shell.
         entry = gemini_entrypoint(executable) if config["kind"] == "gemini" else None

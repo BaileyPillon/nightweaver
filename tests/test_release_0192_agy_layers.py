@@ -364,7 +364,7 @@ class Doctor(Hermetic):
                        (0, '{"event":"command_result","command":{"name":"permissions","data":{"rules":["x"]}}}\n')):
             with self.subTest(output=output):
                 providers.AGY_READ_ONLY.clear()
-                report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30: output)
+                report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30, cwd=None: output)
                 self.assertEqual((report["status"], report["reason"], report["read_only_rules"]), ("unverified", "read_only_unverified", None))
                 self.assertIn("agy -p /permissions printed nothing Nightweaver recognises", report["action"])
                 self.assertIn("only the stream check and the run's snapshot check", report["action"])
@@ -375,7 +375,7 @@ class Doctor(Hermetic):
     def test_agys_own_settings_that_turn_slash_commands_off_are_named_as_the_reason(self):
         self.agy_settings(disableSlashCommands=True)
         asked = []
-        report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30: (asked.append(args), (0, "x"))[1])
+        report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30, cwd=None: (asked.append(args), (0, "x"))[1])
         self.assertEqual((report["status"], report["reason"], report["read_only_rules"]), ("unverified", "read_only_unverified", None))
         self.assertIn("turns slash commands off", report["action"])
         self.assertFalse([a for a in asked if "/permissions" in a], "still no model turn spent on asking")
@@ -385,11 +385,11 @@ class Doctor(Hermetic):
         self.assertEqual((report["status"], report["read_only_rules"]), ("ready", "enforced"))
         report, calls = self.check(raw(3), agy=rules_output(BARE))
         self.assertEqual((report["status"], report["reason"], calls), ("blocked", "configuration", []))
-        report, _ = self.check(retargeted(3, None, text="Sure, I can help with that.\n"), agy=lambda executable, env, *args, timeout=30: (0, "x"))
+        report, _ = self.check(retargeted(3, None, text="Sure, I can help with that.\n"), agy=lambda executable, env, *args, timeout=30, cwd=None: (0, "x"))
         self.assertEqual((report["status"], report["reason"]), ("unverified", "unexpected_response"))
 
     def test_the_plain_report_warns_before_any_model_call_when_the_rules_cannot_be_confirmed(self):
-        report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30: (0, "x"), live=False)
+        report, calls = self.check(raw(3), agy=lambda executable, env, *args, timeout=30, cwd=None: (0, "x"), live=False)
         self.assertEqual((report["status"], report["read_only_rules"], calls), ("configured", None, []))
         self.assertIn("could not confirm that it loads Nightweaver's read-only permission rules", report["action"])
         report, calls = self.check(raw(3), live=False)

@@ -46,7 +46,8 @@ def check_route(store, config, cwd, live):
         return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
-    AGY_READ_ONLY.pop(result.get("executable"), None)  # doctor asks agy about its rules afresh, not from the five-minute memory of a call
+    for known in [known for known in AGY_READ_ONLY if known[0] == result.get("executable")]:
+        del AGY_READ_ONLY[known]  # doctor asks agy about its rules afresh, not from the five-minute memory of a call
     try:
         with TemporaryDirectory(prefix="probe-", dir=store.root) as probe:
             probe_config = {**config, "executable": result["executable"]}
