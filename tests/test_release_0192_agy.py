@@ -131,7 +131,22 @@ def retargeted(number, payload, schema=None, text=None):
 
 # What `agy -p /permissions` printed (stdout), with no settings and with Nightweaver's --settings file. Zero turns, zero tokens.
 BARE = (STREAMS / "permissions-bare.jsonl").read_text(encoding="utf-8")
-LOADED = (STREAMS / "permissions-readonly.jsonl").read_text(encoding="utf-8")
+
+
+def with_deny(text, *rules):
+    """A permissions capture with more deny rules listed in the global scope, in the command_result event and in the result's copy of it. The
+    capture of the 0.19.2 file is what agy 1.5.17 printed; every later release passes more deny rules, which agy lists the same way."""
+    out = []
+    for line in text.splitlines():
+        event = json.loads(line)
+        for scope in (event if event["event"] == "command_result" else event["result"])["command"]["data"]["permissions"]:
+            if "deny" in scope:
+                scope["deny"] += [rule for rule in rules if rule not in scope["deny"]]
+        out.append(json.dumps(event, separators=(",", ":")))
+    return "\n".join(out) + "\n"
+
+
+LOADED = with_deny((STREAMS / "permissions-readonly.jsonl").read_text(encoding="utf-8"), *providers.AGY_NO_NETWORK)
 
 
 class Replayed(Hermetic):
@@ -300,24 +315,28 @@ class ReadOnlyArgv(Hermetic):
             self.assertEqual(("--json-schema" in argv), mode in SCHEMAS, mode)
             self.assertEqual(argv[argv.index("--effort") + 1:argv.index("--effort") + 2], ["xhigh"])
 
-    def test_the_worker_alone_may_edit_and_keeps_its_flag_and_no_settings(self):
+    def test_the_worker_alone_may_edit_and_keeps_its_flag_and_has_none_of_the_write_deny_rules(self):
+        """0.19.3: the worker also passes --settings, with the read allow-rules and only the login-read deny rules (see test_release_0193_agy_reads)."""
         argv, _ = providers.adapter({"kind": "antigravity"}, "worker")
         self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits")
         self.assertIn("--disable-slash-commands", argv)
-        self.assertNotIn("--settings", argv)
+        self.assertEqual(json.loads(Path(argv[argv.index("--settings") + 1]).read_text(encoding="utf-8")),
+                         {"permissions": {"allow": list(providers.AGY_ALLOW), "deny": providers.agy_secret_rules()}})
         self.assertNotIn("--json-schema", argv)
 
-    def test_the_settings_file_holds_exactly_the_deny_rules_the_live_runs_proved(self):
+    def test_the_settings_file_holds_exactly_the_deny_rules_the_live_runs_proved_and_the_read_allow_rules(self):
         argv, _ = providers.adapter({"kind": "antigravity"}, "reviewer")
         target = Path(argv[argv.index("--settings") + 1])
         self.assertTrue(target.is_relative_to(self.root / "home"), "Nightweaver's own folder, never a worktree")
-        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"permissions": {"deny": list(providers.AGY_DENY)}})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")),
+                         {"permissions": {"allow": list(providers.AGY_ALLOW), "deny": [*providers.AGY_DENY, *providers.agy_secret_rules()]}})
         self.assertEqual(providers.AGY_DENY[:4], ("write_file(*)", "write_file(/)", "write_file(.)", "command(*)"),
                          "the rules that exp-06 and exp-08 showed blocking edit_file, write_file and run_command")
         self.assertFalse(target.read_bytes().startswith(b"\xef\xbb\xbf"))
         target.write_text('{"permissions": {"deny": []}}', encoding="utf-8")
         providers.adapter({"kind": "antigravity"}, "judge")
-        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["permissions"]["deny"], list(providers.AGY_DENY), "a stale file is rewritten")
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["permissions"]["deny"], [*providers.AGY_DENY, *providers.agy_secret_rules()],
+                         "a stale file is rewritten")
         self.assertEqual({providers.adapter({"kind": "antigravity"}, mode)[0][providers.adapter({"kind": "antigravity"}, mode)[0].index("--settings") + 1]
                           for mode in READ_ONLY_MODES}, {str(target)}, "one file for every read-only role")
 
@@ -333,11 +352,11 @@ class ReadOnlyArgv(Hermetic):
         for flag in ("--settings", "--json-schema", "--mode"):
             self.assertIn(flag, argv, "agy was only seen honouring the flags that were repeated on the resumed call")
 
-    def test_the_version_is_0_19_2_everywhere(self):
+    def test_the_version_is_0_19_3_everywhere(self):
         import nightweaver
         root = Path(__file__).resolve().parent.parent
-        self.assertEqual(nightweaver.__version__, "0.19.2")
-        self.assertIn('version = "0.19.2"', (root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(nightweaver.__version__, "0.19.3")
+        self.assertIn('version = "0.19.3"', (root / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 def rules_output(text):
@@ -431,7 +450,8 @@ class EveryRole(Called):
         (code, session, answer), seen = self.call(raw(7), mode="worker", prompt="Fix sub.")
         self.assertEqual(code, 0)
         self.assertIn("--disable-slash-commands", seen["argv"])
-        self.assertNotIn("--settings", seen["argv"])
+        rules = json.loads(Path(seen["argv"][seen["argv"].index("--settings") + 1]).read_text(encoding="utf-8"))["permissions"]
+        self.assertFalse(set(providers.AGY_DENY) & set(rules["deny"]), "none of the write deny rules: the worker edits")
         self.assertIn("Fixed sub()", answer, "exp-07 is the worker's shape: edit_file and write_file completed, and that is allowed")
 
     def test_a_read_only_prompt_that_starts_with_a_slash_is_not_run_as_a_command(self):
@@ -570,8 +590,9 @@ class ReadOnlyHolds(Called):
 
     def test_the_captured_permissions_output_is_read_as_the_rules_it_lists(self):
         self.assertEqual(providers.agy_rules(BARE), set(), "no settings: three scopes and no rule")
-        self.assertEqual(providers.agy_rules(LOADED), {"write_file(*)", "write_file(/)", "write_file(.)", "command(*)", "mcp(*)", "mcp(*/*)"},
-                         "the capture was taken with a wider candidate set")
+        self.assertEqual(providers.agy_rules(LOADED), {"write_file(*)", "write_file(/)", "write_file(.)", "command(*)", "mcp(*)", "mcp(*/*)",
+                                                       *providers.AGY_NO_NETWORK},
+                         "the capture was taken with a wider candidate set, and has the network rules of 0.19.3 added")
         self.assertIsNone(providers.agy_rules("warning: x\nnot json\n"))
         self.assertIsNone(providers.agy_rules(""))
         with patch("nightweaver.providers.agy_run", return_value=(0, LOADED)):

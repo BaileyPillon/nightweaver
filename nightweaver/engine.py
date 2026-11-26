@@ -15,7 +15,8 @@ import tempfile
 import time
 
 from .process import BusyRun, ExtendedLimits, PausedRun, WindowsJob, run_lock
-from .providers import UNREADABLE, ProviderUnavailable, advisory, describe_provider, invoke, json_response, metadata, reset_after, same_model, served_models, usage
+from .providers import (UNREADABLE, ProviderUnavailable, advisory, agy_network, credential_paths, describe_provider, invoke, json_response, metadata,
+                        protect, reset_after, same_model, served_models, usage)
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
 from .insights import budget_status, failure_excerpt
 from . import context, notify
@@ -624,6 +625,7 @@ class Run:
         self.spec = row["spec"]
         self.root = store.directory(run_id)
         self.repository = Path(self.spec["repository"])
+        protect(credential_paths(self.spec), keep=(self.repository, self.root))  # no agy read of this run's roles opens a login its routes use
         self.ref = row["state"].get("result_ref", f"refs/heads/rookline/{run_id}")
         self.gate_limits = {}  # (tree, gate) -> the timeouts a gate has been run with on that tree, the plan's first: see run_timed_gate
 
@@ -713,6 +715,18 @@ class Run:
             return result
         finally:
             self.finish_call(pending, succeeded=returned)
+            self.flag_network(config, role, mode or role, log)
+
+    def flag_network(self, config, role, mode, log):
+        """Record a warning (event read_only_network) when a read-only agy call completed a web search or a URL read. agy's rules cannot stop
+        a search (search_web ran under every rule tried), and a read-only role may read any local file, so a search is the one way out for what
+        a prompt-injected file made it read. The warning names the steps and never discards the call's answer: a search is not a failure."""
+        if config["kind"] != "antigravity" or mode == "worker" or not (reached := agy_network(log)):
+            return
+        shown = [redact(step)[:200] for step in reached[:5]]
+        self.set("read_only_network", {**describe_provider(config), "role": role, "steps": shown, "count": len(reached), "log": str(log),
+                                       "warning": f"A read-only {role} call used the network ({'; '.join(shown)}). agy's permission rules cannot stop a web "
+                                                  "search, so a file the call read could have reached the web in a query. The answer was kept."})
 
     def worktree(self, state):
         use_git_timeout(self.spec)

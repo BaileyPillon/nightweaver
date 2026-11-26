@@ -46,7 +46,7 @@ class Hermetic(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {**keep, "NIGHTWEAVER_HOME": str(self.root / "home"), "LOCALAPPDATA": str(self.root / "local"),
                                                   "USERPROFILE": str(self.root / "user"), "HOME": str(self.root / "user")}, clear=True))
         self.enterContext(patch("nightweaver.providers.user_environment", return_value=None))
-        for remembered in (providers.AGY_SIGNED_IN, providers.AGY_READ_ONLY):
+        for remembered in (providers.AGY_SIGNED_IN, providers.AGY_READ_ONLY, providers.AGY_PROTECTED):
             remembered.clear()
             self.addCleanup(remembered.clear)
 
@@ -109,11 +109,16 @@ class AntigravityArgv(Hermetic):
         self.assertEqual(providers.adapter({"kind": "antigravity"}, "worker")[0][0], str(installed))
 
     def test_every_mode_reads_the_task_from_stdin_as_stream_json_and_only_the_worker_may_edit(self):
-        """0.19.2: every role runs --mode accept-edits (plan mode is gone); the worker is the only one without the read-only --settings."""
+        """0.19.2: every role runs --mode accept-edits (plan mode is gone). 0.19.3: every role passes --settings (the read allow-rules); the
+        worker is the only one whose file holds none of the write deny rules (it holds the login-read ones, as every file does)."""
         for mode in ALL_MODES:
             argv, env = providers.adapter({"kind": "antigravity"}, mode)
             self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits", mode)
-            self.assertEqual("--settings" in argv, mode != "worker", mode)
+            self.assertEqual(argv.count("--settings"), 1, mode)
+            rules = json.loads(Path(argv[argv.index("--settings") + 1]).read_text(encoding="utf-8"))["permissions"]
+            self.assertEqual(set(providers.AGY_DENY) <= set(rules["deny"]), mode != "worker", mode)
+            self.assertLessEqual(set(providers.agy_secret_rules()), set(rules["deny"]), mode)
+            self.assertEqual(rules["allow"], list(providers.AGY_ALLOW), mode)
             self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
             self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
             for flag in ("--print", "-p", "--prompt", "--dangerously-skip-permissions", "--sandbox", "--effort", "--model", "--conversation"):
