@@ -57,6 +57,11 @@ SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "requir
 # keeps a rule whatever its class is called (a bogus_tool(*) rule is loaded), so a misspelt class would fail open; antigravity_guard asks
 # agy which rules it loaded, and agy_stream reports any write it completed anyway.
 AGY_DENY = ("write_file(*)", "write_file(/)", "write_file(.)", "command(*)", "mcp(*)")
+# Put in front of the prompt of every read-only agy call. The role prompts say only "remain read-only", so a model that sees gate scripts in the
+# repository may try to run them, be refused under the deny rules, and answer anyway; invoke() then discards that answer (read_only_refused).
+AGY_READ_ONLY_NOTE = ("This call is read-only. Every file write or edit and every shell or terminal command is denied, and an answer given "
+                      "after a denied attempt is discarded. Use only read tools: read files, list folders, search. Everything you need "
+                      "(the task, diffs, check results, logs) is in this prompt or in files you can read.")
 # The tool steps a read-only role must never complete. Every name below is in the tool list agy 1.5.17 announces in its init event, except
 # write_file and edit_file, which the streams show and that list does not: AGY_FILE_WRITERS change a file (Nightweaver can see which one),
 # AGY_RUNNERS run something (a shell command, a notebook cell, an MCP tool, a workflow) or change state elsewhere, so their effect is never
@@ -1289,8 +1294,12 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
                 tag_file(log).write_text(config_tag(claude_directory(env)), encoding="ascii")
             except OSError:
                 pass
+        if config["kind"] == "antigravity" and "--settings" in argv:
+            prompt = AGY_READ_ONLY_NOTE + "\n\n" + prompt  # a read-only role is told what is denied; the worker's prompt is never touched
         if config["kind"] == "antigravity" and "--disable-slash-commands" not in argv and prompt.lstrip().startswith("/"):
-            prompt = "Task:\n" + prompt  # a read-only role's prompt must not run as a slash command (the worker's flag does that)
+            # A read-only role's prompt must not run as a slash command (the worker's flag does that). The note now comes first, so this no
+            # longer fires; it stays as a guard in case the note is ever empty or moved.
+            prompt = "Task:\n" + prompt
         message = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n" if config["kind"] == "antigravity" else prompt
         # A subagent's steps are not in agy's stream, so what a read-only call's subagent did is read from the files (only when it ran one).
         before = agy_tree(cwd, [log]) if config["kind"] == "antigravity" and mode != "worker" else None

@@ -413,7 +413,8 @@ class EveryRole(Called):
     def test_the_probe_and_the_real_ready_capture(self):
         (code, _, answer), seen = self.call(raw(3), mode="probe", prompt="Reply with the single word READY.")
         self.assertEqual((code, answer.strip().casefold()), (0, "ready"))
-        self.assertEqual(json.loads(seen["prompt"])["message"]["content"], "Reply with the single word READY.")
+        self.assertEqual(json.loads(seen["prompt"])["message"]["content"], providers.AGY_READ_ONLY_NOTE + "\n\nReply with the single word READY.",
+                         "a read-only call's prompt follows the note that says edits and commands are denied (see test_release_0192_agy_note)")
 
     def test_the_reviewer_over_the_real_captures_with_and_without_a_schema(self):
         for number, mode in ((1, "brief"), (2, "reviewer"), (4, "reviewer"), (9, "reviewer")):
@@ -434,12 +435,15 @@ class EveryRole(Called):
         self.assertIn("Fixed sub()", answer, "exp-07 is the worker's shape: edit_file and write_file completed, and that is allowed")
 
     def test_a_read_only_prompt_that_starts_with_a_slash_is_not_run_as_a_command(self):
+        note = providers.AGY_READ_ONLY_NOTE + "\n\n"
         _, seen = self.call(raw(3), mode="probe", prompt="/permissions please")
-        self.assertEqual(json.loads(seen["prompt"])["message"]["content"], "Task:\n/permissions please")
+        content = json.loads(seen["prompt"])["message"]["content"]
+        self.assertEqual(content, note + "/permissions please", "the note comes first, so the message no longer starts with a slash")
+        self.assertFalse(content.lstrip().startswith("/"))
         _, seen = self.call(raw(3), mode="worker", prompt="/permissions please")
         self.assertEqual(json.loads(seen["prompt"])["message"]["content"], "/permissions please", "the worker has --disable-slash-commands instead")
         _, seen = self.call(raw(3), mode="probe", prompt="  Review /permissions")
-        self.assertEqual(json.loads(seen["prompt"])["message"]["content"], "  Review /permissions")
+        self.assertEqual(json.loads(seen["prompt"])["message"]["content"], note + "  Review /permissions")
 
 
 class EmptyAnswer(Called):
