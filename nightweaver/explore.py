@@ -197,7 +197,7 @@ def plan_directions(run, state, ex):
     config = run.route(state, None, "planner")
     run.set("directions_started", {"adapter": config["kind"], "attempt": ex["attempts"] + 1}, log=str(log), retry_at=None)
     code, _, answer = run.call_provider(config, "planner", path, log, directions_prompt(run, state, step, count, ex),
-                                        evidence=folder(run), mode="directions")
+                                        evidence=folder(run), mode="directions", unreadable_ok=True)
     try:
         if code:
             raise ValueError(f"The planner exited {code}: {(answer or tail(log))[:300]}")
@@ -441,7 +441,7 @@ def ask(run, state, ex, labelled, prompt, images, *, single, total, workers, nam
     log = where / f"compare-{number + 1:02d}-{state.get('provider_calls', 0) + 1:04d}.jsonl"
     (run.root / "worktrees").mkdir(parents=True, exist_ok=True)
     code, _, answer = run.call_provider(config, "judge", run.root / "worktrees", log, prompt, evidence=where, images=images,
-                                        mode="ranking" if single else "comparison")
+                                        mode="ranking" if single else "comparison", unreadable_ok=True)
     order = [b["index"] for _, b in labelled]
     invalid = None
     try:

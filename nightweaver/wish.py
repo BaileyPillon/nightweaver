@@ -15,7 +15,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .engine import git, git_bytes
-from .providers import ProviderUnavailable, invoke
+from .providers import UNREADABLE, ProviderUnavailable, invoke
 from .safety import atomic_write, redact, scrub_env, write_json
 from .spec import provider, strict_json, validate
 from .store import timestamp
@@ -181,9 +181,15 @@ def read_brief(answer):
             "visual": data["visual"], **({} if web is None else {"web": web}), "conflicts": conflict_notes(data.get("conflicts"))}
 
 
+UNREADABLE_BRIEF = {"no_answer": "it was empty",
+                    "read_only_refused": "it came after an attempt to change files or run commands, which this read-only call refuses"}
+
+
 def write_brief(config, plan, wish, folder):
-    """One read-only model call, repeated once with the rejection reason when its JSON does not qualify."""
-    prompt, problem = brief_prompt(plan, wish), None
+    """One read-only model call, repeated once with the rejection reason when its JSON does not qualify, and that includes an answer agy
+    gave nothing readable for (providers.UNREADABLE: empty, or given after a refused edit). Any other provider failure ends it at once.
+    When the last attempt ends unreadable, its own message (what agy refused, the plan file it wrote, the log) goes into the final error."""
+    prompt, problem, unreadable = brief_prompt(plan, wish), None, None
     for attempt in (1, 2):
         log = folder / f"brief-writer-{attempt}.jsonl"
         asked = prompt if problem is None else (
@@ -191,14 +197,18 @@ def write_brief(config, plan, wish, folder):
         try:
             code, _, answer = invoke(config, "brief", Path(plan["repository"]), log, asked, BRIEF_TIMEOUT, lambda: False)
         except ProviderUnavailable as error:
-            raise ValueError(f"The brief writer ({config['kind']}) is unavailable: {error}") from error
+            if error.kind not in UNREADABLE:
+                raise ValueError(f"The brief writer ({config['kind']}) is unavailable: {error}") from error
+            problem, unreadable = UNREADABLE_BRIEF.get(error.kind, "it was unreadable"), str(error).strip()
+            continue
         if code:
             raise ValueError(f"The brief writer {'timed out' if code == 124 else f'exited {code}'}. See {log}")
         try:
             return read_brief(answer), log, attempt
         except ValueError as error:
-            problem = str(error)
-    raise ValueError(f"The brief writer returned no valid brief twice ({problem}). Nothing was registered. See {folder}")
+            problem, unreadable = str(error), None
+    said = "" if not unreadable else f" The last call said: {unreadable}{'' if unreadable.endswith(('.', '!', '?')) else '.'}"
+    raise ValueError(f"The brief writer returned no valid brief twice ({problem}).{said} Nothing was registered. See {folder}")
 
 
 def ollama_advisory():
