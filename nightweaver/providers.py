@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import subprocess
@@ -56,7 +57,21 @@ SCHEMAS = {"reviewer": {"type": "object", "additionalProperties": False, "requir
 # keeps a rule whatever its class is called (a bogus_tool(*) rule is loaded), so a misspelt class would fail open; antigravity_guard asks
 # agy which rules it loaded, and agy_stream reports any write it completed anyway.
 AGY_DENY = ("write_file(*)", "write_file(/)", "write_file(.)", "command(*)", "mcp(*)")
-AGY_WRITERS = ("write_file", "edit_file", "run_command")  # the tool steps a read-only role must never complete
+# The tool steps a read-only role must never complete. Every name below is in the tool list agy 1.5.17 announces in its init event, except
+# write_file and edit_file, which the streams show and that list does not: AGY_FILE_WRITERS change a file (Nightweaver can see which one),
+# AGY_RUNNERS run something (a shell command, a notebook cell, an MCP tool, a workflow) or change state elsewhere, so their effect is never
+# read from a path. AGY_WRITER_NAME catches a writing tool a later agy adds. Only write_file, edit_file and run_command are proven to be
+# stopped by the rules; the rest are the stream check's job.
+AGY_FILE_WRITERS = ("write_file", "edit_file", "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file", "notebook_edit")
+AGY_RUNNERS = ("run_command", "send_command_input", "notebook_execution", "run_workflow", "call_mcp_tool", "generate_image", "delete_knowledge")
+AGY_WRITERS = AGY_FILE_WRITERS + AGY_RUNNERS
+AGY_WRITER_NAME = re.compile(r"(?:^|_)(?:write|edit|replace|sed|delete|remove|patch|insert|rename|create|append|save|run|exec)(?:_|$)")
+AGY_TREE_LIMIT = 20000  # files agy_tree will list before it gives up
+# A step of this kind starts a subagent. agy 1.5.17 writes it as one step (step_type "subagent", ACTIVE then DONE, with subagent_info) and none
+# of the subagent's own steps, so what a subagent did can only be read from the tree (agy_tree).
+AGY_DELEGATES = ("invoke_subagent", "browser_subagent")
+AGY_PATH_KEYS = ("Path", "TargetFile", "AbsolutePath", "FilePath", "File")  # where a file tool names its file (write_file and edit_file: Path)
+AGY_TALK = ("agent_response", "user_input", "system_message", "finish")  # steps that are not tool calls
 AGY_PLAN = "implementation_plan.md"
 AGY_USAGE = ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens")
 
@@ -689,10 +704,55 @@ def agy_failed(body):
     return bool((status and status != "SUCCESS") or (reason and AGY_FAILED_REASON.search(str(reason))))
 
 
+def agy_where(path):
+    """A path as one comparable string: forward slashes, `.` and `..` resolved, case folded (agy runs on Windows, where both are the same)."""
+    return posixpath.normpath(str(path).replace("\\", "/")).casefold()
+
+
 def agy_scratch(path):
-    """Whether a path is inside agy's own conversation folder (~/.gemini/antigravity-cli/brain), where it keeps plans and notes."""
-    parts = [part.lower() for part in re.split(r"[\\/]+", str(path))]
-    return any(parts[i:i + 3] == [".gemini", "antigravity-cli", "brain"] for i in range(len(parts)))
+    """Whether a file path is inside agy's own conversation folder, <home>/.gemini/antigravity-cli/brain, where it keeps plans and notes.
+    The path is resolved first and compared with that folder under this process's home, so a path that only contains the folder's name
+    (a repository with such a subfolder, another home) or climbs out of it with `..` is not agy's own."""
+    return bool(str(path).strip()) and agy_where(path).startswith(agy_where(Path.home() / ".gemini" / "antigravity-cli" / "brain") + "/")
+
+
+def agy_writes(name):
+    """Whether a tool step by this name changes files or runs something."""
+    return name in AGY_WRITERS or bool(AGY_WRITER_NAME.search(name))
+
+
+def agy_target(name, params):
+    """(text for a message, whether the step is only agy writing in its own folder). Only a file tool is exempt, and only when every path it
+    names is agy's own: a command line is never a path, and a step that names no path gives no proof."""
+    paths = [str(params[key]) for key in AGY_PATH_KEYS if params.get(key)]
+    own = name not in AGY_RUNNERS and bool(paths) and all(agy_scratch(path) for path in paths)
+    return (paths or [str(params.get("CommandLine") or "")])[0], own
+
+
+def agy_tree(folder, skip=()):
+    """{relative path: (size, mtime_ns)} of every file under folder except .git and node_modules (and the files named in skip), or None when
+    it cannot be read or holds more than AGY_TREE_LIMIT files. Nightweaver's own check of what a subagent did, which the stream does not show."""
+    found, skip = {}, {os.path.normcase(os.path.abspath(path)) for path in skip}
+    try:
+        for base, folders, files in os.walk(folder):
+            folders[:] = [name for name in folders if name not in (".git", "node_modules")]
+            for name in files:
+                path = os.path.join(base, name)
+                if os.path.normcase(os.path.abspath(path)) not in skip:
+                    info = os.stat(path)
+                    found[os.path.relpath(path, folder)] = (info.st_size, info.st_mtime_ns)
+            if len(found) > AGY_TREE_LIMIT:
+                return None
+    except OSError:
+        return None
+    return found
+
+
+def agy_changes(before, after):
+    """The files that differ between two agy_tree results, sorted ([] when either is unknown)."""
+    if before is None or after is None:
+        return []
+    return sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
 
 
 def agy_answer(body, mode, said):
@@ -718,15 +778,20 @@ def agy_stream(path, mode=None):
     agent_response, tool, system_message, finish). An agent_response streams text_delta chunks (ACTIVE) and its DONE event holds the last
     chunk, or the whole message when none was streamed, with that step's usage; a tool step carries tool_name and tool_info (parameters,
     output, or error when agy refused it). result names conversation_id, status, response, structured_output (with --json-schema),
-    num_turns and usage, cumulative over a resumed conversation; finished_reason and error only appear on a failure. A step may belong
-    to a subagent's conversation, so only init and result name this one and a subagent's words are not this call's answer.
+    num_turns and usage, cumulative over a resumed conversation; finished_reason and error only appear on a failure. A subagent shows as
+    one step (step_type subagent, tool_name invoke_subagent, ACTIVE then DONE, subagent_info naming its prompt, conversation and workspace)
+    and none of its own steps are in this stream (checked on 1.5.17), so what it did is not known here. A step that did name another
+    conversation is tolerated: only init and result name this one, and another conversation's words are not this call's answer.
 
     Returns {session, answer, source, usage (the result's), call_usage (this call's: the sum of its steps' own usage, which a resumed
     conversation's cumulative result cannot say), model, failed, status, reason, error, messages (agent messages with text), denied
-    (tool steps agy refused under a deny rule: expected for a read-only role), wrote (write, edit and command steps that completed
-    outside agy's own folder) and plan_file (the implementation_plan.md agy wrote, named in the stream and never read)}."""
+    (tool steps agy refused under a deny rule), refused (the denied ones outside agy's own folder: a read-only role tried to change
+    something), wrote (tool steps that change files or run something and completed, see agy_writes, outside agy's own folder),
+    delegated (subagent steps, whose own steps are not in the stream) and plan_file (the implementation_plan.md agy wrote, named in the
+    stream and never read)}."""
     found = {"session": None, "answer": "", "source": None, "usage": None, "call_usage": None, "model": None, "failed": False,
-             "status": None, "reason": None, "error": None, "messages": 0, "denied": [], "wrote": [], "plan_file": None}
+             "status": None, "reason": None, "error": None, "messages": 0, "denied": [], "refused": [], "wrote": [], "delegated": [],
+             "plan_file": None}
     texts, spent, result = {}, {}, None
     for event in json_events(path):
         label = event.get("event")
@@ -745,18 +810,24 @@ def agy_stream(path, mode=None):
                     texts[index] = (texts.get(index, "") + body["text_delta"])[-100000:]
                 if body.get("state") == "DONE" and isinstance(body.get("usage"), dict):
                     spent[(conversation, index)] = body["usage"]
-            elif body.get("step_type") == "tool":
+            elif body.get("step_type") not in AGY_TALK and (body.get("tool_name") or isinstance(body.get("tool_info"), dict)
+                                                            or isinstance(body.get("subagent_info"), dict) or body.get("step_type") == "subagent"):
                 info = body.get("tool_info") if isinstance(body.get("tool_info"), dict) else {}
-                name = body.get("tool_name") or info.get("name")
+                name = str(body.get("tool_name") or info.get("name") or "")
                 params = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
-                target = str(params.get("Path") or params.get("CommandLine") or "")
+                target, own = agy_target(name, params)
                 refusal = info.get("error", {}).get("message") if isinstance(info.get("error"), dict) else None
-                if body.get("state") == "ERROR" and isinstance(refusal, str) and AGY_DENIED.search(refusal):
+                if name in AGY_DELEGATES or body.get("step_type") == "subagent" or isinstance(body.get("subagent_info"), dict):
+                    if (name or "subagent") not in found["delegated"]:
+                        found["delegated"].append(name or "subagent")
+                elif body.get("state") == "ERROR" and isinstance(refusal, str) and AGY_DENIED.search(refusal):
                     found["denied"].append(f"{name} {target}"[:300])
-                elif body.get("state") == "DONE" and name in AGY_WRITERS and not agy_scratch(target):
+                    if not own:
+                        found["refused"].append(f"{name} {target}"[:300])
+                elif body.get("state") == "DONE" and agy_writes(name) and not own:
                     found["wrote"].append(f"{name} {target}"[:300])
-                if name == "write_file" and body.get("state") != "ERROR" and re.split(r"[\\/]", target)[-1].lower() == AGY_PLAN:
-                    found["plan_file"] = target
+                if name == "write_file" and body.get("state") != "ERROR" and re.split(r"[\\/]", str(params.get("Path") or ""))[-1].lower() == AGY_PLAN:
+                    found["plan_file"] = str(params["Path"])
         elif label == "result":
             result = body
             found.update(status=str(body.get("status") or "").upper() or None, failed=agy_failed(body), reason=body.get("finished_reason"),
@@ -792,6 +863,15 @@ def agy_violation(found, mode, log):
     return (f"The Antigravity {mode} call is read-only, but agy completed {len(found['wrote'])} action{'s' if len(found['wrote']) != 1 else ''} "
             f"that change files ({'; '.join(found['wrote'][:3])}), so its permission rules did not hold and its answer is discarded. "
             f"Check the worktree for edits and run doctor --live. See {log}.")
+
+
+def agy_refusal(found, mode, log):
+    """The message for a read-only call that tried to change something, was refused under the deny rules and answered anyway."""
+    count = len(found["refused"])
+    return (f"The Antigravity {mode} call is read-only, but agy tried {count} action{'s' if count != 1 else ''} that change files or run commands "
+            f"and was refused under the permission rules ({'; '.join(found['refused'][:3])}). It answered anyway, and an answer written after refused "
+            f"actions can describe the refusals instead of the work, so it is not taken as a {mode} result. See {log}. A run retries this as a "
+            "transient failure before it blocks; resume with --retry once the role stays read-only.")
 
 
 def metadata(path, kind, mode=None):
@@ -1212,9 +1292,13 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
         if config["kind"] == "antigravity" and "--disable-slash-commands" not in argv and prompt.lstrip().startswith("/"):
             prompt = "Task:\n" + prompt  # a read-only role's prompt must not run as a slash command (the worker's flag does that)
         message = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n" if config["kind"] == "antigravity" else prompt
+        # A subagent's steps are not in agy's stream, so what a read-only call's subagent did is read from the files (only when it ran one).
+        before = agy_tree(cwd, [log]) if config["kind"] == "antigravity" and mode != "worker" else None
         code = execute(argv, cwd, log, timeout, prompt=message, env=env, paused=paused, **(health or {}))
     current, answer = metadata(log, config["kind"], mode)
     found = agy_stream(log, mode) if config["kind"] == "antigravity" else None
+    if found and found["delegated"] and mode != "worker" and (changed := agy_changes(before, agy_tree(cwd, [log]))):
+        found["wrote"].append(f"{found['delegated'][0]} (its steps are not in the stream; the files changed: {', '.join(changed[:3])})"[:300])
     if found and found["wrote"] and mode != "worker":
         # The deny rules are the barrier, this reads what agy completed, and Nightweaver's snapshot checks are the net behind both.
         raise ProviderUnavailable(agy_violation(found, mode, log), "read_only_violation")
@@ -1229,6 +1313,9 @@ def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, eviden
     if found and code == 0 and mode != "worker" and not answer.strip():
         # A read-only role exists to answer. An exit 0 with nothing to read is a failure that says so (a worker's prose is not its product).
         raise ProviderUnavailable(agy_silence(found, mode, log), "no_answer")
+    if found and code == 0 and mode != "worker" and found["refused"]:
+        # The rules held, but the role was not doing its job: it went for an edit or a command and answered afterwards.
+        raise ProviderUnavailable(agy_refusal(found, mode, log), "read_only_refused")
     if code and config["kind"] in {"claude", "codex", "deepseek", "gemini", "antigravity"} and code not in CONTROLLER_EXITS:
         # Only what the provider itself reported as a failure is classified, never the worker's own prose or its tool output.
         # A call the controller ended (time, idle or output limit) was not a provider failure at all.

@@ -2,8 +2,10 @@
 
 The streams in tests/agy_streams are what agy 1.5.17 really wrote in nine signed-in runs on 2026-11-25 (a scratch repository with one seeded
 bug, `agy --input-format stream-json --output-format stream-json`, the task on stdin as Nightweaver sends it), with conversation ids and local
-paths replaced. Two more files hold what `agy -p /permissions` printed, which costs no model turn. Every test replays those captures or builds
-a variation of one (the answer of another role swapped in, an answer blanked); no model is called and no network is used."""
+paths replaced. A tenth capture (exp-10) is a review run by the skeptic who tested the read-only layers: a read-only reviewer asked to try six
+writing tools, one of them a subagent. Two more files hold what `agy -p /permissions` printed, which costs no model turn. Every test replays
+those captures or builds a variation of one (the answer of another role swapped in, an answer blanked, a tool step swapped for another tool's,
+as `tooled` does); no model is called and no network is used."""
 
 import json
 from pathlib import Path
@@ -50,6 +52,33 @@ def result_of(number):
 def put(path, items):
     write(path, *items)
     return path
+
+
+TESTER = "C:\\Users\\tester"  # the made-up home folder the captures name (agy keeps its conversation folder under the home)
+
+
+def at_home(items, home):
+    """The captures with their made-up home folder replaced by the temporary one that Path.home() returns in a test."""
+    old, new = json.dumps(TESTER)[1:-1], json.dumps(str(home))[1:-1]
+    return [(line if isinstance(line, str) else json.dumps(line)).replace(old, new) for line in items]
+
+
+def tooled(number, *calls, step_type="tool"):
+    """A capture whose tool steps are replaced by these calls, in the shape agy wrote them: ACTIVE, then DONE (or ERROR with the refusal agy
+    wrote when a call is (name, parameters, message)). Init, messages, usage and result stay, so the answer is the capture's."""
+    kept = [e for e in events(number) if not (e["event"] == "step_update" and part(e)["step_type"] in ("tool", "subagent"))]
+    conversation = kept[0]["conversation_id"]
+    made = []
+    for index, (name, params, *refusal) in enumerate(calls, start=2):
+        info = {"name": name, "parameters": params}
+        made.append({"event": "step_update", "step_update": {"conversation_id": conversation, "step_index": index, "state": "ACTIVE",
+                                                              "step_type": step_type, "tool_name": name, "tool_info": info}})
+        end = {**info, "error": {"type": "TOOL_ERROR", "message": refusal[0]}} if refusal else info
+        made.append({"event": "step_update", "step_update": {"conversation_id": conversation, "step_index": index,
+                                                              "state": "ERROR" if refusal else "DONE", "step_type": step_type, "tool_name": name,
+                                                              "duration_seconds": 0.5, "tool_info": end}})
+    at = next(i for i, e in enumerate(kept) if e["event"] == "result")
+    return kept[:at] + made + kept[at:]
 
 
 def blanked(number):
@@ -107,7 +136,7 @@ LOADED = (STREAMS / "permissions-readonly.jsonl").read_text(encoding="utf-8")
 
 class Replayed(Hermetic):
     def log(self, items, name="call.jsonl"):
-        return put(self.root / name, items)
+        return put(self.root / name, at_home(items, self.root / "user"))
 
     def stream(self, number, mode=None, items=None):
         return providers.agy_stream(self.log(items if items is not None else raw(number)), mode)
@@ -117,7 +146,7 @@ class RealStreams(Replayed):
     """The parser against every success stream agy 1.5.17 wrote: conversation, model, answer and where it came from, usage, how it ended."""
 
     def test_every_capture_names_its_conversation_model_and_a_clean_finish(self):
-        for number in range(1, 10):
+        for number in range(1, 11):
             found = self.stream(number, "reviewer")
             self.assertRegex(found["session"], r"^00000000-0000-4000-8000-\d{12}$", number)
             self.assertEqual((found["model"], found["status"], found["failed"], found["reason"], found["error"]),
@@ -220,7 +249,7 @@ class RealStreams(Replayed):
         self.assertEqual(providers.provider_errors(self.log(raw(8))), raw(8)[0], "the stderr line is all a classifier would see")
 
     def test_the_served_model_is_the_init_model_for_every_capture(self):
-        for number in range(1, 10):
+        for number in range(1, 11):
             self.assertEqual(providers.served_models({"kind": "antigravity"}, self.log(raw(number))), {"models": ["gemini-4-neon"], "source": "init"})
 
 
@@ -318,12 +347,15 @@ def rules_output(text):
 class Called(Hermetic):
     """Each role's path through invoke(), with agy replaced by one that writes a capture."""
 
-    def call(self, items, *, mode, config=None, code=0, agy=None, prompt="Review it.", **kwargs):
+    def call(self, items, *, mode, config=None, code=0, agy=None, prompt="Review it.", during=None, **kwargs):
+        """`during` runs while agy "runs": whatever a subagent or a tool does to the worktree (the folder the call is made in, self.root)."""
         seen = {"executed": 0}
 
         def fake(argv, cwd, log, timeout, **options):
             seen.update(argv=argv, prompt=options["prompt"], env=options["env"], executed=seen["executed"] + 1)
-            put(log, items)
+            put(log, at_home(items, self.root / "user"))
+            if during:
+                during()
             return code
 
         with patch("nightweaver.providers.execute", side_effect=fake), patch("nightweaver.providers.agy_run", side_effect=agy or rules_output(LOADED)):
@@ -384,7 +416,7 @@ class EveryRole(Called):
         self.assertEqual(json.loads(seen["prompt"])["message"]["content"], "Reply with the single word READY.")
 
     def test_the_reviewer_over_the_real_captures_with_and_without_a_schema(self):
-        for number, mode in ((1, "brief"), (2, "reviewer"), (4, "reviewer"), (6, "reviewer"), (8, "reviewer"), (9, "reviewer")):
+        for number, mode in ((1, "brief"), (2, "reviewer"), (4, "reviewer"), (9, "reviewer")):
             with self.subTest(capture=number):
                 (code, _, answer), _ = self.call(raw(number), mode=mode)
                 self.assertEqual((code, extract_verdict(answer, ("PASS", "REVISE"))["verdict"]), (0, "REVISE"))
@@ -467,9 +499,12 @@ class ReadOnlyHolds(Called):
                 self.assertNotIn("PASS", str(caught.exception).split("(")[0])
 
     def test_the_refusals_under_the_deny_rules_are_not_violations(self):
-        for number in (6, 8):
-            (code, _, _), _ = self.call(raw(number), mode="reviewer")
-            self.assertEqual(code, 0, number)
+        """The rules held, so nothing was written: the call is not a read_only_violation. (Whether its answer can be trusted is
+        RefusedThenAnswered's question (tests/test_release_0192_agy_layers.py).)"""
+        for number in (6, 8, 10):
+            with self.assertRaises(ProviderUnavailable) as caught:
+                self.call(raw(number), mode="reviewer")
+            self.assertEqual(caught.exception.kind, "read_only_refused", number)
 
     def test_a_violation_is_reported_even_when_the_call_failed_afterwards(self):
         with self.assertRaises(ProviderUnavailable) as caught:
@@ -715,8 +750,8 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(ids)
         self.assertTrue(all(i.startswith("00000000-0000-4000-8000-") for i in ids), ids)
 
-    def test_nine_captures_and_two_permission_listings(self):
-        self.assertEqual(len(list(STREAMS.glob("exp-*.jsonl"))), 9)
+    def test_ten_captures_and_two_permission_listings(self):
+        self.assertEqual(len(list(STREAMS.glob("exp-*.jsonl"))), 10)
         self.assertEqual(json.loads(BARE.splitlines()[0])["command"]["name"], "permissions")
         self.assertEqual(json.loads(LOADED.splitlines()[-1])["result"]["num_turns"], 0)
 

@@ -12,8 +12,8 @@ from urllib.request import urlopen
 from uuid import uuid4
 
 from .engine import identity_error, source_info
-from .providers import (ProviderUnavailable, advisory, antigravity_report, check_provider, claude_auth, describe_provider, gemini_auth,
-                        invoke)
+from .providers import (AGY_READ_ONLY, ProviderUnavailable, advisory, antigravity_report, antigravity_settings, check_provider, claude_auth,
+                        describe_provider, gemini_auth, invoke)
 
 
 def check_route(store, config, cwd, live):
@@ -39,10 +39,14 @@ def check_route(store, config, cwd, live):
                 " GEMINI_API_KEY is set, but agy ignores it without \"modelProvider\": \"gemini\" in its settings.json, so this route runs "
                 "on agy's own sign-in." if result.get("api_key_ignored") else
                 " agy did not report Nightweaver's read-only permission rules as loaded, so a reviewer, judge or planner route would be "
-                "blocked before its call." if result.get("read_only_rules") == "missing" else "")
+                "blocked before its call." if result.get("read_only_rules") == "missing" else
+                " agy could not confirm that it loads Nightweaver's read-only permission rules (its settings turn slash commands off, or " 
+                "/permissions printed an unrecognised answer), so a reviewer, judge or planner route would rely on the stream and snapshot checks "
+                "alone." if config["kind"] == "antigravity" and result.get("read_only_rules") is None else "")
         return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
+    AGY_READ_ONLY.pop(result.get("executable"), None)  # doctor asks agy about its rules afresh, not from the five-minute memory of a call
     try:
         with TemporaryDirectory(prefix="probe-", dir=store.root) as probe:
             probe_config = {**config, "executable": result["executable"]}
@@ -54,6 +58,13 @@ def check_route(store, config, cwd, live):
         return {**result, "status": "blocked", "reason": "launch_failed", "action": "Could not start the provider process.",
                 "log": str(log)}
     if code == 0 and answer.strip().casefold().rstrip(".") == "ready":
+        if config["kind"] == "antigravity" and result.get("read_only_rules") != "enforced":
+            return {**result, "status": "unverified", "reason": "read_only_unverified", "log": str(log),
+                    "action": "agy answered, but Nightweaver could not confirm that it loads the read-only permission rules (" + (
+                        "agy's own settings.json turns slash commands off, so asking /permissions would cost a model turn" if
+                        antigravity_settings().get("disableSlashCommands") else "agy -p /permissions printed nothing Nightweaver recognises") +
+                    "). A reviewer, judge or planner route would run with only the stream check and the run's snapshot check behind it. "
+                    "Update agy or allow slash commands in its settings, then run doctor --live again."}
         return {**result, "status": "ready", "log": str(log)}
     # The probe runs in the same read-only configuration as a reviewer or judge, and a clean exit with nothing in it is its own finding.
     silent = code == 0 and not answer.strip()
