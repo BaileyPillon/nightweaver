@@ -187,8 +187,9 @@ UNREADABLE_BRIEF = {"no_answer": "it was empty",
 
 def write_brief(config, plan, wish, folder):
     """One read-only model call, repeated once with the rejection reason when its JSON does not qualify, and that includes an answer agy
-    gave nothing readable for (providers.UNREADABLE: empty, or given after a refused edit). Any other provider failure ends it at once."""
-    prompt, problem = brief_prompt(plan, wish), None
+    gave nothing readable for (providers.UNREADABLE: empty, or given after a refused edit). Any other provider failure ends it at once.
+    When the last attempt ends unreadable, its own message (what agy refused, the plan file it wrote, the log) goes into the final error."""
+    prompt, problem, unreadable = brief_prompt(plan, wish), None, None
     for attempt in (1, 2):
         log = folder / f"brief-writer-{attempt}.jsonl"
         asked = prompt if problem is None else (
@@ -198,15 +199,16 @@ def write_brief(config, plan, wish, folder):
         except ProviderUnavailable as error:
             if error.kind not in UNREADABLE:
                 raise ValueError(f"The brief writer ({config['kind']}) is unavailable: {error}") from error
-            problem = UNREADABLE_BRIEF.get(error.kind, "it was unreadable")
+            problem, unreadable = UNREADABLE_BRIEF.get(error.kind, "it was unreadable"), str(error).strip()
             continue
         if code:
             raise ValueError(f"The brief writer {'timed out' if code == 124 else f'exited {code}'}. See {log}")
         try:
             return read_brief(answer), log, attempt
         except ValueError as error:
-            problem = str(error)
-    raise ValueError(f"The brief writer returned no valid brief twice ({problem}). Nothing was registered. See {folder}")
+            problem, unreadable = str(error), None
+    said = "" if not unreadable else f" The last call said: {unreadable}{'' if unreadable.endswith(('.', '!', '?')) else '.'}"
+    raise ValueError(f"The brief writer returned no valid brief twice ({problem}).{said} Nothing was registered. See {folder}")
 
 
 def ollama_advisory():

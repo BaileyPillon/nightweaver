@@ -70,7 +70,14 @@ AGY_READ_ONLY_NOTE = ("This call is read-only. Every file write or edit and ever
 AGY_FILE_WRITERS = ("write_file", "edit_file", "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file", "notebook_edit")
 AGY_RUNNERS = ("run_command", "send_command_input", "notebook_execution", "run_workflow", "call_mcp_tool", "generate_image", "delete_knowledge")
 AGY_WRITERS = AGY_FILE_WRITERS + AGY_RUNNERS
-AGY_WRITER_NAME = re.compile(r"(?:^|_)(?:write|edit|replace|sed|delete|remove|patch|insert|rename|create|append|save|run|exec)(?:_|$)")
+AGY_WRITER_NAME = re.compile(r"(?:^|_)(?:write|edit|replace|sed|delete|remove|patch|insert|rename|create|append|save|run|exec)(?:_|$)", re.I)
+# The tools of agy 1.5.17 that only read and reach nothing outside: they cannot change a file, run anything or act for the user. The init
+# event's tool list has view_file, list_dir, grep_search, find_by_name, read_url_content (fetches a page), search_web, read_resource,
+# list_resources and read_browser_page; the streams also show read_file (completed in exp-06, 08, 09 and 10). When a step is denied
+# under a deny rule, only one of these is taken for a harmless read: any other name, a writer, an MCP tool, a browser action, a
+# message or a name nobody has seen, is treated as an attempt to act (agy_stream, `refused`). Compared case-insensitively.
+AGY_READS = ("read_file", "view_file", "list_dir", "grep_search", "find_by_name", "read_url_content", "search_web", "read_resource",
+             "list_resources", "read_browser_page")
 AGY_TREE_LIMIT = 20000  # files agy_tree will list before it gives up
 # A step of this kind starts a subagent. agy 1.5.17 writes it as one step (step_type "subagent", ACTIVE then DONE, with subagent_info) and none
 # of the subagent's own steps, so what a subagent did can only be read from the tree (agy_tree).
@@ -717,8 +724,18 @@ def adapter(config, mode, session=None, images=()):
 AGY_FAILED_REASON = re.compile(r"error|time.?out|interrupt|cancel|abort|fail", re.I)
 # agy ends a refused tool step in state ERROR, and the run goes on. The message carries agy's own refusal ("Permission denied for
 # write_file(C:/work/repo/calc.py). Matches user-configured deny rule."), so only that wording counts: an error that merely echoes a file
-# name with "deny rule" in it, or an operating system's own "Permission denied", is not a refusal.
-AGY_DENIED = re.compile(r"Permission denied for\b.*\bMatches user-configured deny rule\b", re.I | re.S)
+# name with "deny rule" in it, or an operating system's own "Permission denied", is not a refusal. The two halves are searched one after
+# the other, never as one pattern with `.*` between them, which backtracks quadratically on a long message that has the first half and not the
+# second (250 KB took 16 s).
+AGY_DENIED_HEAD = re.compile(r"Permission denied for\b", re.I)
+AGY_DENIED_TAIL = re.compile(r"\bMatches user-configured deny rule\b", re.I)
+
+
+def agy_denied(message):
+    """Whether an error message is agy's refusal under a deny rule: "Permission denied for" and, somewhere after it, "Matches
+    user-configured deny rule". Linear in the message: the earliest start of the first half is searched, then the second half after it."""
+    head = AGY_DENIED_HEAD.search(message)
+    return bool(head and AGY_DENIED_TAIL.search(message, head.end()))
 
 
 def agy_failed(body):
@@ -742,14 +759,19 @@ def agy_scratch(path):
 
 def agy_writes(name):
     """Whether a tool step by this name changes files or runs something."""
-    return name in AGY_WRITERS or bool(AGY_WRITER_NAME.search(name))
+    return name.casefold() in AGY_WRITERS or bool(AGY_WRITER_NAME.search(name))
+
+
+def agy_reads(name):
+    """Whether this tool is one of agy's pure read tools (AGY_READS), whatever the case of its name."""
+    return name.casefold() in AGY_READS
 
 
 def agy_target(name, params):
     """(text for a message, whether the step is only agy writing in its own folder). Only a file tool is exempt, and only when every path it
     names is agy's own: a command line is never a path, and a step that names no path gives no proof."""
     paths = [str(params[key]) for key in AGY_PATH_KEYS if params.get(key)]
-    own = name not in AGY_RUNNERS and bool(paths) and all(agy_scratch(path) for path in paths)
+    own = name.casefold() not in AGY_RUNNERS and bool(paths) and all(agy_scratch(path) for path in paths)
     return (paths or [str(params.get("CommandLine") or "")])[0], own
 
 
@@ -810,7 +832,7 @@ def agy_stream(path, mode=None):
     Returns {session, answer, source, usage (the result's), call_usage (this call's: the sum of its steps' own usage, which a resumed
     conversation's cumulative result cannot say), model, failed, status, reason, error, messages (agent messages with text), denied
     (tool steps agy refused under a deny rule, whatever the tool: a user's own rule can deny a read), refused (the denied ones outside
-    agy's own folder that would change something, see agy_writes: a read-only role tried to change something), wrote (tool steps that
+    agy's own folder except agy's pure read tools, see AGY_READS: a read-only role tried to act), wrote (tool steps that
     change files or run something and completed, see agy_writes, outside agy's own folder), delegated (subagent steps, whose own steps are
     not in the stream) and plan_file (the implementation_plan.md agy wrote, named in the stream and never read)}."""
     found = {"session": None, "answer": "", "source": None, "usage": None, "call_usage": None, "model": None, "failed": False,
@@ -844,9 +866,9 @@ def agy_stream(path, mode=None):
                 if name in AGY_DELEGATES or body.get("step_type") == "subagent" or isinstance(body.get("subagent_info"), dict):
                     if (name or "subagent") not in found["delegated"]:
                         found["delegated"].append(name or "subagent")
-                elif body.get("state") == "ERROR" and isinstance(refusal, str) and AGY_DENIED.search(refusal):
+                elif body.get("state") == "ERROR" and isinstance(refusal, str) and agy_denied(refusal):
                     found["denied"].append(f"{name} {target}"[:300])
-                    if not own and (agy_writes(name) or not name):  # a denied read (a user's own rule) is not an attempt to change anything
+                    if not own and not agy_reads(name):  # only a denied pure read (a user's own rule) is harmless: any other tool, or none, is refused
                         found["refused"].append(f"{name} {target}"[:300])
                 elif body.get("state") == "DONE" and agy_writes(name) and not own:
                     found["wrote"].append(f"{name} {target}"[:300])

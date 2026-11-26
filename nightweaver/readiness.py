@@ -1,6 +1,5 @@
 """Check the routes selected by a plan before starting a run."""
 
-from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 import json
@@ -14,24 +13,10 @@ from uuid import uuid4
 
 from .engine import identity_error, source_info
 from .providers import (AGY_READ_ONLY, ProviderUnavailable, advisory, antigravity_report, antigravity_settings, check_provider, claude_auth,
-                        describe_provider, find_executable, gemini_auth, invoke)
+                        describe_provider, gemini_auth, invoke)
 
 
 def check_route(store, config, cwd, live):
-    """One route's report. A live agy route is asked about its read-only rules once: the report asks in the folder the probe will run
-    in, so the folder is made first, and the probe's own check reuses that fresh answer instead of asking again."""
-    if not (live and config["kind"] == "antigravity"):
-        return route_report(store, config, cwd, live)
-    try:
-        with TemporaryDirectory(prefix="probe-", dir=store.root) as probe:
-            return route_report(store, config, cwd, live, Path(probe))
-    except OSError:
-        return {**describe_provider(config), "status": "blocked", "reason": "launch_failed",
-                "action": "Could not start the provider process."}
-
-
-def route_report(store, config, cwd, live, probe=None):
-    """What check_route reports for one route. `probe` is the folder a live agy probe runs in, made by check_route."""
     result = describe_provider(config)
     if config["kind"] == "claude":
         try:
@@ -39,12 +24,7 @@ def route_report(store, config, cwd, live, probe=None):
         except ProviderUnavailable:
             result["auth"] = "oauth_token_file"
     if config["kind"] == "antigravity":
-        if live:
-            executable = find_executable(config, cwd)
-            for known in [known for known in AGY_READ_ONLY if known[0] == executable]:
-                del AGY_READ_ONLY[known]  # doctor asks agy about its rules afresh, not from the five-minute memory of a call
-        # version, how it signs in and whether it is; the sign-in itself is never read. A live check asks in the probe's folder.
-        result.update(antigravity_report(config, probe or cwd))
+        result.update(antigravity_report(config, cwd))  # version, how it signs in and whether it is; the sign-in itself is never read
     if config["kind"] == "gemini":
         result["auth"] = gemini_auth(config)
     try:
@@ -66,10 +46,12 @@ def route_report(store, config, cwd, live, probe=None):
         return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
+    for known in [known for known in AGY_READ_ONLY if known[0] == result.get("executable")]:
+        del AGY_READ_ONLY[known]  # doctor asks agy about its rules afresh, not from the five-minute memory of a call
     try:
-        with nullcontext(probe) if probe else TemporaryDirectory(prefix="probe-", dir=store.root) as folder:
+        with TemporaryDirectory(prefix="probe-", dir=store.root) as probe:
             probe_config = {**config, "executable": result["executable"]}
-            code, _, answer = invoke(probe_config, "probe", Path(folder), log, "Reply with the single word READY.",
+            code, _, answer = invoke(probe_config, "probe", Path(probe), log, "Reply with the single word READY.",
                                      45, lambda: False)
     except ProviderUnavailable as error:
         return {**result, "status": "blocked", "reason": error.kind, "action": str(error), "log": str(log)}
