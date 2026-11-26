@@ -15,7 +15,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .engine import git, git_bytes
-from .providers import ProviderUnavailable, invoke
+from .providers import UNREADABLE, ProviderUnavailable, invoke
 from .safety import atomic_write, redact, scrub_env, write_json
 from .spec import provider, strict_json, validate
 from .store import timestamp
@@ -181,8 +181,13 @@ def read_brief(answer):
             "visual": data["visual"], **({} if web is None else {"web": web}), "conflicts": conflict_notes(data.get("conflicts"))}
 
 
+UNREADABLE_BRIEF = {"no_answer": "it was empty",
+                    "read_only_refused": "it came after an attempt to change files or run commands, which this read-only call refuses"}
+
+
 def write_brief(config, plan, wish, folder):
-    """One read-only model call, repeated once with the rejection reason when its JSON does not qualify."""
+    """One read-only model call, repeated once with the rejection reason when its JSON does not qualify, and that includes an answer agy
+    gave nothing readable for (providers.UNREADABLE: empty, or given after a refused edit). Any other provider failure ends it at once."""
     prompt, problem = brief_prompt(plan, wish), None
     for attempt in (1, 2):
         log = folder / f"brief-writer-{attempt}.jsonl"
@@ -191,7 +196,10 @@ def write_brief(config, plan, wish, folder):
         try:
             code, _, answer = invoke(config, "brief", Path(plan["repository"]), log, asked, BRIEF_TIMEOUT, lambda: False)
         except ProviderUnavailable as error:
-            raise ValueError(f"The brief writer ({config['kind']}) is unavailable: {error}") from error
+            if error.kind not in UNREADABLE:
+                raise ValueError(f"The brief writer ({config['kind']}) is unavailable: {error}") from error
+            problem = UNREADABLE_BRIEF.get(error.kind, "it was unreadable")
+            continue
         if code:
             raise ValueError(f"The brief writer {'timed out' if code == 124 else f'exited {code}'}. See {log}")
         try:

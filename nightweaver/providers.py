@@ -715,7 +715,10 @@ def adapter(config, mode, session=None, images=()):
 
 
 AGY_FAILED_REASON = re.compile(r"error|time.?out|interrupt|cancel|abort|fail", re.I)
-AGY_DENIED = re.compile(r"deny rule", re.I)  # "... Matches user-configured deny rule." ends a tool step in state ERROR, and the run goes on
+# agy ends a refused tool step in state ERROR, and the run goes on. The message carries agy's own refusal ("Permission denied for
+# write_file(C:/work/repo/calc.py). Matches user-configured deny rule."), so only that wording counts: an error that merely echoes a file
+# name with "deny rule" in it, or an operating system's own "Permission denied", is not a refusal.
+AGY_DENIED = re.compile(r"Permission denied for\b.*\bMatches user-configured deny rule\b", re.I | re.S)
 
 
 def agy_failed(body):
@@ -806,10 +809,10 @@ def agy_stream(path, mode=None):
 
     Returns {session, answer, source, usage (the result's), call_usage (this call's: the sum of its steps' own usage, which a resumed
     conversation's cumulative result cannot say), model, failed, status, reason, error, messages (agent messages with text), denied
-    (tool steps agy refused under a deny rule), refused (the denied ones outside agy's own folder: a read-only role tried to change
-    something), wrote (tool steps that change files or run something and completed, see agy_writes, outside agy's own folder),
-    delegated (subagent steps, whose own steps are not in the stream) and plan_file (the implementation_plan.md agy wrote, named in the
-    stream and never read)}."""
+    (tool steps agy refused under a deny rule, whatever the tool: a user's own rule can deny a read), refused (the denied ones outside
+    agy's own folder that would change something, see agy_writes: a read-only role tried to change something), wrote (tool steps that
+    change files or run something and completed, see agy_writes, outside agy's own folder), delegated (subagent steps, whose own steps are
+    not in the stream) and plan_file (the implementation_plan.md agy wrote, named in the stream and never read)}."""
     found = {"session": None, "answer": "", "source": None, "usage": None, "call_usage": None, "model": None, "failed": False,
              "status": None, "reason": None, "error": None, "messages": 0, "denied": [], "refused": [], "wrote": [], "delegated": [],
              "plan_file": None}
@@ -843,7 +846,7 @@ def agy_stream(path, mode=None):
                         found["delegated"].append(name or "subagent")
                 elif body.get("state") == "ERROR" and isinstance(refusal, str) and AGY_DENIED.search(refusal):
                     found["denied"].append(f"{name} {target}"[:300])
-                    if not own:
+                    if not own and (agy_writes(name) or not name):  # a denied read (a user's own rule) is not an attempt to change anything
                         found["refused"].append(f"{name} {target}"[:300])
                 elif body.get("state") == "DONE" and agy_writes(name) and not own:
                     found["wrote"].append(f"{name} {target}"[:300])
