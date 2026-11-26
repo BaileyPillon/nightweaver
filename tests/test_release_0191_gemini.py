@@ -1,7 +1,8 @@
 """Nightweaver 0.19.1 Gemini group: the Gemini CLI route made to work on this machine (the npm package's real entrypoint, folder trust for
 headless worktrees, Gemini's own error texts classified so a login or quota problem parks or blocks instead of burning attempts) and the
-new antigravity kind for Google's agy CLI (argv for every mode, effort per model, a stream-json parser that is still pending live
-verification, sign-in detection, credential scrubbing). No model is called and no network is used."""
+new antigravity kind for Google's agy CLI (argv for every mode, effort per model, a stream-json parser, sign-in detection, credential
+scrubbing). The parser's fixtures here are synthetic shapes; the signed-in streams agy 1.5.17 wrote are replayed in test_release_0192_agy.
+No model is called and no network is used."""
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -45,8 +46,9 @@ class Hermetic(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {**keep, "NIGHTWEAVER_HOME": str(self.root / "home"), "LOCALAPPDATA": str(self.root / "local"),
                                                   "USERPROFILE": str(self.root / "user"), "HOME": str(self.root / "user")}, clear=True))
         self.enterContext(patch("nightweaver.providers.user_environment", return_value=None))
-        providers.AGY_SIGNED_IN.clear()
-        self.addCleanup(providers.AGY_SIGNED_IN.clear)
+        for remembered in (providers.AGY_SIGNED_IN, providers.AGY_READ_ONLY):
+            remembered.clear()
+            self.addCleanup(remembered.clear)
 
     def agy_settings(self, **fields):
         """agy's settings.json in the (temporary) user home, as the Antigravity CLI reads it."""
@@ -107,25 +109,26 @@ class AntigravityArgv(Hermetic):
         self.assertEqual(providers.adapter({"kind": "antigravity"}, "worker")[0][0], str(installed))
 
     def test_every_mode_reads_the_task_from_stdin_as_stream_json_and_only_the_worker_may_edit(self):
+        """0.19.2: every role runs --mode accept-edits (plan mode is gone); the worker is the only one without the read-only --settings."""
         for mode in ALL_MODES:
             argv, env = providers.adapter({"kind": "antigravity"}, mode)
-            self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits" if mode == "worker" else "plan", mode)
+            self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits", mode)
+            self.assertEqual("--settings" in argv, mode != "worker", mode)
             self.assertEqual(argv[argv.index("--input-format") + 1], "stream-json")
             self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
             for flag in ("--print", "-p", "--prompt", "--dangerously-skip-permissions", "--sandbox", "--effort", "--model", "--conversation"):
                 self.assertNotIn(flag, argv, f"{flag} in {mode}: --print takes its prompt as a flag value and ignores stdin, and "
                                  "--input-format stream-json rejects a flag prompt")
 
-    def test_plan_mode_is_never_combined_with_the_flag_that_switches_it_off(self):
-        """agy 1.5.15 applies --mode plan through slash command expansion: with --disable-slash-commands it prints 'warning: --mode plan has no
-        effect while slash command expansion is disabled' and runs in its default request-review mode (reproduced against the real agy.exe)."""
+    def test_no_role_runs_plan_mode_and_only_the_worker_disables_slash_commands(self):
+        """agy 1.5.15 applies --mode plan through slash command expansion (with --disable-slash-commands it warns that plan mode has no effect
+        and runs in its default mode). 0.19.2 stopped using plan mode, so no flag combination can switch a read-only role's mode off; the
+        worker keeps --disable-slash-commands, and invoke() guards a read-only prompt that starts with / (test_release_0192_agy.EveryRole)."""
         for mode in ALL_MODES:
             for config in ({"kind": "antigravity"}, {"kind": "antigravity", "model": "gemini-4-neon", "effort": "xhigh"}):
                 argv, _ = providers.adapter(config, mode, "conv-1")
-                if argv[argv.index("--mode") + 1] == "plan":
-                    self.assertNotIn("--disable-slash-commands", argv, mode)
-        self.assertIn("--disable-slash-commands", providers.adapter({"kind": "antigravity"}, "worker")[0],
-                      "accept-edits is unaffected, and the worker keeps the flag that stops a task starting with / from running as a command")
+                self.assertNotEqual(argv[argv.index("--mode") + 1], "plan", mode)
+                self.assertEqual("--disable-slash-commands" in argv, mode == "worker", mode)
 
     def test_effort_model_and_resume_follow_the_route(self):
         config = {"kind": "antigravity", "model": "gemini-4-neon", "effort": "xhigh", "executable": "agy"}
@@ -631,8 +634,8 @@ def result(**fields):
 
 CONVERSATION = "874f329d-2a94-4f4d-b047-5d4659ba3d06"
 ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 0}
-# Captured from agy 1.5.15 (a call with a dummy API key that the service rejected, exit 3; the init tool list is cut to two names). This is the
-# only complete stream seen so far: no signed-in run has produced a success.
+# Captured from agy 1.5.15 (a call with a dummy API key that the service rejected, exit 3; the init tool list is cut to two names). The error
+# half of the stream; the success half was captured from agy 1.5.17 in 0.19.2 (tests/agy_streams).
 REAL_ERROR = (
     {"event": "init", "conversation_id": CONVERSATION, "init": {"model": "gemini-4-neon-xhigh", "cwd": "C:\\work", "tools": ["read_file", "run_command"],
                                                                 "permission_mode": "request-review"}},
@@ -649,8 +652,8 @@ REAL_REFUSAL = {"event": "result", "result": {"conversation_id": "", "status": "
 
 
 class AntigravityStream(Hermetic):
-    """The success half of the stream-json parser is PENDING LIVE VERIFICATION: its fixtures come from agy's docs. The error half is checked
-    against REAL_ERROR and REAL_REFUSAL, which agy 1.5.15 printed."""
+    """Synthetic success streams (the shapes the parser accepts, odd ones included) and the error half, checked against REAL_ERROR and
+    REAL_REFUSAL, which agy 1.5.15 printed. The success streams agy 1.5.17 wrote are replayed in test_release_0192_agy."""
 
     def test_the_captured_error_stream_is_a_failed_call_with_its_conversation_and_model(self):
         log = self.log(*REAL_ERROR)
@@ -814,7 +817,8 @@ class AntigravityCall(Hermetic):
         self.assertEqual(added, [str(evidence), str(shots)], "a folder already under the evidence folder is not added twice")
         self.assertNotIn("--image", argv)
         self.assertEqual(seen["env"]["NIGHTWEAVER_EVIDENCE"], str(evidence))
-        self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits")
+        self.assertIn("--settings", argv, "a judge is read-only")
 
     def test_a_judge_gets_the_structured_answer(self):
         verdict = {"verdict": "MET", "score": 90, "criteria": [], "gaps": [], "reason": "ok"}

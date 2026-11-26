@@ -37,7 +37,9 @@ def check_route(store, config, cwd, live):
     if not live:
         hint = (" No Gemini credential was found: set GEMINI_API_KEY or sign in with the CLI." if result.get("auth") == "none_found" else
                 " GEMINI_API_KEY is set, but agy ignores it without \"modelProvider\": \"gemini\" in its settings.json, so this route runs "
-                "on agy's own sign-in." if result.get("api_key_ignored") else "")
+                "on agy's own sign-in." if result.get("api_key_ignored") else
+                " agy did not report Nightweaver's read-only permission rules as loaded, so a reviewer, judge or planner route would be "
+                "blocked before its call." if result.get("read_only_rules") == "missing" else "")
         return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
@@ -53,8 +55,11 @@ def check_route(store, config, cwd, live):
                 "log": str(log)}
     if code == 0 and answer.strip().casefold().rstrip(".") == "ready":
         return {**result, "status": "ready", "log": str(log)}
-    return {**result, "status": "unverified", "reason": "timeout" if code == 124 else "unexpected_response",
-            "action": "Inspect the local probe log and check the selected CLI profile.", "log": str(log)}
+    # The probe runs in the same read-only configuration as a reviewer or judge, and a clean exit with nothing in it is its own finding.
+    silent = code == 0 and not answer.strip()
+    return {**result, "status": "unverified", "reason": "timeout" if code == 124 else "empty_answer" if silent else "unexpected_response",
+            "action": ("The provider exited cleanly but returned no answer. A read-only role would get nothing to read. " if silent else "")
+                      + "Inspect the local probe log and check the selected CLI profile.", "log": str(log)}
 
 
 def ollama_readiness(config, live=False):

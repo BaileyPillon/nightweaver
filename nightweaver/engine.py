@@ -1481,7 +1481,7 @@ class Run:
                         return "blocked"
                     failures = current.get("transient_failures", 0)
                     policy = self.spec.get("retry", {})
-                    if error.kind == "transient" and failures < policy.get("transient_attempts", 2):
+                    if error.kind in ("transient", "no_answer") and failures < policy.get("transient_attempts", 2):
                         delay = min(policy.get("max_seconds", 60), policy.get("initial_seconds", 2) * 2 ** failures)
                         self.set("provider_retry_scheduled", {"issue": str(error), "seconds": delay, **provider},
                                  phase=next_phase, transient_failures=failures + 1, **refund,
