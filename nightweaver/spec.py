@@ -354,16 +354,25 @@ def resolve_repository(raw, relative_to=None, store=None):
     return repository, project
 
 
+def planner_timeout_of(raw):
+    """The planner_timeout a plan or template sets (None when it sets none), refused unless it is a whole number of seconds from 1 to 14400."""
+    value = raw.get("planner_timeout")
+    if "planner_timeout" in raw and (type(value) is not int or not 1 <= value <= 14400):
+        raise ValueError("Planner timeout must be between 1 and 14400 seconds")
+    return value
+
+
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
-           "reviewer_fallbacks context_files repository_map source_issue repair pursue git_timeout", "plan")
+           "reviewer_fallbacks context_files repository_map source_issue repair pursue git_timeout planner_timeout", "plan")
     if type(raw.get("schema_version", 1)) is not int or raw.get("schema_version", 1) != 1:
         raise ValueError("Unsupported plan schema_version; expected 1")
     repository, project = resolve_repository(raw, relative_to, store)
     timeout = raw.get("agent_timeout", 1800)
     if type(timeout) is not int or not 1 <= timeout <= 14400:
         raise ValueError("Agent timeout must be between 1 and 14400 seconds")
+    planner_timeout = planner_timeout_of(raw)
     retries = raw.get("attempts", 3)
     if type(retries) is not int or not 1 <= retries <= 10:
         raise ValueError("Attempts must be between 1 and 10")
@@ -434,6 +443,8 @@ def validate(raw, relative_to=None, store=None):
     out["idle_default"] = True  # written by 0.19 only: the engine applies its idle watchdog to plans that carry this, never to saved older ones
     if "git_timeout" in raw:
         out["git_timeout"] = integer(raw["git_timeout"], "git_timeout", 30, 3600)
+    if "planner_timeout" in raw:
+        out["planner_timeout"] = planner_timeout  # the planner's own time limit; a plan without it holds a planner to agent_timeout
     retry = raw.get("retry", {})
     fields(retry, "initial_seconds max_seconds transient_attempts repeated_failure_limit max_parks max_park_seconds gate_timeout_retries", "retry")
     defaults = {"initial_seconds": 2, "max_seconds": 60, "transient_attempts": 2, "repeated_failure_limit": 3,

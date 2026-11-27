@@ -16,6 +16,7 @@ import test_windows as fixtures
 from nightweaver import rescue
 from nightweaver.cli import main
 from nightweaver.engine import Run, git
+from nightweaver.process import ControllerExit
 from nightweaver.providers import DIAGNOSIS_SCHEMA, ProviderUnavailable, adapter, invoke
 from nightweaver.readiness import diagnose
 from nightweaver.reports import metrics
@@ -421,7 +422,7 @@ class RescueTests(unittest.TestCase):
             if mode == "diagnosis" and len(seen) < 2:
                 seen.append(mode)
                 Path(log).write_text("", encoding="utf-8")
-                return 124, None, ""
+                return ControllerExit(124), None, ""
             return real(conf, mode, cwd, log, *args, **kwargs)
         run = self.stalled()
         with patch("nightweaver.engine.invoke", side_effect=hang):
@@ -430,7 +431,7 @@ class RescueTests(unittest.TestCase):
         self.assertEqual((state["phase"], state["blocked_from"], state.get("rescues_used", 0), state["rescue"]["stage"], state["rescue"]["attempts"]),
                          ("blocked", "rescuing", 0, "diagnose", 0))
         self.assertEqual([(i["attempt"], i["exit"]) for i in self.events(run, "rescue_diagnosis_invalid")], [(1, 124), (2, 124)])
-        self.assertIn("exited 124", state["last_error"])
+        self.assertIn("The judge timed out after 40 s, its time limit (agent_timeout in the plan;", state["last_error"])
         for kind in ("rescue_skipped", "rescue_failed", "pursuit_stopped", "rescue_diagnosed"):
             self.assertEqual(self.events(run, kind), [], kind)
         self.assertEqual(self.events(run, "blocked")[-1]["during"], "rescuing")

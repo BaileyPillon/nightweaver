@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from .process import BusyRun, ExtendedLimits, PausedRun, WindowsJob, run_lock
+from .process import DEFAULT_MAX_LOG, BusyRun, ControllerExit, ExtendedLimits, PausedRun, WindowsJob, controller_exit_text, run_lock
 from .providers import (UNREADABLE, ProviderUnavailable, advisory, agy_network, credential_paths, describe_provider, invoke, json_response, metadata,
                         protect, reset_after, same_model, served_models, usage)
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
@@ -32,6 +32,7 @@ GIT_TIMEOUT = 90
 WORKTREE_ADD_TIMEOUT = 900
 SETTLE_POLL, SETTLE_QUIET = 1.0, 5  # seconds between looks at an unfinished checkout; looks with no index lock before git is given up on
 IDLE_DEFAULT = 900
+IDLE_ROLES = ("worker", "reviewer", "judge", "planner")  # the roles a plan written by 0.19 holds to IDLE_DEFAULT
 GATE_TIMEOUT_CAP = 14400  # a gate's retried timeout never exceeds 4 hours
 GATE_TIMEOUT = "Gate exceeded its wall-clock timeout"  # what process.execute reports when it ends a gate at its limit; test_release_0191_runtime holds the two together
 BASELINE_TIMEOUT = "Baseline did not establish the requested proof: " + GATE_TIMEOUT  # a proof gate's baseline run ended at the limit (proof.apply_proof)
@@ -676,6 +677,47 @@ class Run:
                  usage_unknown_calls=state.get("usage_unknown_calls", 0) + int(receipt["observed_tokens"] is None), **sessions,
                  **({"parks": 0} if succeeded and state.get("parks") else {}), **({"model_mismatches": seen} if mismatches else {}))
 
+    def call_limits(self, role):
+        """What one provider call of `role` is held to: (wall-clock seconds, the plan field that sets them, idle seconds or None for no
+        watchdog, log bytes). call_provider runs the call with these and the exit messages name them, so the two cannot drift apart.
+
+        Every role has the plan's agent_timeout; a planner (the wave planner, the design-direction planner, a rescue diagnosis by the planner)
+        has planner_timeout instead when the plan sets one. No call of call_provider has a shorter cap of its own. The local advisory model
+        (advisory_ollama) is not one of them: its own `timeout` (90 s unless the plan sets one, at most 600) holds it, in local_note."""
+        budgets = self.spec.get("budgets", {})
+        seconds, field = ((self.spec["planner_timeout"], "planner_timeout") if role == "planner" and "planner_timeout" in self.spec
+                          else (self.spec["agent_timeout"], "agent_timeout"))
+        if "idle_timeout" in budgets:
+            idle = budgets["idle_timeout"]
+        elif role in IDLE_ROLES and self.spec.get("idle_default"):
+            # A silent stall otherwise runs to the full agent timeout. Only plans written by 0.19 carry the marker, so a saved
+            # 0.18 plan keeps the behavior it was approved with.
+            idle = IDLE_DEFAULT
+        else:
+            idle = None
+        return seconds, field, idle, budgets.get("max_log_bytes", DEFAULT_MAX_LOG)
+
+    def exit_words(self, code, subject, role, advice=True):
+        """The words for a `role` call the controller ended (a ControllerExit: exit 124, 125 or 126 that execute() returned itself), naming the
+        plan setting behind the limit, else None, also for a program that chose one of those numbers itself. `advice` adds how to change it (a
+        run keeps its plan); the worker's rejection, which is sent back to the worker, goes without."""
+        if not isinstance(code, ControllerExit):
+            return None
+        seconds, field, idle, max_log = self.call_limits(role)
+        kept = "; a run keeps the plan it was created with, so raise it in the plan and add the plan as a new run" if advice else ""
+        named = (f"{field} in the plan" if role != "planner" or field != "agent_timeout" else
+                 "agent_timeout in the plan, which a planner follows because the plan sets no planner_timeout")
+        return controller_exit_text(code, subject, (seconds, f"{named}{kept}"),
+                                    (idle, f"budgets.idle_timeout in the plan{kept}"), (max_log, f"budgets.max_log_bytes in the plan{kept}"))
+
+    def call_failure(self, code, role, answer, log, subject=None):
+        """What a read-only role's failed call says: the controller's words for an exit it forced (nothing of the log follows, because the call
+        was cut off and the log holds no answer), else `The <role> exited <code>: <the answer or the end of the log>` as ever, which is also
+        what a program that exits 124, 125 or 126 on its own gets, with its own words."""
+        subject = subject or f"The {role}"
+        words = self.exit_words(code, subject, role)
+        return words if words else f"{subject} exited {code}: {(answer or tail(log))[:300]}"
+
     def call_provider(self, config, role, path, log, prompt, session=None, evidence=None, images=(), mode=None, unreadable_ok=False):
         """One provider call, counted and logged. `unreadable_ok` is for a caller that already answers an unreadable reply itself (it asks
         again once, then records an unscored tie or skips its stage): a read-only call that finished with no answer, or only one it must
@@ -692,19 +734,14 @@ class Run:
         if "effort" in config:
             pending["effort"] = config["effort"]
         self.set("provider_call_started", pending, pending_call=pending, provider_calls=pending["call"])
-        limits = self.spec.get("budgets", {})
-        health = {"max_log_bytes": limits.get("max_log_bytes", 16 * 1024 * 1024),
-                  "heartbeat": lambda info: self.set("process_heartbeat", {**info, "role": role})}
-        if "idle_timeout" in limits:
-            health["idle_timeout"] = limits["idle_timeout"]
-        elif role in ("worker", "reviewer", "judge", "planner") and self.spec.get("idle_default"):
-            # A silent stall otherwise runs to the full agent timeout. Only plans written by 0.19 carry the marker, so a saved
-            # 0.18 plan keeps the behavior it was approved with.
-            health["idle_timeout"] = IDLE_DEFAULT
+        timeout, _, idle, max_log = self.call_limits(role)
+        health = {"max_log_bytes": max_log, "heartbeat": lambda info: self.set("process_heartbeat", {**info, "role": role})}
+        if idle is not None:
+            health["idle_timeout"] = idle
         returned = False
         try:
             try:
-                result = invoke(config, mode or role, path, log, prompt, self.spec["agent_timeout"], self.paused,
+                result = invoke(config, mode or role, path, log, prompt, timeout, self.paused,
                                 session, evidence=evidence, health=health, **({"images": list(images)} if images else {}))
             except ProviderUnavailable as error:
                 if not (unreadable_ok and error.kind in UNREADABLE):
@@ -899,8 +936,8 @@ class Run:
                      retry_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat())
             return
         if code:
-            label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            self.reject(f"Worker exit {label}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None,
+            head = self.exit_words(code, "The worker", "worker", advice=False) or f"Worker exit {code}"
+            self.reject(f"{head}\n{answer or tail(log)}", "worker", exit_code=code, worker_session=None,
                         worker_stalls=0, worker_summary=summary)
             return
         self.set("worker_finished", {"exit": code, "session": session, "log": str(log)},
@@ -1192,10 +1229,9 @@ class Run:
                 code, _, answer = self.call_provider(config, "reviewer", path, log, prompt, evidence=evidence, images=images)
                 excerpt = redact(answer or tail(log)).strip()[:1200]
                 if code:
-                    label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code)
                     self.set("reviewer_failed", {"attempt": state["attempt"], "exit": code, "log": str(log), "excerpt": excerpt[:600]},
                              review_parse_failures=0)
-                    self.reviewer_unavailable(f"the reviewer stopped at its {label}" if label else f"the reviewer exited with code {code}", excerpt)
+                    self.reviewer_unavailable(self.exit_words(code, "the reviewer", "reviewer") or f"the reviewer exited with code {code}", excerpt)
                 try:
                     review = extract_verdict(answer, ("PASS", "REVISE"))
                 except ValueError:

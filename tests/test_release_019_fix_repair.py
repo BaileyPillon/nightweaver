@@ -14,6 +14,7 @@ import test_windows as fixtures
 
 from nightweaver import engine
 from nightweaver.engine import Run, common_dir, git, tree
+from nightweaver.process import CONTROLLER_EXITS, ControllerExit
 from nightweaver.providers import ProviderUnavailable, invoke as real_invoke
 from nightweaver.pursuit import parse_wave
 from nightweaver.repair import family
@@ -104,7 +105,8 @@ class FixRepairBase(unittest.TestCase):
             db.execute("UPDATE runs SET spec=? WHERE id=?", (json.dumps(spec), run))
 
     def reviewer_outcomes(self, outcomes):
-        """Reviewer calls return these (exit code, answer) pairs in order, the last one repeating. A ProviderUnavailable is raised."""
+        """Reviewer calls return these (exit code, answer) pairs in order, the last one repeating; 124 to 126 come back as execute() returns
+        the limits it forces. A ProviderUnavailable is raised."""
         prompts = []
 
         def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, **kwargs):
@@ -113,7 +115,7 @@ class FixRepairBase(unittest.TestCase):
                 item = outcomes[min(len(prompts), len(outcomes)) - 1]
                 if isinstance(item, Exception):
                     raise item
-                return item[0], None, item[1]
+                return (ControllerExit(item[0]) if item[0] in CONTROLLER_EXITS else item[0]), None, item[1]
             return real_invoke(config, mode, cwd, log, prompt, timeout, paused, session, **kwargs)
 
         return patch("nightweaver.engine.invoke", side_effect=invoke), prompts

@@ -352,11 +352,11 @@ class ReadOnlyArgv(Hermetic):
         for flag in ("--settings", "--json-schema", "--mode"):
             self.assertIn(flag, argv, "agy was only seen honouring the flags that were repeated on the resumed call")
 
-    def test_the_version_is_0_19_3_everywhere(self):
+    def test_the_version_agrees_everywhere(self):
+        """The release that ships a version pins it (test_release_0194_planner_timeout today); this module only checks that the files agree."""
         import nightweaver
         root = Path(__file__).resolve().parent.parent
-        self.assertEqual(nightweaver.__version__, "0.19.3")
-        self.assertIn('version = "0.19.3"', (root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn(f'version = "{nightweaver.__version__}"', (root / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 def rules_output(text):

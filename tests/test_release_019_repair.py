@@ -13,6 +13,7 @@ import test_windows as fixtures
 
 from nightweaver.cli import main
 from nightweaver.engine import Run, common_dir
+from nightweaver.process import ControllerExit
 from nightweaver.providers import invoke as real_invoke
 from nightweaver.pursuit import parse_judgment, parse_wave
 from nightweaver.reports import metrics
@@ -179,14 +180,15 @@ class RepairTests(unittest.TestCase):
     # Idle stalls
 
     def stalled(self, run, plan):
-        """The listed worker calls return these exit codes (None runs the real worker). Records each call's session and attempts used."""
+        """The listed worker calls return these exit codes, as execute() returns the limits it forces (None runs the real worker). Records
+        each call's session and attempts used."""
         seen = []
 
         def invoke(config, mode, cwd, log, prompt, timeout, paused, session=None, **kwargs):
             if mode == "worker":
                 seen.append((session, self.state(run)["attempts_used"]))
                 if len(seen) <= len(plan) and plan[len(seen) - 1] is not None:
-                    return plan[len(seen) - 1], None, "no output for a long time"
+                    return ControllerExit(plan[len(seen) - 1]), None, "no output for a long time"
             return real_invoke(config, mode, cwd, log, prompt, timeout, paused, session, **kwargs)
 
         return patch("nightweaver.engine.invoke", side_effect=invoke), seen
@@ -212,7 +214,7 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(len(self.events(run, "worker_stalled")), 2)
         rejected = self.events(run, "attempt_rejected")
         self.assertEqual([(r["phase"], r["exit"]) for r in rejected], [("worker", 125)])
-        self.assertIn("Worker exit idle timeout", rejected[0]["issue"])
+        self.assertIn("The worker was stopped by the idle watchdog after 900 s without output, its idle timeout (budgets.idle_timeout in the plan)", rejected[0]["issue"])
 
     def test_a_stall_streak_ends_with_any_other_outcome_and_wall_clock_limits_stay_rejections(self):
         notes = self.root / "worker.prompts"

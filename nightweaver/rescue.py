@@ -17,7 +17,7 @@ from pathlib import Path
 import shutil
 
 from . import context
-from .engine import git, tail
+from .engine import git
 from .explore import (JUDGE_IMAGES, all_unscored, ask, block_unscored, build_one, checkout, cleanup, compose, criteria_lines, rank, run_check,
                       stage_manifest)
 from .insights import budget_status
@@ -190,7 +190,7 @@ def diagnose(run, state, ex):
                                         mode="diagnosis", unreadable_ok=True)
     try:
         if code:
-            raise ValueError(f"The {role} exited {code}: {(answer or tail(log))[:300]}")
+            raise ValueError(run.call_failure(code, role, answer, log))
         diagnosis, strategies = parse_diagnosis(answer, ex["count"])
     except ValueError as error:
         attempts = ex["attempts"] + 1
