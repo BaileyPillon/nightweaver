@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 
-from .process import DEFAULT_MAX_LOG, BusyRun, ExtendedLimits, PausedRun, WindowsJob, controller_exit_text, run_lock
+from .process import DEFAULT_MAX_LOG, BusyRun, ControllerExit, ExtendedLimits, PausedRun, WindowsJob, controller_exit_text, run_lock
 from .providers import (UNREADABLE, ProviderUnavailable, advisory, agy_network, credential_paths, describe_provider, invoke, json_response, metadata,
                         protect, reset_after, same_model, served_models, usage)
 from .checks import contract_hash, evidence_folder, observed_pass, run_gate, verify_inputs, verify_saved_sample
@@ -682,7 +682,8 @@ class Run:
         watchdog, log bytes). call_provider runs the call with these and the exit messages name them, so the two cannot drift apart.
 
         Every role has the plan's agent_timeout; a planner (the wave planner, the design-direction planner, a rescue diagnosis by the planner)
-        has planner_timeout instead when the plan sets one. No role has a shorter cap of its own."""
+        has planner_timeout instead when the plan sets one. No call of call_provider has a shorter cap of its own. The local advisory model
+        (advisory_ollama) is not one of them: its own `timeout` (90 s unless the plan sets one, at most 600) holds it, in local_note."""
         budgets = self.spec.get("budgets", {})
         seconds, field = ((self.spec["planner_timeout"], "planner_timeout") if role == "planner" and "planner_timeout" in self.spec
                           else (self.spec["agent_timeout"], "agent_timeout"))
@@ -697,8 +698,11 @@ class Run:
         return seconds, field, idle, budgets.get("max_log_bytes", DEFAULT_MAX_LOG)
 
     def exit_words(self, code, subject, role, advice=True):
-        """The words for a `role` call the controller ended (exit 124, 125 or 126), naming the plan setting behind the limit, else None.
-        `advice` adds how to change it (a run keeps its plan); the worker's rejection, which is sent back to the worker, goes without."""
+        """The words for a `role` call the controller ended (a ControllerExit: exit 124, 125 or 126 that execute() returned itself), naming the
+        plan setting behind the limit, else None, also for a program that chose one of those numbers itself. `advice` adds how to change it (a
+        run keeps its plan); the worker's rejection, which is sent back to the worker, goes without."""
+        if not isinstance(code, ControllerExit):
+            return None
         seconds, field, idle, max_log = self.call_limits(role)
         kept = "; a run keeps the plan it was created with, so raise it in the plan and add the plan as a new run" if advice else ""
         named = (f"{field} in the plan" if role != "planner" or field != "agent_timeout" else
@@ -708,7 +712,8 @@ class Run:
 
     def call_failure(self, code, role, answer, log, subject=None):
         """What a read-only role's failed call says: the controller's words for an exit it forced (nothing of the log follows, because the call
-        was cut off and the log holds no answer), else `The <role> exited <code>: <the answer or the end of the log>` as ever."""
+        was cut off and the log holds no answer), else `The <role> exited <code>: <the answer or the end of the log>` as ever, which is also
+        what a program that exits 124, 125 or 126 on its own gets, with its own words."""
         subject = subject or f"The {role}"
         words = self.exit_words(code, subject, role)
         return words if words else f"{subject} exited {code}: {(answer or tail(log))[:300]}"

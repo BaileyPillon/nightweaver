@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12,11 +13,12 @@ import time
 from uuid import uuid4
 
 from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, require_identity, source_info
-from .process import DEFAULT_MAX_LOG, BusyRun, controller_exit_text, run_lock, runner_active
+from .process import DEFAULT_MAX_LOG, BusyRun, ControllerExit, controller_exit_text, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, credential_paths, invoke, json_response, protect
 from .readiness import diagnose
 from .repair import conflict_brief
-from .spec import IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
+from .spec import (IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, planner_timeout_of, provider, read_json, read_plan, resolve_repository,
+                   scoped_milestones, text, validate)
 from .store import Store, default_home, timestamp
 from .verdicts import conflict_notes, extract_object
 from .safety import redact
@@ -136,7 +138,8 @@ def plan_goal(store, args, template=None):
         raw["project"] = project["name"]
     raw["objective"] = args.objective
     if getattr(args, "planner_timeout", None) is not None:
-        raw["planner_timeout"] = args.planner_timeout  # the flag wins over the template, and the run's own planners follow it
+        planner_timeout_of(raw)  # the flag wins over the template, but a bad field of the template is still reported, not hidden by it
+        raw["planner_timeout"] = args.planner_timeout  # the run's own planners follow it
     gates = raw.get("gates", [])
     final_gates = raw.get("final_gates", [])
     fixed = scoped_milestones(raw)
@@ -197,7 +200,7 @@ def plan_goal(store, args, template=None):
     else:
         config = planner_route(args)
         log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
-        timeout, setting = planner_limit(args, prepared)
+        timeout, setting = planner_limit(args, prepared, template=template is None)
         try:
             code, _, answer = invoke(config, "planner", repository, log, prompt, timeout, lambda: False)
         except ProviderUnavailable as error:
@@ -210,8 +213,8 @@ def plan_goal(store, args, template=None):
                 "or sign in to the selected profile and rerun the goal."
             ) from error
         if code:
-            words = controller_exit_text(code, "The planner", (timeout, setting), None,
-                                         (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+            words = (controller_exit_text(code, "The planner", (timeout, setting), None, (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+                     if isinstance(code, ControllerExit) else None)  # a planner that exited 124 to 126 on its own keeps the plain text
             raise ValueError(f"{words or f'Planner exited {code}'}. See {log}")
         response = extract_object(answer, "milestones")
     fields(response, "milestones conflicts", "planner response")
@@ -258,23 +261,30 @@ def plan_goal(store, args, template=None):
     return raw
 
 
-def planner_limit(args, prepared):
+def planner_limit(args, prepared, template=True):
     """(seconds, the words naming where they came from) for the initial planner call: --planner-timeout, else the template's planner_timeout,
     else its agent_timeout (1800 unless it sets one). The planner never gets a shorter cap of its own: a planner that reads a large repository
-    before it plans needs the time a worker gets."""
+    before it plans needs the time a worker gets.
+
+    `template` is False for a plan that oneshot or wish built itself: there is no template file to edit, so the words name only the flag."""
     if getattr(args, "planner_timeout", None) is not None:
-        return args.planner_timeout, "--planner-timeout; give it a larger value, or set planner_timeout in the template"
+        return args.planner_timeout, "--planner-timeout; give it a larger value" + (", or set planner_timeout in the template" if template else "")
     if "planner_timeout" in prepared:
-        return prepared["planner_timeout"], "planner_timeout in the template; raise it there or with --planner-timeout"
+        return prepared["planner_timeout"], ("planner_timeout in the template; raise it there or with --planner-timeout" if template
+                                             else "planner_timeout in the plan; raise it with --planner-timeout")
+    if not template:
+        return prepared["agent_timeout"], (f"the plan's agent_timeout of {prepared['agent_timeout']} s, which the planner follows because no "
+                                           "--planner-timeout was given; pass --planner-timeout")
     return prepared["agent_timeout"], ("agent_timeout in the template, which the planner follows because no planner_timeout is set; "
                                        "set planner_timeout in the template or pass --planner-timeout")
 
 
 def planner_seconds(value):
-    """An argparse type: whole seconds, the range the plan's agent_timeout and planner_timeout accept."""
+    """An argparse type: whole seconds written as plain ASCII digits (no sign, spaces or underscores), in the range the plan's agent_timeout and
+    planner_timeout accept."""
     try:
-        seconds = int(value)
-    except ValueError:
+        seconds = int(value) if re.fullmatch(r"[0-9]+", value) else 0
+    except ValueError:  # more digits than int() reads
         seconds = 0
     if not 1 <= seconds <= 14400:
         raise argparse.ArgumentTypeError("must be a whole number of seconds from 1 to 14400")
@@ -477,10 +487,10 @@ def main(argv=None):
     wish_launch.add_argument("--preview", action="store_true", help="Write the brief and template and stop before any planner call")
     wish_launch.add_argument("--start", action="store_true", help="Plan with the pursuit planner and start a dedicated runner now")
     wisher.add_argument("--wait", action="store_true", help="With --start, run through verification and return the outcome")
-    for parser in (goal, one, wisher):
+    for parser, default in ((goal, "the template's planner_timeout, else its agent_timeout (1800 unless it sets one)"),
+                            (one, "1800, the plan's agent_timeout (oneshot has no template)"), (wisher, "1800, the plan's agent_timeout (wish writes its own template)")):
         parser.add_argument("--planner-timeout", type=planner_seconds, metavar="SECONDS",
-                            help="Seconds the planner may run (1 to 14400). Default: the template's planner_timeout, else its agent_timeout "
-                                 "(1800 unless it sets one), never a shorter cap. A run's own planner calls follow it")
+                            help=f"Seconds the planner may run (1 to 14400). Default: {default}, never a shorter cap. A run's own planner calls follow it")
     for parser in (one, add, goal):
         parser.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
                             help="Launch under a dedicated crash supervisor with this lifetime restart allowance")

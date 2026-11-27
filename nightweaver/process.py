@@ -20,15 +20,24 @@ CONTROLLER_EXITS = (124, 125, 126)
 DEFAULT_MAX_LOG = 16 * 1024 * 1024
 
 
+class ControllerExit(int):
+    """An exit code of CONTROLLER_EXITS that execute() returned because it ended the call itself. It is the plain number to every comparison
+    and every JSON record, and it alone says the controller, not the program, chose that number: a program can exit 124, 125 or 126 on its
+    own (GNU timeout does, a shell does for a command it cannot run), and that is a plain int whose output is the program's own message."""
+
+
 def controller_exit_text(code, subject, wall, idle=None, log=None):
-    """The words for a call the controller ended: exit 124 (time limit), 125 (idle watchdog) or 126 (output limit). None for any other exit
-    code, so a caller keeps its own text for an exit the program chose.
+    """The words for exit 124 (time limit), 125 (idle watchdog) or 126 (output limit); None for any other number. It words the number only:
+    a caller that cannot tell who chose the number checks `isinstance(code, ControllerExit)` first, so that a program's own 124, 125 or 126
+    keeps the caller's text and the program's output.
 
     `subject` begins the sentence ("The planner", "the reviewer"). `wall`, `idle` and `log` are (value, setting) pairs: the limit the call was
     held to (seconds, seconds, bytes; None when there was none) and the words that name the setting that controls it. The sentence has no
     final stop, so a caller can go on."""
     def sized(value):
-        return f"{value / 1048576:g} MB"
+        if value >= 1048576:
+            return f"{value / 1048576:g} MB"
+        return f"{value // 1024} KB" if value >= 1024 and value % 1024 == 0 else f"{value} bytes"
 
     if code == 124:
         return f"{subject} timed out after {wall[0]} s, its time limit ({wall[1]})"
@@ -162,7 +171,7 @@ def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: Fa
     def limit(code, reason):
         if raise_on_limit:
             raise ProcessLimit(reason)
-        return code
+        return ControllerExit(code)
 
     shim = [sys.executable, str(Path(__file__).with_name("_child.py")), json.dumps(argv), str(source)]
     with TemporaryDirectory(prefix="nw-launch-") as temp, log.open("wb") as out, WindowsJob() as job:

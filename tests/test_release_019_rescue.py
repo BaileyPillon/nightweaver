@@ -16,6 +16,7 @@ import test_windows as fixtures
 from nightweaver import rescue
 from nightweaver.cli import main
 from nightweaver.engine import Run, git
+from nightweaver.process import ControllerExit
 from nightweaver.providers import DIAGNOSIS_SCHEMA, ProviderUnavailable, adapter, invoke
 from nightweaver.readiness import diagnose
 from nightweaver.reports import metrics
@@ -421,7 +422,7 @@ class RescueTests(unittest.TestCase):
             if mode == "diagnosis" and len(seen) < 2:
                 seen.append(mode)
                 Path(log).write_text("", encoding="utf-8")
-                return 124, None, ""
+                return ControllerExit(124), None, ""
             return real(conf, mode, cwd, log, *args, **kwargs)
         run = self.stalled()
         with patch("nightweaver.engine.invoke", side_effect=hang):

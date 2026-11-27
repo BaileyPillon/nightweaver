@@ -6,6 +6,7 @@ is called."""
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+import inspect
 from io import StringIO
 import json
 import os
@@ -22,7 +23,7 @@ import test_windows as fixtures
 from nightweaver import engine, process, wish as wishing
 from nightweaver.cli import main, planner_limit, planner_seconds
 from nightweaver.engine import Run
-from nightweaver.process import CONTROLLER_EXITS, DEFAULT_MAX_LOG, controller_exit_text
+from nightweaver.process import CONTROLLER_EXITS, DEFAULT_MAX_LOG, ControllerExit, controller_exit_text
 from nightweaver.providers import invoke as real_invoke
 from nightweaver.spec import validate
 
@@ -44,6 +45,12 @@ def judged(score, met=False):
 
 def plan(*titles):
     return {"milestones": [{"title": title, "task": f"Do {title}"} for title in titles]}
+
+
+def stopped(code):
+    """What execute() returns for a call it ended itself: 124, 125 or 126 as a ControllerExit. Any other number, and any of those three that a
+    program chose, is a plain int."""
+    return ControllerExit(code) if code in CONTROLLER_EXITS else code
 
 
 class ControllerExitWords(unittest.TestCase):
@@ -69,12 +76,63 @@ class ControllerExitWords(unittest.TestCase):
         words = controller_exit_text(126, "The reviewer", (1, "x"), None, (32 * 1024 * 1024, "budgets.max_log_bytes in the plan"))
         self.assertEqual(words, "The reviewer was stopped at its output limit: its log grew past 32 MB (budgets.max_log_bytes in the plan)")
         self.assertIn("past 16 MB", controller_exit_text(126, "The planner", (1, "x")))
-        self.assertIn("past 0.5 MB", controller_exit_text(126, "The planner", (1, "x"), None, (512 * 1024, "x")))
+        self.assertIn("past 512 KB", controller_exit_text(126, "The planner", (1, "x"), None, (512 * 1024, "x")))
+
+    def test_a_small_output_limit_is_shown_in_bytes_or_kilobytes_never_as_a_fraction_of_a_megabyte(self):
+        for value, shown in ((1024, "1 KB"), (1500, "1500 bytes"), (2048, "2 KB"), (1023, "1023 bytes"), (524288, "512 KB"), (1048575, "1048575 bytes"),
+                             (1048576, "1 MB"), (1572864, "1.5 MB"), (16 * 1048576, "16 MB"), (256 * 1048576, "256 MB")):
+            with self.subTest(value=value):
+                words = controller_exit_text(126, "The judge", (1, "x"), None, (value, "budgets.max_log_bytes in the plan"))
+                self.assertEqual(words, f"The judge was stopped at its output limit: its log grew past {shown} (budgets.max_log_bytes in the plan)")
+        self.assertNotIn("0.00", controller_exit_text(126, "The judge", (1, "x"), None, (1500, "budgets.max_log_bytes in the plan")))
+
+    def test_a_controller_exit_is_the_plain_number_to_every_comparison_and_record(self):
+        for number in CONTROLLER_EXITS:
+            code = ControllerExit(number)
+            self.assertEqual((code, hash(code), str(code), f"{code}", json.dumps({"exit": code})),
+                             (number, hash(number), str(number), str(number), json.dumps({"exit": number})))
+            self.assertIn(code, CONTROLLER_EXITS)
+            self.assertTrue(code)
+            self.assertEqual(controller_exit_text(code, "The planner", (240, "x"), (900, "y"), (1, "z")),
+                             controller_exit_text(number, "The planner", (240, "x"), (900, "y"), (1, "z")))
 
     def test_every_other_exit_code_has_no_words_so_the_caller_keeps_its_own_text(self):
         for code in (0, 1, 2, 3, 7, 41, 55, 123, 127, 255, -1, None):
             with self.subTest(code=code):
                 self.assertIsNone(controller_exit_text(code, "The planner", (240, "x"), (900, "y"), (1, "z")))
+
+
+@unittest.skipUnless(os.name == "nt", "Windows controller")
+class ExecuteMarksItsOwnExits(unittest.TestCase):
+    """Exit codes 124 to 126 are in-band: GNU timeout, or a program that cannot start a command, chooses them itself. Only execute() knows who
+    ended a call, so it returns a ControllerExit for an exit it forced and a plain int for one the program chose."""
+    setUp = fixtures.WindowsRunTest.setUp
+
+    def run_program(self, name, program, **limits):
+        return process.execute([sys.executable, "-c", program], self.root, self.root / f"{name}.log", **limits)
+
+    def test_a_limit_it_forced_comes_back_marked_and_equal_to_the_plain_number(self):
+        sleeper = "import time; time.sleep(60)"
+        flood = "import sys, time\nwhile True:\n    sys.stdout.write('x' * 2000)\n    sys.stdout.flush()\n    time.sleep(.01)"
+        for expected, program, limits in ((124, sleeper, {"timeout": 1}), (125, sleeper, {"timeout": 30, "idle_timeout": 1}),
+                                          (126, flood, {"timeout": 30, "max_log_bytes": 4096})):
+            with self.subTest(expected=expected):
+                code = self.run_program(f"forced-{expected}", program, **limits)
+                self.assertEqual(code, expected)
+                self.assertIsInstance(code, ControllerExit)
+                self.assertEqual(json.dumps({"exit": code}), json.dumps({"exit": expected}))
+
+    def test_the_same_numbers_chosen_by_the_program_come_back_as_plain_ints(self):
+        for number in CONTROLLER_EXITS:
+            with self.subTest(number=number):
+                code = self.run_program(f"own-{number}", f"print('fatal: could not load its configuration'); raise SystemExit({number})", timeout=30)
+                self.assertEqual(code, number)
+                self.assertIs(type(code), int)
+                self.assertNotIsInstance(code, ControllerExit)
+
+    def test_a_gate_that_asks_for_an_error_instead_still_gets_one(self):
+        with self.assertRaises(process.ProcessLimit):
+            self.run_program("raising", "import time; time.sleep(60)", timeout=1, raise_on_limit=True)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows controller")
@@ -110,6 +168,29 @@ class PlannerTimeoutInThePlan(unittest.TestCase):
             with self.subTest(value=bad), self.assertRaises(argparse.ArgumentTypeError):
                 planner_seconds(bad)
 
+    def test_the_flag_is_as_strict_as_the_plan_field_and_takes_plain_ascii_digits_only(self):
+        """The plan field accepts only a JSON integer. int() alone also read underscores, spaces, a sign and the digits of other scripts."""
+        for bad in ("1_0", "1__0", " 5 ", " 5", "5 ", "+5", "5\n", "\u0665", "\uff15", "\u0663\u0660\u0660", "0x10", "1,000", "9" * 5000, "\u00b2"):
+            with self.subTest(value=bad), self.assertRaises(argparse.ArgumentTypeError):
+                planner_seconds(bad)
+        self.assertEqual([planner_seconds(v) for v in ("5", "30", "300", "14400")], [5, 30, 300, 14400])
+
+    def test_the_advisory_model_keeps_its_own_90_second_default_and_the_docs_say_so(self):
+        """It is a local request (run.local_note), not a call_provider call, so the claim that no role had a shorter cap needs this exception."""
+        spec = validate(self.raw(advisory_ollama={"model": "qwen3:4b"}))
+        self.assertEqual((spec["advisory_ollama"]["timeout"], spec["agent_timeout"]), (90, 1800))
+        self.assertEqual(validate(self.raw(advisory_ollama={"model": "qwen3:4b", "timeout": 600}))["advisory_ollama"]["timeout"], 600)
+        self.assertNotIn("call_provider", inspect.getsource(Run.local_note))
+        self.assertIn("advisory_ollama", inspect.getsource(Run.call_limits))
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        new = readme[readme.index("## What's new in 0.19.4"):readme.index("## What's new in 0.19.3")]
+        notes = (ROOT / "docs" / "v0.19.4-notes.md").read_text(encoding="utf-8")
+        for text in (new, notes):
+            self.assertIn("advisory_ollama", text)
+            self.assertRegex(text, r"\b90 s")
+        self.assertNotIn("No role inside a run had a shorter cap", readme)
+        self.assertNotIn("no role in a run had a shorter cap", notes)
+
 
 @unittest.skipUnless(os.name == "nt", "Windows controller")
 class GoalPlannerTimeout(unittest.TestCase):
@@ -131,12 +212,13 @@ class GoalPlannerTimeout(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
-    def spy(self, answer=PLAN, code=0):
+    def spy(self, answer=PLAN, code=0, own=False):
+        """A patch of cli.invoke that answers with `code`: the controller's own exit when it is 124 to 126, unless `own` says the planner chose it."""
         calls = []
 
         def fake(config, mode, cwd, log, prompt, timeout, paused, *rest, **options):
             calls.append({"mode": mode, "timeout": timeout, "prompt": prompt, "log": log, "config": config})
-            return code, None, answer
+            return (code if own else stopped(code)), None, answer
         return calls, patch("nightweaver.cli.invoke", side_effect=fake)
 
     def timeout_of(self, *flags, **template):
@@ -267,6 +349,56 @@ class GoalPlannerTimeout(unittest.TestCase):
             self.cli("goal", self.template(), "Build it")
         self.assertEqual(calls[0]["mode"], "planner", "a clean exit is still a clean exit")
 
+    def test_a_planner_that_exits_124_to_126_on_its_own_keeps_the_old_text(self):
+        """Nothing but execute() says the controller ended a call. A planner behind GNU timeout, or one that cannot start its command, chose
+        its exit, and its log is where its own message is: 0.19.3 said `Planner exited 126. See <log>`, and so does this."""
+        for number in CONTROLLER_EXITS:
+            with self.subTest(code=number, how="a real program"):
+                program = f"import sys; sys.stdin.read(); print('fatal: could not load its configuration'); raise SystemExit({number})"
+                with patch("nightweaver.cli.planner_route", return_value={"kind": "command", "argv": [sys.executable, "-c", program]}):
+                    _, err = self.cli("goal", self.template(), "Build it", "--planner-timeout", "30", code=1)
+                self.assertRegex(err, rf"Planner exited {number}\. See .+\.jsonl")
+                self.assertNotRegex(err, r"timed out|watchdog|output limit|time limit|log grew|idle timeout")
+            with self.subTest(code=number, how="a plain int from a stand-in"):
+                calls, patcher = self.spy(code=number, own=True)
+                with patcher:
+                    _, err = self.cli("goal", self.template(), "Build it", code=1)
+                self.assertRegex(err, rf"Planner exited {number}\. See .+\.jsonl")
+                self.assertNotRegex(err, r"timed out|watchdog|output limit|time limit|log grew|idle timeout")
+        self.assertEqual(self.store.runs(), [])
+
+    def test_a_bad_planner_timeout_in_the_template_is_reported_even_when_the_flag_is_valid(self):
+        """The flag overwrote the field before validate() read it, so a bad field stayed in the file and failed the next goal run without one."""
+        message = "Planner timeout must be between 1 and 14400 seconds"
+        for bad in ("soon", "600", 0, -5, 99999, 12.5, True, None, [60]):
+            with self.subTest(planner_timeout=bad):
+                calls, patcher = self.spy()
+                with patcher:
+                    _, flagged = self.cli("goal", self.template(planner_timeout=bad), "Build it", "--planner-timeout", "600", code=1)
+                    _, plain = self.cli("goal", self.template("unflagged.json", planner_timeout=bad), "Build it", code=1)
+                    _, preview = self.cli("goal", self.template("preview.json", planner_timeout=bad), "Build it", "--planner-timeout", "600",
+                                          "--prompt-only", code=1)
+                for err in (flagged, plain, preview):
+                    self.assertIn(message, err)
+                self.assertEqual(calls, [], "nothing is planned from a template that is wrong")
+        self.assertEqual(self.store.runs(), [])
+
+    def test_a_good_template_field_and_a_good_flag_are_still_fine_together(self):
+        calls, patcher = self.spy()
+        with patcher:
+            self.cli("goal", self.template(planner_timeout=900), "Build it", "--planner-timeout", "600")
+        self.assertEqual([c["timeout"] for c in calls], [600])
+
+    def test_the_flag_refuses_what_the_plan_field_would_not_read_as_whole_seconds(self):
+        for bad in ("1_0", " 5 ", "+5", "\u0665", "5\n"):
+            with self.subTest(flag=bad):
+                calls, patcher = self.spy()
+                err = StringIO()
+                with patcher, redirect_stderr(err), self.assertRaises(SystemExit) as stopped_by:
+                    main(["--home", str(self.store.root), "goal", str(self.template()), "Build it", "--planner-timeout", bad])
+                self.assertEqual((stopped_by.exception.code, calls), (2, []))
+                self.assertIn("from 1 to 14400", err.getvalue())
+
     def test_the_planner_gets_the_same_timeout_for_every_provider_kind(self):
         for kind in ("claude", "codex", "deepseek", "gemini", "antigravity"):
             with self.subTest(kind=kind):
@@ -324,6 +456,55 @@ class OneShotPlannerTimeout(unittest.TestCase):
         with redirect_stderr(err), self.assertRaises(SystemExit):
             main(["--home", str(self.store.root), "oneshot", str(self.repo), "Build it", "--planner-timeout", "99999"])
         self.assertIn("from 1 to 14400", err.getvalue())
+
+    def test_the_timeout_message_names_only_what_oneshot_has(self):
+        """oneshot builds its plan by discovery: it has no template file and no agent_timeout flag, so `in the template` cannot be acted on."""
+        for flags, words in (((), "The planner timed out after 1800 s, its time limit (the plan's agent_timeout of 1800 s, which the planner follows "
+                                  "because no --planner-timeout was given; pass --planner-timeout)."),
+                             (("--planner-timeout", "600"), "The planner timed out after 600 s, its time limit (--planner-timeout; give it a larger value).")):
+            with self.subTest(flags=flags):
+                with patch("nightweaver.cli.invoke", return_value=(stopped(124), None, "")):
+                    _, err = self.cli("oneshot", self.repo, "Build it", "--enqueue", *flags, code=1)
+                self.assertIn(words, err)
+                self.assertNotIn("template", err)
+                self.assertNotIn("planner_timeout in", err)
+        with patch("nightweaver.cli.invoke", return_value=(stopped(125), None, "")):
+            _, err = self.cli("oneshot", self.repo, "Build it", "--enqueue", code=1)
+        self.assertIn("The planner was stopped by the idle watchdog", err)
+
+    def test_a_planner_that_exits_124_on_its_own_is_not_called_a_timeout_by_oneshot(self):
+        with patch("nightweaver.cli.invoke", return_value=(124, None, "")):
+            _, err = self.cli("oneshot", self.repo, "Build it", "--enqueue", code=1)
+        self.assertRegex(err, r"Planner exited 124\. See .+\.jsonl")
+        self.assertNotIn("timed out", err)
+
+    def test_planner_limit_words_follow_where_the_plan_came_from(self):
+        flagged, unflagged = argparse.Namespace(planner_timeout=600), argparse.Namespace(planner_timeout=None)
+        self.assertEqual(planner_limit(flagged, {"agent_timeout": 1800}, template=False), (600, "--planner-timeout; give it a larger value"))
+        self.assertEqual(planner_limit(unflagged, {"agent_timeout": 900, "planner_timeout": 2000}, template=False),
+                         (2000, "planner_timeout in the plan; raise it with --planner-timeout"))
+        seconds, words = planner_limit(unflagged, {"agent_timeout": 900}, template=False)
+        self.assertEqual(seconds, 900)
+        self.assertNotIn("template", words)
+        self.assertIn("pass --planner-timeout", words)
+        self.assertEqual(planner_limit(flagged, {"agent_timeout": 1800}),
+                         (600, "--planner-timeout; give it a larger value, or set planner_timeout in the template"),
+                         "a goal, which has a template, keeps every word it had")
+
+    def test_the_help_of_each_command_describes_that_commands_default(self):
+        helps = {}
+        for command in ("goal", "oneshot", "wish"):
+            out = StringIO()
+            with redirect_stdout(out), self.assertRaises(SystemExit):
+                main([command, "--help"])
+            text = " ".join(out.getvalue().split())
+            helps[command] = re.search(r"--planner-timeout SECONDS (Seconds the planner may run.*?)(?= --?[a-z]|$)", text).group(1)
+        self.assertIn("the template's planner_timeout, else its agent_timeout", helps["goal"])
+        for command in ("oneshot", "wish"):
+            self.assertNotIn("the template's", helps[command])
+            self.assertIn("Default: 1800", helps[command])
+        for text in helps.values():
+            self.assertIn("1 to 14400", text)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows controller")
@@ -387,6 +568,25 @@ class WishPlannerTimeout(unittest.TestCase):
             main(["--home", str(self.store.root), "wish", str(self.repo), "Calm the page", "--planner-timeout", "0"])
         self.assertIn("from 1 to 14400", err.getvalue())
 
+    def test_a_planner_timeout_inside_wish_names_only_the_flag(self):
+        self.writer([wish_tests.fenced()])
+        route = {"kind": "command", "argv": [sys.executable, "-c", "pass"]}
+        with patch("nightweaver.cli.planner_route", return_value=route), patch("nightweaver.cli.invoke", return_value=(stopped(124), None, "")), \
+                patch("nightweaver.cli.background", return_value=4242):
+            _, err = self.cli("wish", self.repo, "Calm the page", "--start", code=1)
+        self.assertIn("The planner timed out after 1800 s, its time limit (the plan's agent_timeout of 1800 s, which the planner follows because no "
+                      "--planner-timeout was given; pass --planner-timeout).", err)
+        self.assertNotIn("in the template", err)
+
+    def test_a_brief_writer_that_exits_124_to_126_on_its_own_keeps_the_old_text(self):
+        for code in CONTROLLER_EXITS:
+            with self.subTest(code=code):
+                with patch.object(wishing, "brief_prompt", return_value="Write the brief."), patch.object(wishing, "invoke", return_value=(code, None, "")):
+                    with self.assertRaises(ValueError) as caught:
+                        wishing.write_brief({"kind": "claude"}, {"repository": str(self.root)}, "wish", self.root)
+                self.assertIn(f"The brief writer exited {code}. See ", str(caught.exception))
+                self.assertNotRegex(str(caught.exception), r"timed out|watchdog|output limit")
+
     def test_the_brief_writer_keeps_its_own_900_seconds_and_says_so(self):
         """The brief writer is a pre-run call of the wish command with a fixed limit; it was not one of the roles that needed the setting."""
         self.assertEqual(wishing.BRIEF_TIMEOUT, 900)
@@ -394,7 +594,7 @@ class WishPlannerTimeout(unittest.TestCase):
 
         def timed_out(config, mode, cwd, log, prompt, timeout, paused, *rest, **options):
             seen.append(timeout)
-            return 124, None, ""
+            return stopped(124), None, ""
         with patch.object(wishing, "brief_prompt", return_value="Write the brief."), patch.object(wishing, "invoke", side_effect=timed_out):
             with self.assertRaises(ValueError) as caught:
                 wishing.write_brief({"kind": "claude"}, {"repository": str(self.root)}, "wish", self.root)
@@ -407,7 +607,7 @@ class WishPlannerTimeout(unittest.TestCase):
                             (7, "The brief writer exited 7. See "), (1, "The brief writer exited 1. See ")):
             with self.subTest(code=code):
                 with patch.object(wishing, "brief_prompt", return_value="Write the brief."), \
-                        patch.object(wishing, "invoke", return_value=(code, None, "")):
+                        patch.object(wishing, "invoke", return_value=(stopped(code), None, "")):
                     with self.assertRaises(ValueError) as caught:
                         wishing.write_brief({"kind": "claude"}, {"repository": str(self.root)}, "wish", self.root)
                 self.assertIn(words, str(caught.exception))
@@ -416,7 +616,7 @@ class WishPlannerTimeout(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "Windows controller")
 class InRunRoles(unittest.TestCase):
     """Every provider call inside a run goes through Run.call_provider, which holds it to the plan's agent_timeout, or to planner_timeout for a
-    planner. No in-run role had a shorter cap of its own, so nothing needed raising; the plan gained planner_timeout and the messages gained words."""
+    planner. No worker, reviewer, judge or planner call had a shorter cap of its own (the local advisory model is not one of them), so nothing needed raising; the plan gained planner_timeout and the messages gained words."""
     setUp = fixtures.WindowsRunTest.setUp
     configured = fixtures.WindowsRunTest.configured
 
@@ -431,15 +631,16 @@ class InRunRoles(unittest.TestCase):
     def events(self, run, *kinds):
         return [e["details"] for e in self.store.events(run, limit=None, kinds=kinds)]
 
-    def forcing(self, forced):
+    def forcing(self, forced, own=False):
         """A patch of the engine's invoke that records (mode, timeout, health) of every call and answers the modes in `forced` with that exit
-        code and nothing else; every other call goes through the real invoke to its stand-in."""
+        code and nothing else (the controller's own exit for 124 to 126, a plain int when `own` says the program chose it); every other call
+        goes through the real invoke to its stand-in."""
         seen = []
 
         def fake(config, mode, cwd, log, prompt, timeout, paused, *rest, **options):
             seen.append((mode, timeout, dict(options.get("health") or {})))
             if mode in forced:
-                return forced[mode], None, ""
+                return (forced[mode] if own else stopped(forced[mode])), None, ""
             return real_invoke(config, mode, cwd, log, prompt, timeout, paused, *rest, **options)
         return seen, patch("nightweaver.engine.invoke", side_effect=fake)
 
@@ -596,22 +797,78 @@ class InRunRoles(unittest.TestCase):
                 self.assertIn("Reviewer unavailable: " + words, self.store.get(run)["state"]["last_error"])
                 self.assertEqual({e["exit"] for e in self.events(run, "reviewer_failed")}, {code})
 
+    def test_a_program_that_exits_124_to_126_on_its_own_keeps_its_own_words_in_the_judge_and_the_planner(self):
+        """A real stand-in prints a message and exits with the number itself, as GNU timeout does. The message is the program's, not a limit's."""
+        for number in CONTROLLER_EXITS:
+            program = f"import sys; sys.stdin.read(); print('fatal: could not load its configuration'); raise SystemExit({number})"
+            own = {"kind": "command", "argv": [sys.executable, "-c", program]}
+            with self.subTest(code=number, role="judge"):
+                run = self.pursuit(own)
+                self.assertEqual(Run(self.store, run).run(), "blocked")
+                first = self.events(run, "judge_invalid")[0]
+                self.assertEqual(first["exit"], number)
+                self.assertEqual(first["issue"].rstrip(), f"The judge returned no valid judgment (attempt 1 of 2): The judge exited {number}: fatal: could not load its configuration")
+            with self.subTest(code=number, role="planner"):
+                run = self.pursuit(self.route(f"judge-own-{number}", [judged(60)]), planner=own)
+                self.assertEqual(Run(self.store, run).run(), "blocked")
+                first = self.events(run, "plan_invalid")[0]
+                self.assertEqual(first["exit"], number)
+                self.assertEqual(first["issue"].rstrip(), f"The plan returned no valid plan (attempt 1 of 2): The planner exited {number}: fatal: could not load its configuration")
+
+    def test_a_worker_or_reviewer_that_chooses_124_or_126_itself_keeps_the_old_words(self):
+        for code in (124, 126):
+            with self.subTest(code=code, role="worker"):
+                run = self.configured(fixtures.fixture("implement"), attempts=1, retry=FAST)
+                seen, patcher = self.forcing({"worker": code}, own=True)
+                with patcher:
+                    Run(self.store, run).run()
+                rejected = self.events(run, "attempt_rejected")
+                self.assertEqual([(r["phase"], r["exit"]) for r in rejected], [("worker", code)])
+                self.assertTrue(rejected[0]["issue"].startswith(f"Worker exit {code}\n"), rejected[0]["issue"])
+            with self.subTest(code=code, role="reviewer"):
+                run = self.configured(fixtures.fixture("good"), reviewer={"kind": "command", "argv": fixtures.fixture("review")}, attempts=1, retry=FAST)
+                seen, patcher = self.forcing({"reviewer": code}, own=True)
+                with patcher:
+                    self.assertEqual(Run(self.store, run).run(), "blocked")
+                self.assertIn(f"Reviewer unavailable: the reviewer exited with code {code}. The worker's attempt was not charged",
+                              self.store.get(run)["state"]["last_error"])
+
+    def test_exit_words_need_the_exit_the_controller_forced_and_a_plain_number_gets_the_programs_own_sentence(self):
+        run = Run(self.store, self.configured(fixtures.fixture("implement")))
+        log = self.root / "own.jsonl"
+        log.write_text("the last words of the call", encoding="utf-8")
+        for number in CONTROLLER_EXITS:
+            self.assertIsNone(run.exit_words(number, "The judge", "judge"))
+            self.assertIsNone(run.exit_words(ControllerExit(number) + 0, "The judge", "judge"), "arithmetic gives a plain int again")
+            self.assertTrue(run.exit_words(ControllerExit(number), "The judge", "judge").startswith("The judge "))
+            self.assertEqual(run.call_failure(number, "judge", "its own words", log), f"The judge exited {number}: its own words")
+            self.assertEqual(run.call_failure(number, "judge", "", log), f"The judge exited {number}: the last words of the call")
+            self.assertNotIn("exited", run.call_failure(ControllerExit(number), "judge", "its own words", log))
+
+    def test_a_small_max_log_bytes_is_worded_in_bytes_by_the_run(self):
+        run = self.limits(budgets={"max_log_bytes": 1500})
+        self.assertIn("its log grew past 1500 bytes (budgets.max_log_bytes in the plan; ", run.exit_words(ControllerExit(126), "The judge", "judge"))
+        run = self.limits(budgets={"max_log_bytes": 2048})
+        self.assertIn("its log grew past 2 KB (", run.exit_words(ControllerExit(126), "The judge", "judge"))
+
     def test_call_failure_words_the_controller_and_keeps_the_old_sentence_for_other_exits(self):
         run = Run(self.store, self.configured(fixtures.fixture("implement"), planner_timeout=75))
         log = self.root / "role.jsonl"
         log.write_text("the last words of the call", encoding="utf-8")
         for role in ("planner", "judge", "diagnosis"):
             for code in (124, 125, 126):
-                text = run.call_failure(code, role, "some answer", log)
+                text = run.call_failure(ControllerExit(code), role, "some answer", log)
                 self.assertTrue(text.startswith(f"The {role} "), text)
                 self.assertNotIn("the last words", text, "a cut-off call has no answer to quote")
                 self.assertNotIn("exited", text)
             self.assertEqual(run.call_failure(9, role, "some answer", log), f"The {role} exited 9: some answer")
             self.assertEqual(run.call_failure(9, role, "", log), f"The {role} exited 9: the last words of the call")
-        self.assertEqual(run.call_failure(124, "planner", "", log, subject="The explorer"), run.exit_words(124, "The explorer", "planner"))
-        self.assertIn("planner_timeout in the plan", run.exit_words(124, "The planner", "planner"))
-        self.assertIn("agent_timeout in the plan;", run.exit_words(124, "The judge", "judge"))
+        forced = ControllerExit(124)
+        self.assertEqual(run.call_failure(forced, "planner", "", log, subject="The explorer"), run.exit_words(forced, "The explorer", "planner"))
+        self.assertIn("planner_timeout in the plan", run.exit_words(forced, "The planner", "planner"))
+        self.assertIn("agent_timeout in the plan;", run.exit_words(forced, "The judge", "judge"))
         self.assertIsNone(run.exit_words(1, "The planner", "planner"))
+        self.assertIsNone(run.exit_words(ControllerExit(7), "The planner", "planner"), "only the three limits have words")
         self.assertEqual(run.call_failure(0, "judge", "", log), "The judge exited 0: the last words of the call", "the caller decides what a zero exit means")
 
 
@@ -669,6 +926,15 @@ class ExploreAndRescueRoles(unittest.TestCase):
         self.assertEqual(self.events(run, "direction_built"), [])
         self.assertTrue(all(b["reason"].startswith("The worker was stopped at its output limit: its log grew past 16 MB (budgets.max_log_bytes in the plan)\n")
                             for b in built), [b["reason"] for b in built])
+
+    def test_an_explore_worker_that_chooses_126_itself_keeps_the_old_head(self):
+        run = self.explored("own")
+        seen, patcher = self.forcing({"worker": 126}, own=True)
+        with patcher:
+            Run(self.store, run).run()
+        built = self.events(run, "direction_failed")
+        self.assertEqual(len(built), 3)
+        self.assertTrue(all(b["reason"].startswith("Worker exit 126\n") for b in built), [b["reason"] for b in built])
 
     def test_the_rescue_diagnosis_is_named_and_a_plain_failure_keeps_its_text(self):
         for code, words in ((124, f"The judge timed out after 40 s, its time limit (agent_timeout in the plan; {KEPT})"), (6, "The judge exited 6: ")):

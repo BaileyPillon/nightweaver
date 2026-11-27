@@ -354,6 +354,14 @@ def resolve_repository(raw, relative_to=None, store=None):
     return repository, project
 
 
+def planner_timeout_of(raw):
+    """The planner_timeout a plan or template sets (None when it sets none), refused unless it is a whole number of seconds from 1 to 14400."""
+    value = raw.get("planner_timeout")
+    if "planner_timeout" in raw and (type(value) is not int or not 1 <= value <= 14400):
+        raise ValueError("Planner timeout must be between 1 and 14400 seconds")
+    return value
+
+
 def validate(raw, relative_to=None, store=None):
     fields(raw, "schema_version repository project title objective attempts agent_timeout gates final_gates milestones "
            "worker reviewer protected_paths acceptance expected_base advisory_ollama budgets retry worker_fallbacks "
@@ -364,9 +372,7 @@ def validate(raw, relative_to=None, store=None):
     timeout = raw.get("agent_timeout", 1800)
     if type(timeout) is not int or not 1 <= timeout <= 14400:
         raise ValueError("Agent timeout must be between 1 and 14400 seconds")
-    planner_timeout = raw.get("planner_timeout")
-    if "planner_timeout" in raw and (type(planner_timeout) is not int or not 1 <= planner_timeout <= 14400):
-        raise ValueError("Planner timeout must be between 1 and 14400 seconds")
+    planner_timeout = planner_timeout_of(raw)
     retries = raw.get("attempts", 3)
     if type(retries) is not int or not 1 <= retries <= 10:
         raise ValueError("Attempts must be between 1 and 10")

@@ -15,7 +15,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .engine import git, git_bytes
-from .process import DEFAULT_MAX_LOG, controller_exit_text
+from .process import DEFAULT_MAX_LOG, ControllerExit, controller_exit_text
 from .providers import UNREADABLE, ProviderUnavailable, invoke
 from .safety import atomic_write, redact, scrub_env, write_json
 from .spec import provider, strict_json, validate
@@ -203,8 +203,9 @@ def write_brief(config, plan, wish, folder):
             problem, unreadable = UNREADABLE_BRIEF.get(error.kind, "it was unreadable"), str(error).strip()
             continue
         if code:
-            words = controller_exit_text(code, "The brief writer", (BRIEF_TIMEOUT, f"a fixed {BRIEF_TIMEOUT} s limit of the wish command; --planner-timeout does not change it"),
-                                         None, (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+            words = (controller_exit_text(code, "The brief writer", (BRIEF_TIMEOUT, f"a fixed {BRIEF_TIMEOUT} s limit of the wish command; --planner-timeout does not change it"),
+                                          None, (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+                     if isinstance(code, ControllerExit) else None)
             raise ValueError(f"{words or f'The brief writer exited {code}'}. See {log}")
         try:
             return read_brief(answer), log, attempt
