@@ -8,6 +8,7 @@ over a stand-in agy that writes a capture); no model is called and no network is
 
 import json
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
@@ -83,7 +84,8 @@ class TheNote(Called):
     def test_the_worker_does_not_get_it(self):
         (code, _, _), seen = self.call(raw(7), mode="worker", prompt=PROMPT)
         self.assertEqual(code, 0)
-        self.assertNotIn("--settings", seen["argv"])
+        rules = json.loads(Path(seen["argv"][seen["argv"].index("--settings") + 1]).read_text(encoding="utf-8"))["permissions"]
+        self.assertFalse(set(providers.AGY_DENY) & set(rules["deny"]), "none of the write deny rules: the worker edits")
         self.assertIn("--disable-slash-commands", seen["argv"])
         self.assertEqual(user_event(seen)["message"]["content"], PROMPT, "the worker prompt is exactly what the engine built")
 

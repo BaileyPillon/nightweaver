@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, require_identity, source_info
 from .process import BusyRun, run_lock, runner_active
-from .providers import ProviderUnavailable, configure_deepseek_key, invoke, json_response
+from .providers import ProviderUnavailable, configure_deepseek_key, credential_paths, invoke, json_response, protect
 from .readiness import diagnose
 from .repair import conflict_brief
 from .spec import IMPLEMENTERS, REVIEWERS, anchor_provider_paths, fields, provider, read_json, read_plan, resolve_repository, scoped_milestones, text, validate
@@ -128,6 +128,7 @@ def plan_goal(store, args, template=None):
         raw, folder = template, Path(template["repository"])
     anchor_provider_paths(raw, folder)
     repository, project = resolve_repository(raw, folder, store)
+    protect(credential_paths(raw), keep=(repository, store.root))  # the planner's agy call may not read a login the plan's routes use
     if args.start or args.enqueue:
         require_identity(repository)  # before the planner call: promotion would otherwise stop at the first accepted milestone
     raw["repository"] = str(repository)

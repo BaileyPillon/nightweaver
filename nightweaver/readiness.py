@@ -16,6 +16,17 @@ from .providers import (AGY_READ_ONLY, ProviderUnavailable, advisory, antigravit
                         describe_provider, gemini_auth, invoke)
 
 
+def read_warning(result):
+    """The doctor warning for an agy route whose agy did not list Nightweaver's read allow-rules as loaded ("" when it did or could not say).
+    It is a warning and never a block: the rules cost answers, not safety. Without them a read outside the repository is auto-denied and the
+    call ends with no answer (a read-only call is resumed once for it, see providers.AGY_RESUME)."""
+    if result.get("read_allow_rules") != "missing":
+        return ""
+    return (" agy did not report Nightweaver's read allow-rules as loaded, so a read outside the repository would be denied and end the call "
+            "with no answer (a read-only call is then resumed once for its answer, a worker's edits for that turn do not happen). Run agy -p "
+            "/permissions --settings <file> to see what it loaded.")
+
+
 def check_route(store, config, cwd, live):
     result = describe_provider(config)
     if config["kind"] == "claude":
@@ -43,7 +54,7 @@ def check_route(store, config, cwd, live):
                 " agy could not confirm that it loads Nightweaver's read-only permission rules (its settings turn slash commands off, or " 
                 "/permissions printed an unrecognised answer), so a reviewer, judge or planner route would rely on the stream and snapshot checks "
                 "alone." if config["kind"] == "antigravity" and result.get("read_only_rules") is None else "")
-        return {**result, "status": "configured", "action": "Use --live to verify model access." + hint}
+        return {**result, "status": "configured", "action": "Use --live to verify model access." + hint + read_warning(result)}
 
     log = store.root / "diagnostics" / f"{uuid4().hex[:12]}.jsonl"
     for known in [known for known in AGY_READ_ONLY if known[0] == result.get("executable")]:
@@ -66,7 +77,7 @@ def check_route(store, config, cwd, live):
                         antigravity_settings().get("disableSlashCommands") else "agy -p /permissions printed nothing Nightweaver recognises") +
                     "). A reviewer, judge or planner route would run with only the stream check and the run's snapshot check behind it. "
                     "Update agy or allow slash commands in its settings, then run doctor --live again."}
-        return {**result, "status": "ready", "log": str(log)}
+        return {**result, "status": "ready", "log": str(log), **({"warning": read_warning(result).strip()} if read_warning(result) else {})}
     # The probe runs in the same read-only configuration as a reviewer or judge, and a clean exit with nothing in it is its own finding.
     silent = code == 0 and not answer.strip()
     return {**result, "status": "unverified", "reason": "timeout" if code == 124 else "empty_answer" if silent else "unexpected_response",
