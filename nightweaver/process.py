@@ -15,6 +15,31 @@ from .safety import scrub_env
 
 # The exit codes execute() returns when the controller, not the program, ended the call: time, idle and output limits.
 CONTROLLER_EXITS = (124, 125, 126)
+# execute() returns these: 124 when the call ran past its wall-clock timeout, 125 when its log did not grow for idle_timeout seconds (only
+# when an idle watchdog was passed), 126 when its log grew past max_log_bytes.
+DEFAULT_MAX_LOG = 16 * 1024 * 1024
+
+
+def controller_exit_text(code, subject, wall, idle=None, log=None):
+    """The words for a call the controller ended: exit 124 (time limit), 125 (idle watchdog) or 126 (output limit). None for any other exit
+    code, so a caller keeps its own text for an exit the program chose.
+
+    `subject` begins the sentence ("The planner", "the reviewer"). `wall`, `idle` and `log` are (value, setting) pairs: the limit the call was
+    held to (seconds, seconds, bytes; None when there was none) and the words that name the setting that controls it. The sentence has no
+    final stop, so a caller can go on."""
+    def sized(value):
+        return f"{value / 1048576:g} MB"
+
+    if code == 124:
+        return f"{subject} timed out after {wall[0]} s, its time limit ({wall[1]})"
+    if code == 125:
+        value, setting = idle or (None, "no idle watchdog was set for this call")
+        return (f"{subject} was stopped by the idle watchdog" + ("" if value is None else f" after {value} s without output")
+                + f", its idle timeout ({setting})")
+    if code == 126:
+        value, setting = log or (DEFAULT_MAX_LOG, "the log-size limit of this call")
+        return f"{subject} was stopped at its output limit: its log grew past {sized(value)} ({setting})"
+    return None
 
 
 class BusyRun(ValueError):
@@ -120,7 +145,7 @@ class ProcessLimit(RuntimeError):
 
 
 def execute(argv, cwd, log, timeout, *, prompt=None, env=None, paused=lambda: False,
-            idle_timeout=None, max_log_bytes=16 * 1024 * 1024, heartbeat=None, raise_on_limit=False):
+            idle_timeout=None, max_log_bytes=DEFAULT_MAX_LOG, heartbeat=None, raise_on_limit=False):
     """Run an operator-approved program using files for I/O and a native Job for ownership.
 
     A caller that passes no env gets the process environment without provider credentials."""

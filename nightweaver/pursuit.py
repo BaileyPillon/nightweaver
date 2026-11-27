@@ -9,7 +9,7 @@ from tempfile import mkdtemp
 
 from . import context
 from .checks import contract_hash, observed_pass
-from .engine import common_dir, git, tail, timed_out_for_good, timeout_issue, verify_registered_repository
+from .engine import common_dir, git, timed_out_for_good, timeout_issue, verify_registered_repository
 from .insights import budget_status, failure_excerpt
 from .process import PausedRun
 from .repair import describe
@@ -626,7 +626,7 @@ def judge(run, state):
                                         evidence=folder / where, images=[*shown, *references])
     try:
         if code:
-            raise ValueError(f"The judge exited {code}: {(answer or tail(log))[:300]}")
+            raise ValueError(run.call_failure(code, "judge", answer, log))
         verdict = parse_judgment(answer)
     except ValueError as error:
         invalid(run, state, "judge", error, log, code)
@@ -835,7 +835,7 @@ def plan_wave(run, state):
     code, _, answer = run.call_provider(config, "planner", path, log, plan_prompt(run, state, room), evidence=folder, mode="replanner")
     try:
         if code:
-            raise ValueError(f"The planner exited {code}: {(answer or tail(log))[:300]}")
+            raise ValueError(run.call_failure(code, "planner", answer, log))
         planned, conflicts = parse_wave(answer, room)
     except ValueError as error:
         invalid(run, state, "plan", error, log, code)

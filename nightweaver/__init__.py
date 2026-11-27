@@ -1,3 +1,3 @@
 """Nightweaver Windows coding-agent orchestration."""
 
-__version__ = "0.19.3"
+__version__ = "0.19.4"

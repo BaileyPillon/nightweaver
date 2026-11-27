@@ -430,7 +430,7 @@ class RescueTests(unittest.TestCase):
         self.assertEqual((state["phase"], state["blocked_from"], state.get("rescues_used", 0), state["rescue"]["stage"], state["rescue"]["attempts"]),
                          ("blocked", "rescuing", 0, "diagnose", 0))
         self.assertEqual([(i["attempt"], i["exit"]) for i in self.events(run, "rescue_diagnosis_invalid")], [(1, 124), (2, 124)])
-        self.assertIn("exited 124", state["last_error"])
+        self.assertIn("The judge timed out after 40 s, its time limit (agent_timeout in the plan;", state["last_error"])
         for kind in ("rescue_skipped", "rescue_failed", "pursuit_stopped", "rescue_diagnosed"):
             self.assertEqual(self.events(run, kind), [], kind)
         self.assertEqual(self.events(run, "blocked")[-1]["during"], "rescuing")

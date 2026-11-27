@@ -12,7 +12,7 @@ import time
 from uuid import uuid4
 
 from .engine import Run, checkout, create_run, directory_identity, fork_run, pending_dependencies, require_identity, source_info
-from .process import BusyRun, run_lock, runner_active
+from .process import DEFAULT_MAX_LOG, BusyRun, controller_exit_text, run_lock, runner_active
 from .providers import ProviderUnavailable, configure_deepseek_key, credential_paths, invoke, json_response, protect
 from .readiness import diagnose
 from .repair import conflict_brief
@@ -135,6 +135,8 @@ def plan_goal(store, args, template=None):
     if project:
         raw["project"] = project["name"]
     raw["objective"] = args.objective
+    if getattr(args, "planner_timeout", None) is not None:
+        raw["planner_timeout"] = args.planner_timeout  # the flag wins over the template, and the run's own planners follow it
     gates = raw.get("gates", [])
     final_gates = raw.get("final_gates", [])
     fixed = scoped_milestones(raw)
@@ -164,8 +166,10 @@ def plan_goal(store, args, template=None):
         + "\nProtected paths: " + json.dumps(raw.get("protected_paths", []))
         + "\n\nGoal:\n" + args.objective
     )
-    prompt += "\nRun limits: " + json.dumps({"budgets":prepared["budgets"], "attempts_per_milestone":prepared["attempts"],
-                                            "agent_timeout_seconds":prepared["agent_timeout"]})
+    limits = {"budgets":prepared["budgets"], "attempts_per_milestone":prepared["attempts"], "agent_timeout_seconds":prepared["agent_timeout"]}
+    if "planner_timeout" in prepared:
+        limits["planner_timeout_seconds"] = prepared["planner_timeout"]  # shown only when set, so a prompt without it is what it was
+    prompt += "\nRun limits: " + json.dumps(limits)
     if fixed:
         boundaries = [{k:s[k] for k in ("title","task","paths","gates")} for s in prepared["milestones"]]
         prompt += ("\nUse exactly one entry per fixed milestone in its original order. Return only title and task. "
@@ -193,8 +197,9 @@ def plan_goal(store, args, template=None):
     else:
         config = planner_route(args)
         log = store.root / "planning" / f"{uuid4().hex[:12]}.jsonl"
+        timeout, setting = planner_limit(args, prepared)
         try:
-            code, _, answer = invoke(config, "planner", repository, log, prompt, 240, lambda: False)
+            code, _, answer = invoke(config, "planner", repository, log, prompt, timeout, lambda: False)
         except ProviderUnavailable as error:
             if error.kind != "authentication":
                 raise
@@ -205,7 +210,9 @@ def plan_goal(store, args, template=None):
                 "or sign in to the selected profile and rerun the goal."
             ) from error
         if code:
-            raise ValueError(f"Planner exited {code}. See {log}")
+            words = controller_exit_text(code, "The planner", (timeout, setting), None,
+                                         (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+            raise ValueError(f"{words or f'Planner exited {code}'}. See {log}")
         response = extract_object(answer, "milestones")
     fields(response, "milestones conflicts", "planner response")
     conflicts = conflict_notes(response.get("conflicts"))
@@ -249,6 +256,29 @@ def plan_goal(store, args, template=None):
         result = register(store, spec, args)
         return {**result, "milestones": raw["milestones"], **({"planner_conflicts": conflicts} if conflicts else {})}
     return raw
+
+
+def planner_limit(args, prepared):
+    """(seconds, the words naming where they came from) for the initial planner call: --planner-timeout, else the template's planner_timeout,
+    else its agent_timeout (1800 unless it sets one). The planner never gets a shorter cap of its own: a planner that reads a large repository
+    before it plans needs the time a worker gets."""
+    if getattr(args, "planner_timeout", None) is not None:
+        return args.planner_timeout, "--planner-timeout; give it a larger value, or set planner_timeout in the template"
+    if "planner_timeout" in prepared:
+        return prepared["planner_timeout"], "planner_timeout in the template; raise it there or with --planner-timeout"
+    return prepared["agent_timeout"], ("agent_timeout in the template, which the planner follows because no planner_timeout is set; "
+                                       "set planner_timeout in the template or pass --planner-timeout")
+
+
+def planner_seconds(value):
+    """An argparse type: whole seconds, the range the plan's agent_timeout and planner_timeout accept."""
+    try:
+        seconds = int(value)
+    except ValueError:
+        seconds = 0
+    if not 1 <= seconds <= 14400:
+        raise argparse.ArgumentTypeError("must be a whole number of seconds from 1 to 14400")
+    return seconds
 
 
 def planner_route(args):
@@ -447,6 +477,10 @@ def main(argv=None):
     wish_launch.add_argument("--preview", action="store_true", help="Write the brief and template and stop before any planner call")
     wish_launch.add_argument("--start", action="store_true", help="Plan with the pursuit planner and start a dedicated runner now")
     wisher.add_argument("--wait", action="store_true", help="With --start, run through verification and return the outcome")
+    for parser in (goal, one, wisher):
+        parser.add_argument("--planner-timeout", type=planner_seconds, metavar="SECONDS",
+                            help="Seconds the planner may run (1 to 14400). Default: the template's planner_timeout, else its agent_timeout "
+                                 "(1800 unless it sets one), never a shorter cap. A run's own planner calls follow it")
     for parser in (one, add, goal):
         parser.add_argument("--guard-restarts", type=int, choices=range(11), metavar="0..10",
                             help="Launch under a dedicated crash supervisor with this lifetime restart allowance")
@@ -825,6 +859,8 @@ def main(argv=None):
                     raw["budgets"] = {"max_calls": 80, "max_seconds": 21600}
             if args.expected_base and raw["expected_base"] != args.expected_base.lower():
                 raise ValueError("The repository moved since preview. Preview its checks again.")
+            if args.planner_timeout is not None:
+                raw["planner_timeout"] = args.planner_timeout  # reaches the plan with or without a planner call (--direct, --preview)
             spec = validate(raw, store=store)
             if args.preview:
                 output(raw)

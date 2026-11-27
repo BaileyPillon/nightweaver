@@ -212,7 +212,7 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(len(self.events(run, "worker_stalled")), 2)
         rejected = self.events(run, "attempt_rejected")
         self.assertEqual([(r["phase"], r["exit"]) for r in rejected], [("worker", 125)])
-        self.assertIn("Worker exit idle timeout", rejected[0]["issue"])
+        self.assertIn("The worker was stopped by the idle watchdog after 900 s without output, its idle timeout (budgets.idle_timeout in the plan)", rejected[0]["issue"])
 
     def test_a_stall_streak_ends_with_any_other_outcome_and_wall_clock_limits_stay_rejections(self):
         notes = self.root / "worker.prompts"

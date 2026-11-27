@@ -1743,10 +1743,11 @@ class EngineEvidence(unittest.TestCase):
 class Release(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
 
-    def test_the_version_is_0_19_3_everywhere(self):
+    def test_the_version_agrees_everywhere_and_the_readme_keeps_this_releases_section(self):
+        """The release that ships a version pins it (test_release_0194_planner_timeout today); this module checks that the files agree and
+        that the 0.19.3 section and notes are still there."""
         import nightweaver
-        self.assertEqual(nightweaver.__version__, "0.19.3")
-        self.assertIn('version = "0.19.3"', (self.ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn(f'version = "{nightweaver.__version__}"', (self.ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## What's new in 0.19.3", readme)
         self.assertLess(readme.index("## What's new in 0.19.3"), readme.index("## What's new in 0.19.2"))

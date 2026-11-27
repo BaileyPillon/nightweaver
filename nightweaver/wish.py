@@ -15,6 +15,7 @@ from urllib.request import ProxyHandler, build_opener
 from uuid import uuid4
 
 from .engine import git, git_bytes
+from .process import DEFAULT_MAX_LOG, controller_exit_text
 from .providers import UNREADABLE, ProviderUnavailable, invoke
 from .safety import atomic_write, redact, scrub_env, write_json
 from .spec import provider, strict_json, validate
@@ -202,7 +203,9 @@ def write_brief(config, plan, wish, folder):
             problem, unreadable = UNREADABLE_BRIEF.get(error.kind, "it was unreadable"), str(error).strip()
             continue
         if code:
-            raise ValueError(f"The brief writer {'timed out' if code == 124 else f'exited {code}'}. See {log}")
+            words = controller_exit_text(code, "The brief writer", (BRIEF_TIMEOUT, f"a fixed {BRIEF_TIMEOUT} s limit of the wish command; --planner-timeout does not change it"),
+                                         None, (DEFAULT_MAX_LOG, "a fixed limit of this call that no setting changes"))
+            raise ValueError(f"{words or f'The brief writer exited {code}'}. See {log}")
         try:
             return read_brief(answer), log, attempt
         except ValueError as error:
@@ -375,6 +378,8 @@ def assemble(plan, brief, routes, args, advisory=None, project=None):
                     milestones=[{"title": "Deliver the goal", "task": brief["objective"]}])
     if routes.get("reviewer"):
         template["reviewer"] = routes["reviewer"]
+    if getattr(args, "planner_timeout", None) is not None:
+        template["planner_timeout"] = args.planner_timeout  # saved with the template, so a later `goal` of it keeps the setting
     if advisory:
         template["advisory_ollama"] = advisory
     if project:
@@ -411,7 +416,7 @@ def launch_lines(args, store, folder, template):
     guard = "" if args.guard_restarts is None else f" --guard-restarts {args.guard_restarts}"
     again = [quote(args.target), quote(args.wish), "--roster", args.roster]
     for flag, value in (("--brief-kind", args.brief_kind), ("--brief-model", args.brief_model), ("--brief-effort", args.brief_effort),
-                        ("--waves", args.waves), ("--target-score", args.target_score)):
+                        ("--waves", args.waves), ("--target-score", args.target_score), ("--planner-timeout", args.planner_timeout)):
         if value is not None:
             again += [flag, str(value)]
     for item in args.reference:
@@ -456,7 +461,8 @@ def summary(wish_id, brief, template, notes, folder, args, writer, log, attempts
               + (f", {len(pursue['references'])} reference image(s)" if pursue.get("references") else "")
               + (f", {pursue['explore']['directions']} explored directions" if "explore" in pursue else ""),
               f"Limits: {template['budgets']['max_calls']} model calls, {template['budgets']['max_seconds'] // 3600} h, "
-              f"{template['attempts']} attempts per milestone, {template['agent_timeout'] // 60} min per call"]
+              f"{template['attempts']} attempts per milestone, {template['agent_timeout'] // 60} min per call"
+              + (f", {template['planner_timeout']} s per planner call" if "planner_timeout" in template else "")]
     lines += [f"Note: {note}" for note in notes]
     lines += ["", f"Brief writer: {route_text(writer)}, {attempts} attempt{'s' if attempts > 1 else ''}",
               f"Saved in {folder}: brief.json, template.json, objective.txt", f"Raw brief-writer log: {log}"]
@@ -531,7 +537,8 @@ def run_wish(store, args):
     planner = template["pursue"]["planner"]
     request = argparse.Namespace(objective=brief["objective"], start=True, enqueue=False, after=[], wait=args.wait,
                                  guard_restarts=args.guard_restarts, prompt_only=False, plan_from=None, planner=planner["kind"],
-                                 profile_dir=None, model=planner.get("model"), effort=planner.get("effort"))
+                                 profile_dir=None, model=planner.get("model"), effort=planner.get("effort"),
+                                 planner_timeout=args.planner_timeout)
     try:
         result = cli.plan_goal(store, request, deepcopy(template))
     except ValueError as error:

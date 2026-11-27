@@ -200,7 +200,7 @@ def plan_directions(run, state, ex):
                                         evidence=folder(run), mode="directions", unreadable_ok=True)
     try:
         if code:
-            raise ValueError(f"The planner exited {code}: {(answer or tail(log))[:300]}")
+            raise ValueError(run.call_failure(code, "planner", answer, log))
         directions = parse_directions(answer, count)
     except ValueError as error:
         attempts = ex["attempts"] + 1
@@ -282,8 +282,8 @@ def build_one(run, state, ex, current, *, config, path, out, step, detail, promp
         code, _, answer = run.call_provider(config, "worker", path, log, prompt)
         current["summary"] = redact(answer or "").strip()[:1500]
         if code:
-            label = {124: "time limit", 125: "idle timeout", 126: "output limit"}.get(code, str(code))
-            return record(run, ex, {**detail, "passed": False, "reason": redact(f"Worker exit {label}\n{answer or tail(log)}")[:1500]}, current, names)
+            head = run.exit_words(code, "The worker", "worker", advice=False) or f"Worker exit {code}"
+            return record(run, ex, {**detail, "passed": False, "reason": redact(f"{head}\n{answer or tail(log)}")[:1500]}, current, names)
         ex = {**ex, "current": current}
         run.set(names["worked"], {"index": index, "log": str(log)}, **{names["key"]: ex})
     try:
@@ -446,7 +446,7 @@ def ask(run, state, ex, labelled, prompt, images, *, single, total, workers, nam
     invalid = None
     try:
         if code:
-            raise ValueError(f"The judge exited {code}: {(answer or tail(log))[:300]}")
+            raise ValueError(run.call_failure(code, "judge", answer, log))
         if single:
             found, reason = parse_ranking(answer, [label for label, _ in labelled])
             by_label = {label: b["index"] for label, b in labelled}
